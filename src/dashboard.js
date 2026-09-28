@@ -608,9 +608,41 @@ export function usageFor(entry, view) {
   };
 }
 
+// The Clients chart's bars: every client on the window and measure being
+// shown, largest first. Read through usageFor so the chart and the table under
+// it cannot disagree about a window. `share` is of the shown total and `ratio`
+// of the largest bar, so a bar's length and the percentage beside it answer
+// the same question. Ties fall back to the name, or two equal clients would
+// trade places on every poll. Nothing spent yet shares nothing, rather than
+// dividing by zero into NaN widths.
+/** @param {Record<string, any>|null|undefined} clients @param {string} [view] @param {string} [metric] */
+export function clientRanking(clients, view, metric) {
+  var all = clients || {};
+  var rows = Object.keys(all).map(function (name) {
+    var u = usageFor(all[name], view);
+    return {
+      name: name,
+      value: metric === 'requests' ? u.requests : u.inputTokens + u.outputTokens,
+      usage: u,
+      lastUsed: (all[name] || {}).lastUsed || null,
+      share: 0,
+      ratio: 0,
+    };
+  });
+  var total = 0, max = 0;
+  rows.forEach(function (r) { total += r.value; if (r.value > max) max = r.value; });
+  rows.forEach(function (r) {
+    r.share = total ? r.value / total : 0;
+    r.ratio = max ? r.value / max : 0;
+  });
+  rows.sort(function (a, b) { return (b.value - a.value) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0); });
+  return rows;
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
+  clientRanking,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -638,12 +670,16 @@ const PAGE = `<!doctype html>
      nothing. The light palette is applied two ways: by the media query when no
      choice has been stored (data-theme absent), and by the attribute when one
      has. The media rule excludes an explicit dark choice, so choosing dark on a
-     light desktop is honoured rather than overridden by the system. */
+     light desktop is honoured rather than overridden by the system.
+     --chart is the Clients chart's bar colour, a token of its own because the
+     dark accent is too light for a filled data mark; each step clears 3:1 on
+     its theme's panel. */
   :root {
     color-scheme: dark;
     --bg: #101418; --panel: #171d24; --line: #242c36;
     --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd;
     --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+    --chart: #3987e5;
   }
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) {
@@ -651,6 +687,7 @@ const PAGE = `<!doctype html>
       --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
       --text: #1f2328; --dim: #59636e; --accent: #0969da;
       --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+      --chart: #0969da;
     }
   }
   :root[data-theme="light"] {
@@ -658,6 +695,7 @@ const PAGE = `<!doctype html>
     --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
     --text: #1f2328; --dim: #59636e; --accent: #0969da;
     --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+    --chart: #0969da;
   }
   * { box-sizing: border-box; margin: 0; }
   body { background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; padding: 24px; }
@@ -695,6 +733,29 @@ const PAGE = `<!doctype html>
   td { border-bottom: 1px solid var(--line); }
   tr:last-child td { border-bottom: none; }
   td.num, th.num { text-align: right; }
+  /* Clients chart: one series, so one colour and no legend — the heading
+     names what is plotted. Bars cap at 16px with a rounded end and a square
+     baseline; the row, not the painted bar, is the hover and focus target. */
+  #clientChartCard { position: relative; }
+  .chart-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .chart-head .lead { color: var(--dim); font-size: 12px; }
+  .chart-head .seg { display: flex; gap: 6px; margin-left: auto; }
+  .chart-head .seg button { font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
+  .chart-head .seg button:hover { color: var(--text); border-color: var(--text); }
+  .chart-head .seg button.sel { color: var(--text); border-color: var(--accent); }
+  .crow { display: grid; grid-template-columns: minmax(64px, 140px) 1fr 108px; gap: 10px; align-items: center; min-height: 28px; padding: 0 6px; border-radius: 6px; }
+  .crow:hover, .crow:focus-visible { background: var(--bg); outline: none; }
+  .crow:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
+  .crow .cname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .crow .ctrack { height: 16px; }
+  .crow .cbar { height: 100%; background: var(--chart); border-radius: 0 4px 4px 0; }
+  .crow:hover .cbar, .crow:focus-visible .cbar { filter: brightness(1.15); }
+  .crow .cval { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .ctip { position: absolute; z-index: 5; display: none; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font-size: 12px; white-space: nowrap; box-shadow: 0 4px 16px rgba(0,0,0,.25); }
+  .ctip b { display: block; font-size: 13px; }
+  .ctip .dim { color: var(--dim); }
+  .chart-foot { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  @media (max-width: 520px) { .crow { grid-template-columns: minmax(56px, 96px) 1fr 92px; gap: 8px; } }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
   .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
   .act { font: inherit; font-size: 12px; padding: 1px 10px; border-radius: 999px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; margin-left: auto; }
@@ -773,9 +834,20 @@ const PAGE = `<!doctype html>
       <h2>Routing</h2>
       <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
     </div>
+    <div id="usageViewWrap" class="actions" style="display:none"></div>
+    <div id="clientChartWrap" style="display:none">
+      <h2 id="clientChartHeading">Most used</h2>
+      <div class="card" id="clientChartCard">
+        <div class="chart-head">
+          <span class="lead" id="clientChartLead"></span>
+          <span class="seg" id="clientChartMetric"></span>
+        </div>
+        <div id="clientChart"></div>
+        <div class="chart-foot">Tokens are the uncached input and output each response reports; cached context is not counted. Traffic on the shared proxy key is not attributed to anyone.</div>
+      </div>
+    </div>
     <h2>Accounts</h2>
     <div id="accounts"></div>
-    <div id="usageViewWrap" class="actions" style="display:none"></div>
     <div id="clientsWrap" style="display:none">
       <h2 id="clientsHeading">Clients</h2>
       <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
@@ -811,6 +883,18 @@ const PAGE = `<!doctype html>
   // number against the other's. Like the sort, it survives the poll.
   var usageView = 'total';
   var usageButtons = [];
+  // The Most used chart's measure, page state like the window above so it
+  // survives the poll. Tokens first: it is what the Clients table sorts by.
+  var CHART_METRICS = [{ key: 'tokens', label: 'Tokens' }, { key: 'requests', label: 'Requests' }];
+  var chartMetric = 'tokens';
+  var chartButtons = [];
+  var chartTip = null;
+  // The poll rebuilds the chart every few seconds, which would drop keyboard
+  // focus off a bar each time; the focused client's name is kept so the
+  // rebuilt row can take focus back. chartRebuilding stops the blur that a
+  // rebuild itself causes from clearing it.
+  var chartFocus = null;
+  var chartRebuilding = false;
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
 
 ${SHARED_CONSTS}
@@ -1018,6 +1102,118 @@ ${SHARED_HELPERS}
 
   function markUsageView() {
     usageButtons.forEach(function (b) { b.btn.className = b.key === usageView ? 'sel' : ''; });
+  }
+
+  // The Most used chart's measure buttons and its one tooltip, built once. The
+  // tooltip lives on the card rather than in the bar list, which every render
+  // replaces wholesale.
+  function buildClientChart() {
+    var wrap = document.getElementById('clientChartMetric');
+    CHART_METRICS.forEach(function (m) {
+      var btn = el('button', '', m.label);
+      btn.setAttribute('type', 'button');
+      btn.addEventListener('click', function () {
+        chartMetric = m.key;
+        markChartMetric();
+        if (lastStatus) render(lastStatus);
+      });
+      wrap.appendChild(btn);
+      chartButtons.push({ key: m.key, btn: btn });
+    });
+    markChartMetric();
+    chartTip = el('div', 'ctip');
+    document.getElementById('clientChartCard').appendChild(chartTip);
+  }
+
+  function markChartMetric() {
+    chartButtons.forEach(function (b) {
+      b.btn.className = b.key === chartMetric ? 'sel' : '';
+      b.btn.setAttribute('aria-pressed', b.key === chartMetric ? 'true' : 'false');
+    });
+  }
+
+  // A share too small to round to 1% still says it is there.
+  function fmtShare(share) {
+    if (share > 0 && share < 0.005) return '<1%';
+    return Math.round(share * 100) + '%';
+  }
+
+  function chartValueText(r) {
+    return fmtNum(r.value) + (chartMetric === 'requests' ? ' req' : ' tok') + ' · ' + fmtShare(r.share);
+  }
+
+  // One horizontal bar per client, longest first. The value and share sit in
+  // a column of their own rather than at the bar tip, so a full-width bar never
+  // pushes its label off the card. The table under Accounts keeps every number
+  // the bars and the tooltip show, so neither is the only way to read one.
+  function renderClientChart(clients) {
+    var wrap = document.getElementById('clientChartWrap');
+    var rows = clientRanking(clients, usageView, chartMetric);
+    if (!rows.length) { wrap.style.display = 'none'; hideChartTip(); return; }
+    wrap.style.display = '';
+    document.getElementById('clientChartHeading').textContent = usageHeading('Most used');
+    document.getElementById('clientChartLead').textContent = 'Share of ' + (chartMetric === 'requests' ? 'requests' : 'tokens') + ' by client key';
+    var box = document.getElementById('clientChart');
+    chartRebuilding = true;
+    box.textContent = '';
+    var refocus = null;
+    rows.forEach(function (r) {
+      var row = el('div', 'crow');
+      row.setAttribute('tabindex', '0');
+      row.setAttribute('aria-label', r.name + ': ' + chartValueText(r));
+      row.appendChild(el('span', 'cname', r.name));
+      var track = el('div', 'ctrack');
+      var bar = el('div', 'cbar');
+      // Anything spent draws at least 2px: a bar of nothing would read as the
+      // zero it is not.
+      bar.style.width = r.value > 0 ? 'max(2px, ' + (r.ratio * 100).toFixed(2) + '%)' : '0';
+      track.appendChild(bar);
+      row.appendChild(track);
+      row.appendChild(el('span', 'cval', chartValueText(r)));
+      row.addEventListener('pointermove', function (ev) { showChartTip(r, ev, null); });
+      row.addEventListener('pointerleave', hideChartTip);
+      row.addEventListener('focus', function () { chartFocus = r.name; showChartTip(r, null, this); });
+      row.addEventListener('blur', function () { if (!chartRebuilding) { chartFocus = null; hideChartTip(); } });
+      box.appendChild(row);
+      if (r.name === chartFocus) refocus = row;
+    });
+    chartRebuilding = false;
+    if (refocus) refocus.focus();
+  }
+
+  // Value first, name second: the reader already knows which bar they are on
+  // and wants its number. Built with textContent, since client names come from
+  // the operator's config rather than from this page.
+  function showChartTip(r, ev, rowEl) {
+    if (!chartTip) return;
+    var u = r.usage;
+    chartTip.textContent = '';
+    chartTip.appendChild(el('b', '', chartMetric === 'requests'
+      ? fmtNum(u.requests) + ' requests'
+      : fmtNum(u.inputTokens + u.outputTokens) + ' tokens'));
+    chartTip.appendChild(el('div', '', r.name + ' · ' + fmtShare(r.share) + ' of the total'));
+    chartTip.appendChild(el('div', 'dim', 'in ' + fmtNum(u.inputTokens) + ' · out ' + fmtNum(u.outputTokens) + ' · ' + fmtNum(u.requests) + ' req'));
+    if (r.lastUsed) chartTip.appendChild(el('div', 'dim', 'last used ' + fmtAgo(r.lastUsed)));
+    chartTip.style.display = 'block';
+    var card = document.getElementById('clientChartCard').getBoundingClientRect();
+    var x, y;
+    if (ev) {
+      x = ev.clientX - card.left + 14;
+      y = ev.clientY - card.top + 14;
+    } else {
+      var rb = rowEl.getBoundingClientRect();
+      x = rb.left - card.left + 16;
+      y = rb.bottom - card.top + 4;
+    }
+    // Flip to the pointer's left rather than overflow the card's right edge.
+    var w = chartTip.offsetWidth;
+    if (x + w > card.width - 4) x = Math.max(4, (ev ? ev.clientX - card.left - 14 : card.width - 4) - w);
+    chartTip.style.left = x + 'px';
+    chartTip.style.top = y + 'px';
+  }
+
+  function hideChartTip() {
+    if (chartTip) chartTip.style.display = 'none';
   }
 
   // Header cells that re-sort in place. The sort is state, not a re-fetch, so
@@ -1247,6 +1443,7 @@ ${SHARED_HELPERS}
     (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds)); });
     renderProblems(s);
     renderRoutes(s);
+    renderClientChart(s.clients);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
     // The control means nothing with no usage table under it. The payload
@@ -1448,6 +1645,7 @@ ${SHARED_HELPERS}
     if (e.key === 'Enter') document.getElementById('thrSet').click();
   });
   buildUsageViews();
+  buildClientChart();
 
   ['fProject', 'fClient'].forEach(function (id) {
     document.getElementById(id).addEventListener('change', function () {

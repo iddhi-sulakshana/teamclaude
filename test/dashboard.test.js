@@ -10,7 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
-  usageFor, USAGE_VIEWS,
+  usageFor, USAGE_VIEWS, clientRanking,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
@@ -672,7 +672,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -781,6 +781,28 @@ test('a first poll that fails shows its error instead of a blank page', async ()
   assert.equal(page.byId('err').style.display, 'block');
   assert.match(page.byId('err').textContent, /status 500/);
   assert.equal(page.byId('app').style.display, '');
+});
+
+test('the Most used chart draws a bar per client and switches measure without polling', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], clients: {
+    alice: { requests: 3, inputTokens: 10, outputTokens: 90 },
+    bob: { requests: 9, inputTokens: 5, outputTokens: 5 },
+  } });
+  assert.equal(page.byId('clientChartWrap').style.display, '');
+  // Each client is named once by its bar and once by its table row.
+  assert.equal(page.labelled('alice'), 2);
+  assert.equal(page.labelled('100 tok · 91%'), 1);
+  page.click('Requests');
+  assert.equal(page.requests.length, 0, 'the measure re-renders the last status rather than fetching');
+  assert.equal(page.labelled('bob'), 2);
+  assert.equal(page.labelled('9 req · 75%'), 1);
+});
+
+test('the Most used chart stays hidden until a client key has been used', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  assert.equal(page.byId('clientChartWrap').style.display, 'none');
 });
 
 test('dashboard page is self-contained: no external resources', () => {
@@ -977,6 +999,46 @@ test('every offered view names a window the tracker actually keeps', () => {
 
 test('the page ships the view list it renders buttons from', () => {
   assert.ok(renderDashboardHtml().includes(`var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`));
+});
+
+const CLIENTS = {
+  alice: { requests: 4, inputTokens: 100, outputTokens: 500, lastUsed: '2026-09-28T10:00:00.000Z',
+    windows: { '5h': { requests: 1, inputTokens: 10, outputTokens: 20 } } },
+  bob: { requests: 20, inputTokens: 50, outputTokens: 150,
+    windows: { '5h': { requests: 6, inputTokens: 40, outputTokens: 50 } } },
+  carol: { requests: 0, inputTokens: 0, outputTokens: 0 },
+};
+
+test('the chart ranks clients by tokens on the shown window, largest first', () => {
+  const total = clientRanking(CLIENTS, 'total', 'tokens');
+  assert.deepEqual(total.map(r => [r.name, r.value]), [['alice', 600], ['bob', 200], ['carol', 0]]);
+  // A bar's length is against the largest bar, its percentage against the sum.
+  assert.equal(total[0].ratio, 1);
+  assert.equal(total[1].ratio, 200 / 600);
+  assert.equal(total[1].share, 200 / 800);
+  assert.equal(total[0].lastUsed, '2026-09-28T10:00:00.000Z');
+  // The window reorders the ranking rather than filtering the lifetime one:
+  // bob is the busier client of the last five hours.
+  assert.deepEqual(clientRanking(CLIENTS, '5h', 'tokens').map(r => [r.name, r.value]), [['bob', 90], ['alice', 30], ['carol', 0]]);
+});
+
+test('the chart can rank by requests instead', () => {
+  const rows = clientRanking(CLIENTS, 'total', 'requests');
+  assert.deepEqual(rows.map(r => [r.name, r.value]), [['bob', 20], ['alice', 4], ['carol', 0]]);
+  assert.equal(rows[0].share, 20 / 24);
+});
+
+test('equal clients keep a stable order, and nothing spent shares nothing', () => {
+  // Ties fall back to the name, or two equal bars would swap on every poll.
+  const tied = clientRanking({ zed: { requests: 1 }, amy: { requests: 1 } }, 'total', 'requests');
+  assert.deepEqual(tied.map(r => r.name), ['amy', 'zed']);
+  // An idle fleet has no total to divide by: zero shares, never NaN widths.
+  for (const r of clientRanking({ a: {}, b: {} }, '5h', 'tokens')) {
+    assert.equal(r.share, 0);
+    assert.equal(r.ratio, 0);
+  }
+  assert.deepEqual(clientRanking(null, 'total', 'tokens'), []);
+  assert.deepEqual(clientRanking(undefined), []);
 });
 
 test('selecting a window relabels every table it governs', async () => {
