@@ -639,6 +639,36 @@ export function clientRanking(clients, view, metric) {
   return rows;
 }
 
+// The two requests Add account sends: start answers a sign-in link and the
+// state naming it, finish hands back that state with the code Claude showed.
+// The code is trimmed here because it is pasted, and a trailing newline from a
+// copy is not part of it.
+/** @param {string|null} key */
+export function loginStartRequest(key) {
+  return {
+    url: '/teamclaude/login/start',
+    init: { method: 'POST', headers: { 'x-api-key': key || '' } },
+  };
+}
+/** @param {string} state @param {string} code @param {string|null} key */
+export function loginFinishRequest(state, code, key) {
+  return {
+    url: '/teamclaude/login/finish',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ state: state, code: String(code || '').trim() }),
+    },
+  };
+}
+/** @param {any} res */
+export function loginOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'adding the account failed' + (res && res.error ? ': ' + res.error : '') };
+  // An account already in the config signing in again gets fresh tokens, not
+  // a second row, and the note should not claim a new account appeared.
+  return { kind: 'ok', text: (res.action === 'updated' ? 'signed in again as ' : 'added account ') + res.name };
+}
+
 // Whether the caller the status payload names may use one of the page's
 // controls, mirroring the server's gates (controlRole in server.js) so a button
 // is offered only where it would be honoured. `action` is 'switch', 'reload',
@@ -656,7 +686,7 @@ export function viewerCan(viewer, action) {
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  clientRanking, viewerCan,
+  clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -769,6 +799,19 @@ const PAGE = `<!doctype html>
   .ctip b { display: block; font-size: 13px; }
   .ctip .dim { color: var(--dim); }
   .chart-foot { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  /* Add account panel. */
+  #loginWrap .title2 { font-weight: 600; }
+  #loginWrap ol { margin: 4px 0 0 18px; padding: 0; }
+  #loginWrap li { margin: 8px 0; }
+  #loginWrap a { color: var(--accent); }
+  #loginWrap li button { font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
+  #loginWrap li button:hover { color: var(--text); border-color: var(--text); }
+  #loginWrap li button:disabled { opacity: .5; cursor: default; }
+  #loginWrap #loginGo { color: var(--text); border-color: var(--accent); }
+  .loginRow { display: flex; gap: 8px; margin-top: 6px; }
+  .loginRow input { flex: 1; min-width: 0; font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  #loginNote { font-size: 12px; color: var(--dim); margin-top: 4px; }
+  #loginNote.ok { color: var(--ok); } #loginNote.error { color: var(--bad); }
   @media (max-width: 520px) { .crow { grid-template-columns: minmax(56px, 96px) 1fr 92px; gap: 8px; } }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
   .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
@@ -833,6 +876,7 @@ const PAGE = `<!doctype html>
     <div class="actions">
       <button id="reload" type="button">Reload config</button>
       <button id="probe" type="button">Probe quotas</button>
+      <button id="addAcct" type="button">Add account</button>
       <button id="theme" type="button" title="Switch between following the system, light and dark"></button>
       <span class="thr" id="thrWrap">
         <label for="thrVal">Switch at</label>
@@ -840,6 +884,19 @@ const PAGE = `<!doctype html>
         <span>%</span>
         <button id="thrSet" type="button">Set</button>
       </span>
+    </div>
+    <div id="loginWrap" class="card" style="display:none">
+      <div class="chart-head">
+        <span class="title2">Add a Claude account</span>
+        <span class="seg"><button id="loginClose" type="button">Close</button></span>
+      </div>
+      <ol>
+        <li>Open the sign-in link and sign in as the account to add: <a id="loginLink" target="_blank" rel="noopener noreferrer">open sign-in link</a> <button id="loginCopy" type="button">Copy link</button></li>
+        <li>Claude then shows a code. Paste it here:
+          <span class="loginRow"><input id="loginCode" type="text" placeholder="code from the sign-in page" autocomplete="off" spellcheck="false"><button id="loginGo" type="button">Add account</button></span>
+        </li>
+      </ol>
+      <div id="loginNote"></div>
     </div>
     <div id="err"></div>
     <div id="problems"></div>
@@ -911,6 +968,9 @@ const PAGE = `<!doctype html>
   var chartRebuilding = false;
   // How the summary line names a signed-in client key's role.
   var VIEWER_ROLE_TEXT = { operator: 'admin', tenant: 'user', readonly: 'read-only' };
+  // Add account: the state naming the sign-in link now open, or null. The
+  // server holds everything else about that login; the link is only opened.
+  var loginState = null;
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
 
 ${SHARED_CONSTS}
@@ -1462,6 +1522,11 @@ ${SHARED_HELPERS}
       sum.appendChild(el('span', '', ' (' + (VIEWER_ROLE_TEXT[viewer.role] || viewer.role) + ')'));
     }
     document.getElementById('reload').style.display = viewerCan(viewer, 'reload') ? '' : 'none';
+    // Adding an account writes a credential into the config: an account
+    // control, so it is offered to exactly those who may use the others.
+    var canAdd = viewerCan(viewer, 'accounts');
+    document.getElementById('addAcct').style.display = canAdd ? '' : 'none';
+    if (!canAdd) document.getElementById('loginWrap').style.display = 'none';
     document.getElementById('thrWrap').style.display = viewerCan(viewer, 'threshold') ? '' : 'none';
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
@@ -1512,6 +1577,67 @@ ${SHARED_HELPERS}
         poll();
       })
       .catch(function (e) { note('error', 'switch failed: ' + e.message); btn.disabled = false; });
+  }
+
+  function loginNote(kind, text) {
+    var n = document.getElementById('loginNote');
+    n.className = kind || '';
+    n.textContent = text;
+  }
+
+  // Asks the server for a sign-in link and opens the panel on it. Asking again
+  // replaces the link: the server keeps the old one until it lapses, but the
+  // page only ever offers the newest.
+  function doLoginStart(btn) {
+    btn.disabled = true;
+    var r = loginStartRequest(localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        if (!json.ok) { note('error', 'could not start a sign-in: ' + (json.error || 'unknown error')); return; }
+        loginState = json.state;
+        document.getElementById('loginLink').setAttribute('href', json.url);
+        document.getElementById('loginCode').value = '';
+        var mins = Math.max(1, Math.round((json.expiresAt - Date.now()) / 60000));
+        loginNote('', 'The link works for ' + mins + ' minutes. If this browser is signed in to a different Claude account, open it in a private window.');
+        document.getElementById('loginWrap').style.display = '';
+      })
+      .catch(function (e) { note('error', 'could not start a sign-in: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  function doLoginFinish(btn) {
+    var code = document.getElementById('loginCode').value.trim();
+    if (!loginState) { loginNote('error', 'there is no sign-in link open; press Add account again'); return; }
+    if (!code) { loginNote('error', 'paste the code Claude showed after signing in'); return; }
+    btn.disabled = true;
+    loginNote('', 'adding…');
+    var r = loginFinishRequest(loginState, code, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = loginOutcome(json);
+        if (out.kind !== 'ok') { loginNote('error', out.text); return; }
+        closeLogin();
+        note('ok', out.text);
+        poll();
+      })
+      .catch(function (e) { loginNote('error', 'adding the account failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  function closeLogin() {
+    loginState = null;
+    document.getElementById('loginWrap').style.display = 'none';
+    document.getElementById('loginCode').value = '';
   }
 
   function doControlAccount(name, spec, btn) {
@@ -1676,6 +1802,19 @@ ${SHARED_HELPERS}
   });
   buildUsageViews();
   buildClientChart();
+  document.getElementById('addAcct').addEventListener('click', function () { doLoginStart(this); });
+  document.getElementById('loginGo').addEventListener('click', function () { doLoginFinish(this); });
+  document.getElementById('loginCode').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') document.getElementById('loginGo').click();
+  });
+  document.getElementById('loginClose').addEventListener('click', closeLogin);
+  document.getElementById('loginCopy').addEventListener('click', function () {
+    var href = document.getElementById('loginLink').getAttribute('href');
+    var failed = function () { loginNote('error', 'could not copy; open the link instead'); };
+    try {
+      navigator.clipboard.writeText(href).then(function () { loginNote('ok', 'link copied'); }, failed);
+    } catch (e) { failed(); }
+  });
 
   ['fProject', 'fClient'].forEach(function (id) {
     document.getElementById(id).addEventListener('change', function () {

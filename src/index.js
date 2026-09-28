@@ -10,7 +10,8 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
+import { PendingLogins } from './pending-logins.js';
+import { importCredentials, loginOAuth, loginOAuthWithPastedCode, beginPastedCodeLogin, completePastedCodeLogin, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
   orgKey,
@@ -676,6 +677,35 @@ async function serverCommand() {
     let result;
     await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountDisabled(diskConfig, account, disabled, spec); });
     return result;
+  };
+
+  // The dashboard's Add account (POST /teamclaude/login/{start,finish}): the
+  // copy/paste OAuth login split in two, so the sign-in link goes to a browser
+  // and the code Claude shows comes back in a second request. The verifier
+  // waits in pendingLogins in between. The account is saved by the same upsert
+  // the CLI and the TUI use — an existing account signing in again gets fresh
+  // tokens rather than a second row — told neither to exit nor to notify: the
+  // endpoint reloads afterwards, as it does for the other account controls.
+  // What the operator can act on (a lapsed link, a code upstream refused, an
+  // account the profile lookup cannot identify) is a ConfigOpError, which the
+  // endpoint echoes; anything else is logged and answered generically.
+  const pendingLogins = new PendingLogins();
+  hooks.startLogin = () => pendingLogins.add(beginPastedCodeLogin());
+  hooks.finishLogin = async (/** @type {string} */ state, /** @type {string} */ code) => {
+    const pending = pendingLogins.use(state);
+    if (!pending) throw new ConfigOpError('this sign-in link has expired or was already used; start again');
+    let creds;
+    try {
+      creds = await completePastedCodeLogin(pending, code);
+    } catch (err) {
+      throw new ConfigOpError(`the code was not accepted: ${/** @type {Error} */ (err).message}`);
+    }
+    pendingLogins.done(state);
+    try {
+      return await upsertOAuthAccount(undefined, creds, 'dashboard', null, false, { fatal: false, notify: false });
+    } catch (err) {
+      throw new ConfigOpError(/** @type {Error} */ (err).message);
+    }
   };
 
   // Whether one of a Codex account's free rate-limit reset credits should be

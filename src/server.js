@@ -359,6 +359,9 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
+  // Adding an account puts a new credential into the config file.
+  ['/teamclaude/login/start', 'a client key cannot change accounts'],
+  ['/teamclaude/login/finish', 'a client key cannot change accounts'],
 ]);
 
 /**
@@ -654,6 +657,72 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.writeHead(known ? 400 : 500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: known ? message : 'account change failed; see the proxy log' }));
         }
+        return;
+      }
+
+      // Add account, in two requests: /teamclaude/login/start answers the
+      // sign-in link to open (and the state that names it), and
+      // /teamclaude/login/finish takes that state and the code Claude shows
+      // after signing in. The PKCE verifier stays in the server's hooks the
+      // whole time, never in the page. Operator only, like the account
+      // controls above: a tenant key is refused by CLIENT_KEY_REFUSED_PATHS
+      // and a readonly one by the prefix rule, before either reaches here.
+      if (req.method === 'POST' && req.url === '/teamclaude/login/start') {
+        if (!hooks.startLogin || !hooks.finishLogin || !hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'adding an account is not supported by this server' }));
+          return;
+        }
+        const login = hooks.startLogin();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, url: login.url, state: login.state, expiresAt: login.expiresAt }));
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/teamclaude/login/finish') {
+        if (!hooks.finishLogin || !hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'adding an account is not supported by this server' }));
+          return;
+        }
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}') ?? {};
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof body.state !== 'string' || !body.state || typeof body.code !== 'string' || !body.code.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "state" or "code"' }));
+          return;
+        }
+        let result;
+        try {
+          result = await hooks.finishLogin(body.state, body.code);
+        } catch (err) {
+          const known = err instanceof ConfigOpError;
+          const message = /** @type {Error} */ (err).message;
+          if (!known) console.error('[TeamClaude] Adding an account failed:', message);
+          res.writeHead(known ? 400 : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: known ? message : 'adding the account failed; see the proxy log' }));
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after adding an account failed:', /** @type {Error} */ (err).message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' }));
+          return;
+        }
+        // Never silent: a credential entering the config is exactly what an
+        // operator reading the log afterwards needs to be able to find.
+        console.log(`[TeamClaude] ${result.action === 'updated' ? 'Signed in again' : 'Added account'} "${result.name}" (dashboard${req.tcClient ? `, by ${req.tcClient}` : ''})`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, action: result.action, name: result.name }));
         return;
       }
 

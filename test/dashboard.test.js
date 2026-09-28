@@ -10,7 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
-  usageFor, USAGE_VIEWS, clientRanking, viewerCan,
+  usageFor, USAGE_VIEWS, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
@@ -672,7 +672,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -840,6 +840,68 @@ test('an admin viewer gets every control', async () => {
   assert.equal(page.byId('reload').style.display, '');
   assert.equal(page.byId('thrWrap').style.display, '');
   assert.equal(page.labelled(' (admin)'), 1);
+});
+
+test('Add account sends the start with the key and no body, and the finish with the trimmed code', () => {
+  const start = loginStartRequest('tc-k');
+  assert.equal(start.url, '/teamclaude/login/start');
+  assert.equal(start.init.method, 'POST');
+  assert.equal(start.init.headers['x-api-key'], 'tc-k');
+  assert.equal(start.init.body, undefined);
+  const finish = loginFinishRequest('st', '  abc#st\n', null);
+  assert.equal(finish.url, '/teamclaude/login/finish');
+  assert.deepEqual(JSON.parse(finish.init.body), { state: 'st', code: 'abc#st' });
+  assert.equal(finish.init.headers['x-api-key'], '');
+});
+
+test('the Add account note says whether the account is new or signed in again', () => {
+  assert.deepEqual(loginOutcome({ ok: true, action: 'added', name: 'n@x' }), { kind: 'ok', text: 'added account n@x' });
+  assert.deepEqual(loginOutcome({ ok: true, action: 'updated', name: 'n@x' }), { kind: 'ok', text: 'signed in again as n@x' });
+  assert.deepEqual(loginOutcome({ ok: false, error: 'the code was not accepted: invalid_grant' }),
+    { kind: 'error', text: 'adding the account failed: the code was not accepted: invalid_grant' });
+  assert.equal(loginOutcome(null).kind, 'error');
+});
+
+test('Add account: the link opens a panel, and a pasted code adds the account', async () => {
+  const page = bootPage({ storedKey: 'tc-admin' });
+  await page.answer(200, ROLE_STATUS({ client: 'boss', role: 'operator' }));
+  assert.equal(page.byId('addAcct').style.display, '');
+  page.byId('addAcct').fire('click');
+  const start = page.requests.at(-1);
+  assert.equal(start.url, '/teamclaude/login/start');
+  assert.equal(start.init.headers['x-api-key'], 'tc-admin');
+  await page.answer(200, { ok: true, url: 'https://claude.ai/oauth/authorize?state=st', state: 'st', expiresAt: Date.now() + 15 * 60 * 1000 });
+  assert.equal(page.byId('loginWrap').style.display, '', 'the panel opens on the new link');
+  assert.match(page.byId('loginNote').textContent, /15 minutes/);
+
+  page.byId('loginCode').value = ' abc#st ';
+  page.byId('loginGo').fire('click');
+  const finish = page.requests.at(-1);
+  assert.equal(finish.url, '/teamclaude/login/finish');
+  assert.deepEqual(JSON.parse(finish.init.body), { state: 'st', code: 'abc#st' });
+  await page.answer(200, { ok: true, action: 'added', name: 'new@example.com' });
+  assert.equal(page.byId('loginWrap').style.display, 'none', 'the panel closes on success');
+  assert.match(page.byId('note').textContent, /added account new@example\.com/);
+});
+
+test('Add account: a refused code keeps the panel open with the reason', async () => {
+  const page = bootPage({ storedKey: 'tc-admin' });
+  await page.answer(200, ROLE_STATUS({ client: 'boss', role: 'operator' }));
+  page.byId('addAcct').fire('click');
+  await page.answer(200, { ok: true, url: 'https://claude.ai/oauth/authorize?state=st', state: 'st', expiresAt: Date.now() + 60000 });
+  page.byId('loginCode').value = 'wrong';
+  page.byId('loginGo').fire('click');
+  await page.answer(400, { ok: false, error: 'the code was not accepted: invalid_grant' });
+  assert.equal(page.byId('loginWrap').style.display, '');
+  assert.match(page.byId('loginNote').textContent, /invalid_grant/);
+  assert.equal(page.byId('loginNote').className, 'error');
+});
+
+test('Add account is not offered to a read-only viewer', async () => {
+  const page = bootPage();
+  await page.answer(200, ROLE_STATUS({ client: 'watcher', role: 'readonly' }));
+  assert.equal(page.byId('addAcct').style.display, 'none');
+  assert.equal(page.byId('loginWrap').style.display, 'none');
 });
 
 test('the Most used chart stays hidden until a client key has been used', async () => {

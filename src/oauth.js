@@ -754,20 +754,20 @@ export async function loginOAuth({ interactive = true, routing = null } = {}) {
 }
 
 /**
- * Perform OAuth login via manual copy/paste (no local callback server).
- * User opens the authorization URL on any device, logs in, and pastes back
- * the authorization code shown on the success page. Useful for headless
- * machines, remote servers, or when localhost callbacks are unavailable.
- * @param {{ routing?: import('./account-routing.js').RoutingProxy|null }} [opts]
+ * The first half of the copy/paste login: the authorization URL to open, and
+ * the PKCE verifier and state the pasted code must be exchanged against.
+ * Split out so a caller that is not a terminal — the dashboard's Add account —
+ * can hand the URL to a browser and finish in a later request, holding the
+ * verifier itself. The verifier is the secret half and never needs to leave
+ * the process that made it; the URL carries only its hash.
+ * @returns {{ url: string, state: string, codeVerifier: string, redirectUri: string }}
  */
-export async function loginOAuthWithPastedCode({ routing = null } = {}) {
-  // Generate PKCE
+export function beginPastedCodeLogin() {
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
   const state = randomBytes(32).toString('base64url');
   const redirectUri = MANUAL_LOGIN_REDIRECT_URI;
 
-  // Build authorization URL
   const authUrl = new URL(OAUTH_AUTHORIZE);
   authUrl.searchParams.set('code', 'true');
   authUrl.searchParams.set('client_id', DEFAULT_CLIENT_ID);
@@ -777,10 +777,37 @@ export async function loginOAuthWithPastedCode({ routing = null } = {}) {
   authUrl.searchParams.set('code_challenge', codeChallenge);
   authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('state', state);
+  return { url: authUrl.toString(), state, codeVerifier, redirectUri };
+}
+
+/**
+ * The second half: exchange what the user pasted (a code, `code#state`, or the
+ * callback URL) for tokens, against the login `beginPastedCodeLogin` started.
+ * @param {{ state: string, codeVerifier: string, redirectUri: string }} pending
+ * @param {string} input
+ * @param {{ routing?: import('./account-routing.js').RoutingProxy|null, tokenEndpoint?: string }} [opts]
+ */
+export async function completePastedCodeLogin(pending, input, { routing = null, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT } = {}) {
+  const parsed = parseAuthCode(String(input ?? ''), pending.state);
+  if (!parsed || !parsed.code) {
+    throw new Error('No authorization code provided');
+  }
+  return exchangeCodeForTokens(parsed.code, parsed.state, pending.codeVerifier, pending.redirectUri, tokenEndpoint, routing);
+}
+
+/**
+ * Perform OAuth login via manual copy/paste (no local callback server).
+ * User opens the authorization URL on any device, logs in, and pastes back
+ * the authorization code shown on the success page. Useful for headless
+ * machines, remote servers, or when localhost callbacks are unavailable.
+ * @param {{ routing?: import('./account-routing.js').RoutingProxy|null }} [opts]
+ */
+export async function loginOAuthWithPastedCode({ routing = null } = {}) {
+  const pending = beginPastedCodeLogin();
 
   // Display the authorization URL
   console.log('Authorization URL:');
-  console.log(`  ${authUrl.toString()}\n`);
+  console.log(`  ${pending.url}\n`);
   console.log('Steps:');
   console.log('  1. Open the URL above in a browser (on any device)');
   console.log('  2. Log in to your Claude account');
@@ -794,15 +821,8 @@ export async function loginOAuthWithPastedCode({ routing = null } = {}) {
   });
   rl.close();
 
-  // Parse the input
-  const parsed = parseAuthCode(input, state);
-  if (!parsed || !parsed.code) {
-    throw new Error('No authorization code provided');
-  }
-
-  // Exchange code for tokens
   console.log('Exchanging authorization code for tokens...');
-  return exchangeCodeForTokens(parsed.code, parsed.state, codeVerifier, redirectUri, DEFAULT_TOKEN_ENDPOINT, routing);
+  return completePastedCodeLogin(pending, input, { routing });
 }
 
 /**
