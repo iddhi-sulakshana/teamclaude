@@ -265,12 +265,14 @@ export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost
 
 /**
  * Which identity a presented key authenticates as, checked against the shared
- * `proxy.apiKey` and every `proxy.clientKeys` entry ({ name, key }).
+ * `proxy.apiKey` and every `proxy.clientKeys` entry ({ name, key, role? }).
  *
- * Returns { ok, client }: ok=false → reject; `client` is the matching entry's
+ * Returns { ok, client, role? }: ok=false → reject; `client` is the matching entry's
  * name (per-client usage is booked against it), or null for the shared key —
  * the shared key predates client identities and stays unattributed rather than
- * inventing one. With no keys configured at all the gate is open (unchanged
+ * inventing one. `role` is present only when the matching entry names one (see
+ * clientKeyRole), so every other answer keeps the shape it has always had.
+ * With no keys configured at all the gate is open (unchanged
  * behavior), also unattributed.
  *
  * Client keys are checked first so a clientKeys entry that duplicates the
@@ -292,10 +294,48 @@ function usableClientKeys(clientKeys) {
       } else if (seen.has(name)) {
         console.error(`[TeamClaude] proxy.clientKeys: duplicate name "${name}" — its keys share one usage counter`);
       }
+      if (entry?.role != null && !CLIENT_KEY_ROLES.has(String(entry.role).trim().toLowerCase())) {
+        console.error(`[TeamClaude] proxy.clientKeys: "${name}" has an unknown role ${JSON.stringify(entry.role)} — treated as "readonly"; use "admin" or "readonly"`);
+      }
       seen.add(name);
     }
   }
   return clientKeys.filter(e => typeof e?.name === 'string' && e.name.trim() && e.key);
+}
+
+// The roles a clientKeys entry may carry. Without one a client key is a
+// tenant: it spends quota under its own name, reads status and may nudge the
+// running fleet (switch, reload, probe), but not rewrite the config. "admin"
+// raises it to the operator's control plane while its usage stays booked to
+// its own name, which the shared key cannot do. "readonly" drops the nudges
+// too, for a key that should only ever watch.
+const CLIENT_KEY_ROLES = new Set(['admin', 'readonly']);
+
+/**
+ * The role a clientKeys entry names, normalized: 'admin', 'readonly', or null
+ * for none. A role that is set but unrecognized fails closed to 'readonly' —
+ * a typo in "admin" must not leave a key with more than the operator asked
+ * for, and a typo in "readonly" must not leave it with the tenant's nudges.
+ * @param {any} entry
+ * @returns {'admin'|'readonly'|null}
+ */
+export function clientKeyRole(entry) {
+  if (entry?.role == null) return null;
+  return String(entry.role).trim().toLowerCase() === 'admin' ? 'admin' : 'readonly';
+}
+
+/**
+ * Who a request is to the control plane. 'operator' is the shared
+ * proxy.apiKey, a key-exempt local caller (both arrive with no client name),
+ * or a client key whose entry says role "admin"; 'tenant' is a client key
+ * with no role; 'readonly' is one whose role is "readonly".
+ * @param {string|null|undefined} client the name a client key authenticated as
+ * @param {'admin'|'readonly'|null|undefined} role its normalized role
+ * @returns {'operator'|'tenant'|'readonly'}
+ */
+export function controlRole(client, role) {
+  if (!client || role === 'admin') return 'operator';
+  return role === 'readonly' ? 'readonly' : 'tenant';
 }
 
 export function resolveClientAuth(proxyConfig, presented) {
@@ -304,7 +344,8 @@ export function resolveClientAuth(proxyConfig, presented) {
   if (!shared && clientKeys.length === 0) return { ok: true, client: null };
   for (const entry of clientKeys) {
     if (safeKeyEqual(presented, entry.key)) {
-      return { ok: true, client: entry.name.trim() };
+      const role = clientKeyRole(entry);
+      return role ? { ok: true, client: entry.name.trim(), role } : { ok: true, client: entry.name.trim() };
     }
   }
   if (shared && safeKeyEqual(presented, shared)) return { ok: true, client: null };
@@ -394,6 +435,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // a valid client key is attributed like any other; loopback without one
       // passed only via the exemption and stays unattributed.
       req.tcClient = auth.ok ? auth.client : null;
+      req.tcRole = auth.ok ? (auth.role ?? null) : null;
 
       // Control-plane mutations are refused when the request was issued by a web
       // page. The gate above exempts loopback from the API key, so without this
@@ -429,8 +471,22 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // the key-exempt loopback caller are the operator and stay allowed.
       // Refused here, before the body is read, so a request that will not be
       // honoured is never parsed.
-      const clientKeyRefusal = req.method === 'POST' ? CLIENT_KEY_REFUSED_PATHS.get(req.url || '') : undefined;
-      if (req.tcClient && clientKeyRefusal) {
+      //
+      // A clientKeys entry's role moves it off the tenant line either way:
+      // "admin" passes as the operator, and "readonly" is refused every
+      // control-plane POST — the runtime nudges included, and any route added
+      // later, since the test is the prefix rather than a list. The MCP
+      // endpoint is left to serve it: its read tools are what "readonly" is
+      // for, and modeFor keeps its write tools from a non-admin key.
+      const who = controlRole(req.tcClient, req.tcRole);
+      const url = req.url || '';
+      if (who === 'readonly' && req.method === 'POST' && url.startsWith('/teamclaude/') && !/^\/teamclaude\/mcp\/?(\?|$)/.test(url)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'a read-only client key cannot change anything' }));
+        return;
+      }
+      const clientKeyRefusal = req.method === 'POST' ? CLIENT_KEY_REFUSED_PATHS.get(url) : undefined;
+      if (who === 'tenant' && clientKeyRefusal) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: clientKeyRefusal }));
         return;
@@ -487,7 +543,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, upstreamPool: upstreamPoolStatus() }, null, 2));
+        // `viewer` is who asked, as the control plane will treat them, so the
+        // dashboard can leave out the controls this caller would be refused
+        // rather than offer buttons that only ever answer 403.
+        const viewer = { client: req.tcClient || null, role: who };
+        res.end(JSON.stringify({ ...extra, ...status, viewer, upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -765,7 +825,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.end(JSON.stringify({ ok: false, error: refusal }));
           return;
         }
-        await serveManagementMcp(req, res, { accountManager, config, hooks, client: req.tcClient, readBody: readControlBody });
+        await serveManagementMcp(req, res, { accountManager, config, hooks, client: req.tcClient, role: req.tcRole, readBody: readControlBody });
         return;
       }
 

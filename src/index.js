@@ -2500,8 +2500,9 @@ mode).
 Connect Claude Code with:
   claude mcp add --transport http teamclaude http://localhost:3456/teamclaude/mcp
 Same gates as the other /teamclaude/ routes. A named client key is served
-read-only even in "full" mode: the write tools answer to the shared proxy key
-and to local callers. With no proxy key configured, only local callers are served.
+read-only even in "full" mode: the write tools answer to the shared proxy key,
+to local callers, and to a client key with "role": "admin". With no proxy key
+configured, only local callers are served.
 
 Upstream proxy. On a host with no direct route to the internet, set
 "upstreamProxy": "http://user:pass@host:3128" (or just "host:3128") and every

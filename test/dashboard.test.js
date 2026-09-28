@@ -10,7 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
-  usageFor, USAGE_VIEWS, clientRanking,
+  usageFor, USAGE_VIEWS, clientRanking, viewerCan,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
@@ -672,7 +672,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -797,6 +797,49 @@ test('the Most used chart draws a bar per client and switches measure without po
   assert.equal(page.requests.length, 0, 'the measure re-renders the last status rather than fetching');
   assert.equal(page.labelled('bob'), 2);
   assert.equal(page.labelled('9 req · 75%'), 1);
+});
+
+test('viewerCan mirrors the server: operator everything, tenant the nudges, readonly nothing', () => {
+  const actions = ['switch', 'reload', 'probe', 'accounts', 'threshold'];
+  for (const a of actions) assert.equal(viewerCan({ role: 'operator' }, a), true, a);
+  for (const a of actions) assert.equal(viewerCan({ role: 'readonly' }, a), false, a);
+  assert.deepEqual(actions.filter(a => viewerCan({ role: 'tenant' }, a)), ['switch', 'reload', 'probe']);
+  // A server older than the viewer field: everything shows, as it always did.
+  for (const a of actions) assert.equal(viewerCan(undefined, a), true, a);
+});
+
+const ROLE_STATUS = viewer => ({
+  viewer,
+  currentAccount: 'alice@example.com',
+  accounts: [
+    { name: 'alice@example.com', provider: 'anthropic', quota: {}, usage: {} },
+    { name: 'bob@example.com', provider: 'anthropic', quota: {}, usage: {} },
+  ],
+});
+
+test('a read-only viewer is shown no controls, and told why', async () => {
+  const page = bootPage();
+  await page.answer(200, ROLE_STATUS({ client: 'watcher', role: 'readonly' }));
+  for (const label of ['switch', 'disable', 'prioritize', 'deprioritize']) {
+    assert.equal(page.labelled(label), 0, label);
+  }
+  assert.equal(page.byId('reload').style.display, 'none');
+  assert.equal(page.byId('probe').style.display, 'none');
+  assert.equal(page.byId('thrWrap').style.display, 'none');
+  assert.equal(page.labelled('watcher'), 1, 'the summary names who is signed in');
+  assert.equal(page.labelled(' (read-only)'), 1);
+});
+
+test('an admin viewer gets every control', async () => {
+  const page = bootPage();
+  await page.answer(200, ROLE_STATUS({ client: 'boss', role: 'operator' }));
+  // bob is not current, so it carries the switch; both carry the account controls.
+  assert.equal(page.labelled('switch'), 1);
+  assert.equal(page.labelled('disable'), 2);
+  assert.equal(page.labelled('prioritize'), 2);
+  assert.equal(page.byId('reload').style.display, '');
+  assert.equal(page.byId('thrWrap').style.display, '');
+  assert.equal(page.labelled(' (admin)'), 1);
 });
 
 test('the Most used chart stays hidden until a client key has been used', async () => {

@@ -639,10 +639,24 @@ export function clientRanking(clients, view, metric) {
   return rows;
 }
 
+// Whether the caller the status payload names may use one of the page's
+// controls, mirroring the server's gates (controlRole in server.js) so a button
+// is offered only where it would be honoured. `action` is 'switch', 'reload',
+// 'probe', 'accounts' (enable/disable and priority) or 'threshold'. A server
+// older than `viewer` sends none, and every control shows as it always did —
+// the server's 403 still has the final word either way.
+/** @param {{ role?: string }|null|undefined} viewer @param {string} action */
+export function viewerCan(viewer, action) {
+  var role = viewer && viewer.role;
+  if (!role || role === 'operator') return true;
+  if (role === 'readonly') return false;
+  return action === 'switch' || action === 'reload' || action === 'probe';
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  clientRanking,
+  clientRanking, viewerCan,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -820,7 +834,7 @@ const PAGE = `<!doctype html>
       <button id="reload" type="button">Reload config</button>
       <button id="probe" type="button">Probe quotas</button>
       <button id="theme" type="button" title="Switch between following the system, light and dark"></button>
-      <span class="thr">
+      <span class="thr" id="thrWrap">
         <label for="thrVal">Switch at</label>
         <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
         <span>%</span>
@@ -895,6 +909,8 @@ const PAGE = `<!doctype html>
   // rebuild itself causes from clearing it.
   var chartFocus = null;
   var chartRebuilding = false;
+  // How the summary line names a signed-in client key's role.
+  var VIEWER_ROLE_TEXT = { operator: 'admin', tenant: 'user', readonly: 'read-only' };
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
 
 ${SHARED_CONSTS}
@@ -973,7 +989,7 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds) {
+  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds, viewer) {
     var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
@@ -984,7 +1000,7 @@ ${SHARED_HELPERS}
       head.appendChild(el('span', 'badge ' + badge.cls, badge.text));
     });
     // Last in the row so the badges sit in the same place on every card.
-    if (!isCurrent) {
+    if (!isCurrent && viewerCan(viewer, 'switch')) {
       var btn = el('button', 'act', 'switch');
       btn.addEventListener('click', function () { doSwitch(a.name, btn); });
       head.appendChild(btn);
@@ -996,10 +1012,13 @@ ${SHARED_HELPERS}
     // Named ctl* deliberately: var is function-scoped, and this builder already
     // declares a "last" further down (the last-used string). A button named
     // last here is overwritten by that before any click can fire.
-    var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
-    ctlDisable.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, ctlDisable); });
-    head.appendChild(ctlDisable);
-    if (!a.disabled) {
+    var canControl = viewerCan(viewer, 'accounts');
+    if (canControl) {
+      var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
+      ctlDisable.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, ctlDisable); });
+      head.appendChild(ctlDisable);
+    }
+    if (canControl && !a.disabled) {
       var ctlFirst = el('button', 'act', 'prioritize');
       ctlFirst.addEventListener('click', function () { doControlAccount(a.name, { place: 'first' }, ctlFirst); });
       head.appendChild(ctlFirst);
@@ -1434,13 +1453,24 @@ ${SHARED_HELPERS}
     // one page saying "sessions" here and "conversations" there would read as
     // two different quantities rather than one counted twice.
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
+    // Who this page is signed in as, when a client key says so: the controls
+    // below appear or not by that, and a missing button should not be a puzzle.
+    var viewer = s.viewer || null;
+    if (viewer && viewer.client) {
+      sum.appendChild(el('span', '', ' · signed in as '));
+      sum.appendChild(el('b', '', viewer.client));
+      sum.appendChild(el('span', '', ' (' + (VIEWER_ROLE_TEXT[viewer.role] || viewer.role) + ')'));
+    }
+    document.getElementById('reload').style.display = viewerCan(viewer, 'reload') ? '' : 'none';
+    document.getElementById('thrWrap').style.display = viewerCan(viewer, 'threshold') ? '' : 'none';
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
+    probeBtn.style.display = viewerCan(viewer, 'probe') ? '' : 'none';
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeBtn.disabled = !!probe.running;
     var acc = document.getElementById('accounts');
     acc.textContent = '';
-    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds)); });
+    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.viewer)); });
     renderProblems(s);
     renderRoutes(s);
     renderClientChart(s.clients);
