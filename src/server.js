@@ -28,6 +28,7 @@ import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
+import { envVar, legacyControlUrl } from './brand.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -68,7 +69,7 @@ const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // rate-limit 429 never rotates accounts (that just moves the burst); it pauses
 // the account so concurrent requests wait, then retries the same account.
 const RATE_LIMIT_ABSORB_MAX_SECONDS =
-  Number(process.env.TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS) || 60;
+  Number(envVar('RATE_LIMIT_ABSORB_MAX_SECONDS')) || 60;
 // How long to wait before the one retry of a headerless 429 — a 429 carrying no
 // retry-after and no anthropic-ratelimit-* headers at all.
 //
@@ -101,7 +102,7 @@ const DEFAULT_HEADERLESS_429_RETRY_DELAY_MS = 2000;
  * @returns {number}
  */
 function resolveHeaderless429RetryDelayMs() {
-  const raw = process.env.TEAMCLAUDE_HEADERLESS_429_RETRY_DELAY_MS;
+  const raw = envVar('HEADERLESS_429_RETRY_DELAY_MS');
   if (raw == null || raw.trim() === '') return DEFAULT_HEADERLESS_429_RETRY_DELAY_MS;
   const env = Number(raw);
   if (env === 0) return 0;
@@ -174,6 +175,51 @@ const CONNECTION_SPECIFIC_HEADERS = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'upgrade',
   'proxy-connection', 'te', 'trailer',
 ]);
+
+// Response headers describing the SERVING organization's billing state:
+// whether extra usage (overage) is enabled, why it is not, whether it is in
+// use, and what the org could upgrade to. A pool whose accounts belong to
+// several organizations returns these for whichever org served the response,
+// and Claude Code caches them as if they described the user's own org. After a
+// response from an org with extra usage disabled, the client can report "no
+// usage credits", block a model the pool still has plan quota for, or show a
+// consent dialog offering to enable paid overage on the wrong org.
+//
+// With `stripOverageHeaders: true` in the config, only this family
+// (anthropic-ratelimit-unified-overage-* and
+// anthropic-ratelimit-unified-upgrade-paths) is removed, and only from the
+// client-bound copy. The plan-quota headers (5h, 7d and 7d_oi status,
+// utilization and reset, the overall status, representative-claim, fallback)
+// always pass through: the client needs them for its usage readout, and they
+// describe the account that actually served the request. updateQuota receives
+// the unfiltered headers either way and does not persist the overage family.
+// The default (false) passes everything through unchanged.
+// relayHttpForward (absolute-form relay) is filtered too, for consistency:
+// Claude Code reaches Anthropic via CONNECT, so in practice it does not carry
+// these headers.
+const OVERAGE_HEADER_PREFIX = 'anthropic-ratelimit-unified-overage-';
+const OVERAGE_HEADER_NAMES = new Set(['anthropic-ratelimit-unified-upgrade-paths']);
+
+/**
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function isOverageHeader(name) {
+  const lk = String(name).toLowerCase();
+  return lk.startsWith(OVERAGE_HEADER_PREFIX) || OVERAGE_HEADER_NAMES.has(lk);
+}
+
+// Read off the shared config object (like eventLogging) when a request is
+// dispatched, so a reload applies to subsequent requests without a restart; a
+// request already in flight keeps the value it was dispatched with. Off
+// unless explicitly enabled.
+/**
+ * @param {unknown} config
+ * @returns {boolean}
+ */
+export function shouldStripOverageHeaders(config) {
+  return /** @type {{ stripOverageHeaders?: unknown } | null | undefined} */ (config)?.stripOverageHeaders === true;
+}
 
 // Constant-time proxy-API-key comparison (both the HTTP gate and the CONNECT
 // gate use it). Returns false on any type/length mismatch without leaking timing.
@@ -400,6 +446,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
   const requestHandler = async (req, res) => {
     try {
+      // The control plane answers to its new name as well (issue #72): a URL
+      // under /teamrouter/ is rewritten to /teamclaude/ once, here, so every
+      // route below keeps matching the one spelling it always has. Only the
+      // proxy's own prefix is touched; nothing forwarded upstream starts with it.
+      const legacyUrl = legacyControlUrl(req.url);
+      if (legacyUrl) req.url = legacyUrl;
+
       // Dashboard page — served BEFORE the auth gate on purpose. The page is a
       // static asset containing no data: everything it shows comes from
       // /teamclaude/status, which stays behind the gate and is fetched by the
@@ -502,7 +555,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Dispatched BEFORE the loopback-only checks below: a page cannot make a
       // browser emit an absolute-form request line, the relay injects no fleet
       // credential, and its Host header names the TARGET, not this proxy.
-      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, shouldStripOverageHeaders(config)); return; }
 
       // A request admitted ONLY by the loopback exemption — no valid key — is
       // held to two more conditions. Both target the same actor: a web page in
@@ -920,7 +973,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // classification path like every other prefix test; `/tc-acct/` and an
       // absolute-form proxy URL do not start with it and are untouched.
       const controlPath = classificationPath(req.url);
-      if (controlPath === '/teamclaude' || controlPath.startsWith('/teamclaude/')) {
+      // Both prefixes: an encoded spelling of the new one (`/%74eamrouter/`)
+      // escapes the rewrite above and must not reach the forwarder either.
+      if (controlPath === '/teamclaude' || controlPath.startsWith('/teamclaude/')
+        || controlPath === '/teamrouter' || controlPath.startsWith('/teamrouter/')) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'unknown teamclaude control route (check the path and the method)' }));
         return;
@@ -1020,7 +1076,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // path (req.tcClient): a handshake authenticated with a client key is
       // attributed to that client, or it is a channel the operator cannot see
       // under `clients` at all (#325).
-      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage });
+      relayUpgrade(req, socket, head, upstream, sx, { client: auth.client, clientUsage, stripOverage: shouldStripOverageHeaders(config) });
     } catch (err) {
       console.error(`[TeamClaude] WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
       try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
@@ -1195,7 +1251,7 @@ export function describeConnectError(err) {
 // client's own headers — no account selection, no token injection,
 // content-encoding passed through (a transparent forward proxy). Anthropic is
 // HTTPS-only, so in practice this only ever sees third-party hosts.
-export function relayHttpForward(req, res) {
+export function relayHttpForward(req, res, stripOverage = false) {
   let target;
   try { target = new URL(req.url); } catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1234,6 +1290,7 @@ export function relayHttpForward(req, res) {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
+      if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.statusCode, responseHeaders);
@@ -1366,7 +1423,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
       // Client token refresh: pass through untouched (the proxy manages its own
       // tokens via ensureTokenFresh; rewriting client refreshes would conflict).
-      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config)); return; }
+      if (req.method === 'POST' && req.url === '/v1/oauth/token') { await relayRaw(req, res, upstream, sx, resolveMaxBodyBytes(config), shouldStripOverageHeaders(config)); return; }
       // Account pin: a request to `/tc-acct/<name-or-index>/...` (e.g. via
       // ANTHROPIC_BASE_URL=http://host:port/tc-acct/deepseek) is forced onto that
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
@@ -1429,7 +1486,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // moving past it would turn an unknown TC_ACCT pin on an identity-plane
       // request into a 404 that it does not return today.
       const classifiedPath = classificationPath(req.url);
-      if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx); return; }
+      if (CLIENT_CREDENTIAL_PATHS.some((p) => classifiedPath.startsWith(p))) { await relayStream(req, res, upstream, sx, shouldStripOverageHeaders(config)); return; }
 
       // MITM-mode pin. A CONNECT carrying `Proxy-Authorization: Basic <acct>:…`
       // has no URL to hang a `/tc-acct/` prefix on — the path inside the tunnel
@@ -1553,7 +1610,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      // stripOverage is sampled once here, at dispatch: retries and holds of
+      // this request keep it, and a reload applies to subsequent requests.
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1819,7 +1878,7 @@ function sxAgent(sx, targetHost) {
  * buffering, no timeout, no reconstruction — just pipe bytes both ways as they
  * arrive, exactly like a transparent proxy would.
  */
-function relayStream(req, res, upstream, sx) {
+function relayStream(req, res, upstream, sx, stripOverage = false) {
   const target = new URL(`${upstream}${req.url}`);
   /** @type {import('node:http').OutgoingHttpHeaders} */
   const headers = {};
@@ -1841,6 +1900,7 @@ function relayStream(req, res, upstream, sx) {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;
+      if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.statusCode, responseHeaders);
@@ -1958,7 +2018,7 @@ export function upgradeTarget(upstream, url) {
   return target;
 }
 
-export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log } = {}) {
+export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log, stripOverage = false } = {}) {
   const target = upgradeTarget(upstream, req.url);
   if (!target) {
     log(`[TeamClaude] WebSocket upgrade refused: request target ${JSON.stringify(safeLine(req.url, 128))} is not a path on the upstream`);
@@ -1995,8 +2055,11 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
 
   upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
     const headerLines = Object.entries(upstreamRes.headers)
-      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\r\n');
-    socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\n\r\n`);
+      .filter(([k]) => !(stripOverage && isOverageHeader(k)))
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
+    // Lines joined, one terminator: an empty header set must not leave a blank
+    // line inside (or an extra CRLF after) the response head.
+    socket.write([`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`, ...headerLines].join('\r\n') + '\r\n\r\n');
     if (upstreamHead?.length) socket.write(upstreamHead);
     if (head?.length) upstreamSocket.write(head);
     socket.pipe(upstreamSocket);
@@ -2030,9 +2093,10 @@ export function relayUpgrade(req, socket, head, upstream, sx, { client = null, c
     log(`[TeamClaude] ${tag}WebSocket ${path} refused by upstream (${upstreamRes.statusCode})`);
     const headerLines = Object.entries(upstreamRes.headers)
       .filter(([k]) => !CONNECTION_SPECIFIC_HEADERS.has(k.toLowerCase()) && k.toLowerCase() !== 'content-length')
-      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('\r\n');
+      .filter(([k]) => !(stripOverage && isOverageHeader(k)))
+      .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
     try {
-      socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\nConnection: close\r\n\r\n`);
+      socket.write([`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`, ...headerLines, 'Connection: close'].join('\r\n') + '\r\n\r\n');
     } catch { /* already gone */ }
     upstreamRes.resume();
     socket.destroy();
@@ -2073,9 +2137,14 @@ async function refuseOversizedBody(req, res) {
 }
 
 /**
- * Relay a request to upstream with no header rewriting — pure passthrough.
+ * Relay a request to upstream on the client's own terms: no pooled account
+ * credentials are injected and the body goes through unchanged, with only
+ * content-type, accept and user-agent forwarded. On the way back the
+ * connection-specific and stale framing headers (transfer-encoding,
+ * connection, content-encoding, content-length) are dropped, and so is the
+ * per-org billing family when `stripOverage` is set (see isOverageHeader).
  */
-async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES) {
+async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_BYTES, stripOverage = false) {
   const bodyChunks = [];
   let bodyBytes = 0;
   for await (const chunk of req) {
@@ -2106,6 +2175,7 @@ async function relayRaw(req, res, upstream, sx, maxBodyBytes = DEFAULT_MAX_BODY_
       // a gzip'd upstream response reaches the client mis-framed / truncated.
       if (key === 'transfer-encoding' || key === 'connection' ||
           key === 'content-encoding' || key === 'content-length') continue;
+      if (stripOverage && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.status, responseHeaders);
@@ -2645,8 +2715,8 @@ const DEFAULT_STREAM_PEEK_HOLD_MS = 10_000;
  * @returns {{ budgetBytes: number, holdMs: number }}
  */
 export function resolveStreamPeekBounds() {
-  const budget = Number(process.env.TEAMCLAUDE_STREAM_PEEK_BUDGET_BYTES);
-  const hold = Number(process.env.TEAMCLAUDE_STREAM_PEEK_HOLD_MS);
+  const budget = Number(envVar('STREAM_PEEK_BUDGET_BYTES'));
+  const hold = Number(envVar('STREAM_PEEK_HOLD_MS'));
   return {
     budgetBytes: budget > 0 ? budget : DEFAULT_STREAM_PEEK_BUDGET_BYTES,
     holdMs: hold > 0 ? hold : DEFAULT_STREAM_PEEK_HOLD_MS,
@@ -3184,6 +3254,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Any response at all came back through the account's routing proxy.
     accountManager.clearRoutingFailed(account.index);
 
+    // And a response that is not an error is proof its API key works: the 401
+    // cooldown and the count behind its length start over (#473). Only that —
+    // a 429 or a 5xx says nothing about the key either way.
+    if (upstreamRes.status < 400) accountManager.clearCredentialRejected(account.index);
+
     // Any non-429 response is live proof a rate-limit hold no longer binds —
     // this is what lets a revalidation probe (a throttled account selected by
     // _selectProbe) clear its own hold and return the fleet to service.
@@ -3559,8 +3634,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // hours while three healthy siblings served none of them (#412). Like the
     // 403 above, the client must not see it: Claude Code reads a 401 as its own
     // login having died. So the account is skipped for this request and the
-    // request fails over. It also leaves rotation when nothing here can ever
-    // repair it: an API key, or an OAuth account with no refresh token to try.
+    // request fails over. It also leaves rotation when nothing here can
+    // repair it: an OAuth account with no refresh token to try, for good, and an
+    // API key for a cooldown that lengthens while it keeps being rejected — a
+    // gateway answers 401 with a good key when its own upstream is down (#473;
+    // see markCredentialRejected).
     // An account that DOES hold one only fails over. Its second 401 can be stale
     // news — the forced refresh is suppressed for a short floor after a
     // successful one (the refresh-storm guard), so the retry may have gone out
@@ -3642,6 +3720,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (CONNECTION_SPECIFIC_HEADERS.has(key)) continue;
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
+      // Per-org billing state, dropped when stripOverageHeaders is on (see
+      // isOverageHeader); updateQuota above already saw the full header set.
+      if (ctx.stripOverage === true && isOverageHeader(key)) continue;
       responseHeaders[key] = value;
     }
 
@@ -3829,7 +3910,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 120_000;
 
 function resolveBodyIdleTimeout() {
-  const env = Number(process.env.TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS);
+  const env = Number(envVar('UPSTREAM_BODY_TIMEOUT_MS'));
   return env > 0 ? env : DEFAULT_BODY_IDLE_TIMEOUT_MS;
 }
 
@@ -4278,7 +4359,8 @@ export function rewriteModel(body, modelMap) {
 function blockingResets(accountManager, account, model) {
   const q = account.quota || {};
   /** @type {any[]} */
-  const resets = [account.rateLimitedUntil, account.entitlementDeniedUntil, account.routingFailedUntil];
+  const resets = [account.rateLimitedUntil, account.entitlementDeniedUntil, account.routingFailedUntil,
+    account.credentialRejectedUntil];
 
   if (q.unified5h != null && q.unified5h >= accountManager.thresholdFor('unified5h')) {
     resets.push(q.unified5hReset);

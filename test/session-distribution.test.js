@@ -356,3 +356,27 @@ test('untagged spreading skips excluded accounts', () => {
   for (let i = 0; i < 6; i++) seen.add(am.getActiveAccount(new Set([1]), null, null, null).name);
   assert.deepEqual([...seen].sort(), ['a', 'c']);
 });
+
+// Spreading is among equals. A lower-priority account is a fallback, and the
+// cursor walking through it sent Claude Code's bootstrap and connector calls to
+// a priority-200 inference gateway that answers them with 404, while every
+// account above it had quota (#472).
+test('untagged spreading stays within the top priority tier', () => {
+  const am = new AccountManager([
+    oauth('a'), oauth('b'), oauth('fallback', { priority: 200 }),
+  ], 0.98, { distributeSessions: true });
+  const names = [];
+  for (let i = 0; i < 6; i++) names.push(am.getActiveAccount(null, null, null, null).name);
+  assert.deepEqual([...new Set(names)].sort(), ['a', 'b']);
+});
+
+// The lower tier is still where the traffic goes once nothing above it can
+// take the request.
+test('untagged requests reach a lower tier when the one above is unavailable', () => {
+  const am = new AccountManager([
+    oauth('a'), oauth('b'), oauth('fallback', { priority: 200 }),
+  ], 0.98, { distributeSessions: true });
+  const seen = new Set();
+  for (let i = 0; i < 4; i++) seen.add(am.getActiveAccount(new Set([0, 1]), null, null, null).name);
+  assert.deepEqual([...seen], ['fallback']);
+});

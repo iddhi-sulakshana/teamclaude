@@ -93,6 +93,21 @@ The per-model weekly cap (e.g. Fable) is tracked separately, so an account whose
 
 Advisor requests (Claude Code's `/advisor`) carry a **second** model nested in the tools array. Routing sees it too, so the request lands on an account eligible for both the main model and the advisor, falling back to main-model-only routing when no account can serve both.
 
+Claude Code declares the advisor tool on **every** request once an advisor model is configured, whether or not the advisor is ever called. So when only some accounts can serve the advisor's model — a route lists one account for `claude-fable-*`, or the others have spent their Fable bucket — all of that client's traffic is confined to them and the rest of the fleet idles. TeamClaude says so, at most once a minute:
+
+```
+[TeamClaude] Advisor model "claude-fable-5-1" narrows selection to 1 of 4 accounts — set advisorEligibility to "prefer" to route by request model instead
+```
+
+The counts are the accounts that can serve the request right now, and how many of those can also serve its advisor. `GET /teamclaude/status` carries the same reading as `advisorNarrowing` (`{ model, eligible, of, at }`, or `null` when the last advisor request was not narrowed), beside the mode in `advisorEligibility`.
+
+[`advisorEligibility`](configuration.md#fields) chooses what happens then:
+
+- `"strict"` (the default) keeps the request on the accounts that can serve both models. The advisor always has somewhere to run; the cost is the narrowing above.
+- `"prefer"` routes a narrowed request **by its main model only**, as though it declared no advisor: every account that can serve the main model is a candidate, under the ordinary rotation, session distribution included. The advisor call is then made by whichever account serves the request, which may be one your routes do not list for the advisor's model, or one whose bucket for it is spent — upstream fails that advisor call and Claude Code may stop using the advisor for the session. A route pin on the advisor's model is set aside with it. Where every candidate can serve the advisor, nothing changes, and the advisor model still takes part in selection.
+
+In both modes, no account able to serve the advisor at all means main-model-only routing, as before.
+
 Unwanted models can be rejected outright with [`blockedModels`](configuration.md#fields) instead of being forwarded — a model no account can serve otherwise gets rate-limited upstream and hangs the pipeline.
 
 ## Model routes

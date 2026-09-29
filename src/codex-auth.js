@@ -17,6 +17,7 @@ import { exec } from 'node:child_process';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
 import { tokenPairFromResponse } from './oauth.js';
+import { envVar } from './brand.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 export const DEFAULT_CODEX_CREDENTIALS_PATH = '~/.codex/auth.json';
@@ -73,6 +74,7 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
     accountId: auth.chatgpt_account_id || tokens.account_id,
     email: claims.email,
     planType: auth.chatgpt_plan_type,
+    userId: auth.chatgpt_user_id || auth.user_id,
   };
 }
 
@@ -88,7 +90,7 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
  */
 export async function refreshCodexToken(refreshToken, endpoint = TOKEN_ENDPOINT, routing = null) {
-  const timeoutMs = Number(process.env.TEAMCLAUDE_REFRESH_TIMEOUT_MS) || 30_000;
+  const timeoutMs = Number(envVar('REFRESH_TIMEOUT_MS')) || 30_000;
   const res = await proxyFetch(endpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -177,6 +179,7 @@ export function credentialsFromTokenResponse(data) {
     accountId: auth.chatgpt_account_id,
     email: claims.email,
     planType: auth.chatgpt_plan_type,
+    userId: auth.chatgpt_user_id || auth.user_id,
   };
 }
 

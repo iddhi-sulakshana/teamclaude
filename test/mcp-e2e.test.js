@@ -1,60 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import net from 'node:net';
-import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFile, writeFile } from 'node:fs/promises';
+import { spawnServer, closedPort } from '../test-helpers/spawn-server.js';
 
 // The real server, headless, driven over its MCP endpoint: what a write tool
 // changes has to show up in the running fleet AND in the config file, in that
 // order, because a headless server has no TUI to save for it.
-
-const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
-
-function closedPort() {
-  return new Promise(resolve => {
-    const probe = net.createServer();
-    probe.listen(0, '127.0.0.1', () => {
-      const { port } = probe.address();
-      probe.close(() => resolve(port));
-    });
-  });
-}
-
-function startServer(configPath) {
-  // The child must not inherit a proxy from the shell: see test/README.md.
-  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' };
-  for (const key of Object.keys(env)) if (/^(https?|all|no)_proxy$/i.test(key)) delete env[key];
-  const child = spawn(process.execPath, [cliPath, 'server', '--headless'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
-  let output = '';
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', c => { output += c; });
-  child.stderr.on('data', c => { output += c; });
-  const stop = async () => {
-    child.kill('SIGTERM');
-    const killer = setTimeout(() => child.kill('SIGKILL'), 5000);
-    if (child.exitCode === null && child.signalCode === null) {
-      await new Promise(resolve => child.on('exit', resolve));
-    }
-    clearTimeout(killer);
-  };
-  return { stop, output: () => output };
-}
-
-async function waitForStatus(port, childOutput) {
-  const deadline = Date.now() + 15_000;
-  for (;;) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
-      if (res.ok) return res.json();
-    } catch { /* not up yet */ }
-    if (Date.now() > deadline) throw new Error(`server did not start:\n${childOutput()}`);
-    await new Promise(r => setTimeout(r, 100));
-  }
-}
 
 async function rpc(port, method, params) {
   const res = await fetch(`http://127.0.0.1:${port}/teamclaude/mcp`, {
@@ -77,26 +28,23 @@ const status = port => fetch(`http://127.0.0.1:${port}/teamclaude/status`).then(
 
 test('a headless server applies and saves what the write tools change', async () => {
   const deadPort = await closedPort();
-  const proxyPort = await closedPort();
-  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-mcp-e2e-'));
-  const configPath = join(dir, 'config.json');
-  await writeFile(configPath, JSON.stringify({
-    proxy: { port: proxyPort, apiKey: 'tc-test', mcp: 'read' },
-    upstream: `http://127.0.0.1:${deadPort}`,
-    upstreamProxy: false,
-    switchThreshold: 0.98,
-    accounts: [
-      { name: 'a@example.com', type: 'apikey', apiKey: 'k1' },
-      { name: 'b@example.com', type: 'apikey', apiKey: 'k2' },
-      { name: 'c@example.com', type: 'apikey', apiKey: 'k3' },
-    ],
-  }));
+  const server = await spawnServer({
+    config: () => ({
+      proxy: { apiKey: 'tc-test', mcp: 'read' },
+      upstream: `http://127.0.0.1:${deadPort}`,
+      upstreamProxy: false,
+      switchThreshold: 0.98,
+      accounts: [
+        { name: 'a@example.com', type: 'apikey', apiKey: 'k1' },
+        { name: 'b@example.com', type: 'apikey', apiKey: 'k2' },
+        { name: 'c@example.com', type: 'apikey', apiKey: 'k3' },
+      ],
+    }),
+  });
+  const { port: proxyPort, configPath } = server;
   const disk = async () => JSON.parse(await readFile(configPath, 'utf8'));
 
-  const server = startServer(configPath);
   try {
-    await waitForStatus(proxyPort, server.output);
-
     // The mode is a config field like any other: a reload picks it up.
     let list = await rpc(proxyPort, 'tools/list');
     assert.equal(list.result.tools.length, 3);

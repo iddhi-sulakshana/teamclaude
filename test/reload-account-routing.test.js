@@ -2,11 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import http from 'node:http';
-import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { writeFile, readFile } from 'node:fs/promises';
+import { spawnServer } from '../test-helpers/spawn-server.js';
 
 // The whole feature, witnessed: a request forwarded for a routed account must
 // reach the upstream THROUGH that account's proxy — and an account without one
@@ -15,54 +12,8 @@ import { fileURLToPath } from 'node:url';
 // since both paths end at the same stub upstream. Reload drives the disk edits,
 // so the live-update path (sync-accounts.js) is covered too.
 
-const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
-
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
-}
-
-// A port nothing is listening on: bind one, learn its number, give it back.
-function closedPort() {
-  return new Promise(resolve => {
-    const probe = net.createServer();
-    probe.listen(0, '127.0.0.1', () => {
-      const { port } = probe.address();
-      probe.close(() => resolve(port));
-    });
-  });
-}
-
-function startServer(configPath) {
-  const child = spawn(process.execPath, [cliPath, 'server', '--headless'], {
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let output = '';
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', c => { output += c; });
-  child.stderr.on('data', c => { output += c; });
-  const stop = async () => {
-    child.kill('SIGTERM');
-    const killer = setTimeout(() => child.kill('SIGKILL'), 5000);
-    if (child.exitCode === null && child.signalCode === null) {
-      await new Promise(resolve => child.on('exit', resolve));
-    }
-    clearTimeout(killer);
-  };
-  return { child, stop, output: () => output };
-}
-
-async function waitForServer(port, childOutput) {
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
-      if (res.ok) return;
-    } catch { /* not up yet */ }
-    if (Date.now() > deadline) throw new Error(`server did not start:\n${childOutput()}`);
-    await new Promise(r => setTimeout(r, 100));
-  }
 }
 
 // A recording stand-in upstream: both the direct and the proxied path end
@@ -121,20 +72,17 @@ async function withServer(accounts, fn) {
   const connects = [];
   const socks = startSocks5(connects);
   const socksPort = await listen(socks);
-  const proxyPort = await closedPort();
 
-  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-routing-reload-'));
-  const configPath = join(dir, 'config.json');
-  await writeFile(configPath, JSON.stringify({
-    proxy: { port: proxyPort, apiKey: 'tc-test' },
-    upstream: `http://127.0.0.1:${stubPort}`,
-    upstreamProxy: false,
-    accounts,
-  }));
-
-  const server = startServer(configPath);
+  const server = await spawnServer({
+    config: () => ({
+      proxy: { apiKey: 'tc-test' },
+      upstream: `http://127.0.0.1:${stubPort}`,
+      upstreamProxy: false,
+      accounts,
+    }),
+  });
+  const { port: proxyPort, configPath } = server;
   try {
-    await waitForServer(proxyPort, server.output);
     await fn({ hits, connects, stubPort, socksPort, proxyPort, configPath });
   } catch (err) {
     console.error('--- server output ---\n' + server.output());

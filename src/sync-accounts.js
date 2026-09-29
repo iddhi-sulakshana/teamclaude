@@ -225,6 +225,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') mgr.status = 'active';
+      // A different key is a different credential: the 401 hold was about the
+      // old one, and the operator who just fixed it should not wait it out.
+      accountManager.clearCredentialRejected(mgr.index);
       console.log(`[TeamClaude] Updated API key for "${safeLine(mgr.name, 64)}"`);
     }
   }

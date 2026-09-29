@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
+import { envVar } from './brand.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -149,7 +150,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
   // can't hang the refresh forever. A hung refresh is especially harmful here:
   // ensureTokenFresh coalesces callers into a single _refreshPromise, so one
   // stuck refresh wedges every request for that account until a restart.
-  const timeoutMs = Number(process.env.TEAMCLAUDE_REFRESH_TIMEOUT_MS) || 30_000;
+  const timeoutMs = Number(envVar('REFRESH_TIMEOUT_MS')) || 30_000;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {

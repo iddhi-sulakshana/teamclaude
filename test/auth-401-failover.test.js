@@ -9,7 +9,8 @@ import { createProxyServer } from '../src/server.js';
 // relayed to the client and the account stayed `active`, so the next request
 // picked it again — 4,124 consecutive 401s from one account in the report
 // (#412). A 401 now fails over, and an account nothing here can repair leaves
-// rotation.
+// rotation: an OAuth account for good, an API key for a cooldown after which it
+// is tried again (#473; see apikey-401-cooldown.test.js).
 
 const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
 
@@ -56,8 +57,10 @@ test('a 401 on an API-key account fails over, and the account leaves rotation', 
     assert.equal(res.status, 200, 'the client must not be handed the account\'s 401');
     await res.text();
     assert.deepEqual(seen, ['dead-key', 'live-key']);
-    assert.equal(am.accounts[0].status, 'error', 'nothing can repair a rejected API key');
-    assert.ok(errors.some(e => /taken out of rotation/.test(e) && /dead/.test(e)), errors.join('\n'));
+    // Held, not errored: `error` has no way back for an API key (#473).
+    assert.equal(am.accounts[0].status, 'active');
+    assert.equal(am.unavailableReason(am.accounts[0]), 'credential');
+    assert.ok(errors.some(e => /held out of rotation for \d+s/.test(e) && /dead/.test(e)), errors.join('\n'));
 
     // The next request does not try the dead account again.
     const again = await send();
