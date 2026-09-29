@@ -6,7 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens,
-  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar,
+  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, seriesBars, seriesTicks,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
@@ -69,14 +69,23 @@ test('account metadata and session state are separate badges', () => {
     status: 'active', sessions: 1, knownSessions: 3,
   }, 'legacy', { anthropic: 'personal', codex: 'corp' });
   assert.deepEqual(badges, [
-    { cls: 'provider codex', text: 'Codex' },
-    { cls: 'meta', text: 'oauth' },
-    { cls: 'meta priority', text: 'prio -2' },
     { cls: 'current', text: 'current' },
-    { cls: 'active', text: 'active' },
+    { cls: 'meta priority', text: 'prio -2' },
+    { cls: 'provider codex', text: 'Codex' },
     { cls: 'sessions', text: '1 recent' },
     { cls: 'sessions known', text: '3 known' },
   ]);
+});
+
+test('accountBadges leaves out what every account in a Claude OAuth fleet would repeat', () => {
+  // Claude, oauth and active are the common case: a badge each on every card
+  // is noise that buries the ones that differ.
+  assert.deepEqual(accountBadges({ name: 'a', provider: 'anthropic', type: 'oauth', status: 'active' }, 'b'),
+    [{ cls: 'meta priority', text: 'prio 0' }]);
+  // Anything off the common case still says so.
+  const odd = accountBadges({ name: 'a', provider: 'anthropic', type: 'api_key', status: 'throttled' }, 'b');
+  assert.deepEqual(odd.map(b => b.text), ['prio 0', 'throttled', 'api_key']);
+  assert.deepEqual(accountBadges({ name: 'a', disabled: true, status: 'active' }, 'b').map(b => b.text), ['prio 0', 'disabled']);
 });
 
 // ── per-account switch threshold (#409) ───────────────────────
@@ -616,7 +625,8 @@ test('extraUsageText keeps a month\'s spend on an account switched off since, wi
 test('extraUsageBar fills against upstream\'s monthly limit', () => {
   const bar = extraUsageBar({ quota: { spend: billable(1435) } });
   assert.equal(bar.ratio, 1435 / 1000000);
-  assert.equal(bar.value, '$14.35 of $10,000.00');
+  assert.equal(bar.used, '$14.35');
+  assert.equal(bar.rest, ' of $10,000.00');
   assert.equal(bar.off, false);
   assert.equal(bar.title, extraUsageText({ quota: { spend: billable(1435) } }));
   assert.deepEqual(extraUsageBar({ quota: { spend: billable(0) } }).ratio, 0);
@@ -627,9 +637,9 @@ test('extraUsageBar fills against upstream\'s monthly limit', () => {
 test('extraUsageBar fills against the maxSpend cap when it binds first, and says so', () => {
   const capped = extraUsageBar({ maxSpend: 20, quota: { spend: billable(1435) } });
   assert.equal(capped.ratio, 1435 / 2000);
-  assert.equal(capped.value, '$14.35 of $20.00 cap');
+  assert.equal(capped.used + capped.rest, '$14.35 of $20.00 cap');
   // A cap above the limit never binds: the limit is the ceiling shown.
-  assert.equal(extraUsageBar({ maxSpend: 50000, quota: { spend: billable(1435) } }).value, '$14.35 of $10,000.00');
+  assert.equal(extraUsageBar({ maxSpend: 50000, quota: { spend: billable(1435) } }).rest, ' of $10,000.00');
   // "Not one cent": nothing spent is an empty bar, anything spent a full one.
   assert.equal(extraUsageBar({ maxSpend: 0, quota: { spend: billable(0) } }).ratio, 0);
   assert.equal(extraUsageBar({ maxSpend: 0, quota: { spend: billable(5) } }).ratio, 1);
@@ -639,12 +649,13 @@ test('extraUsageBar marks an account switched off since, and draws no ratio with
   const off = extraUsageBar(switchedOff({ disabled_reason: 'out_of_credits' }));
   assert.equal(off.off, true);
   assert.equal(off.ratio, 0.75);
-  assert.equal(off.value, '€15.00 of €20.00 · off');
+  assert.equal(off.used + off.rest, '€15.00 of €20.00 · off');
   const noLimit = extraUsageBar({ quota: { spend: normalizeSpend({
     extra_usage: { is_enabled: true }, spend: { used: { amount_minor: 4237, currency: 'USD', exponent: 2 } },
   }) } });
   assert.equal(noLimit.ratio, null);
-  assert.equal(noLimit.value, '$42.37');
+  assert.equal(noLimit.used, '$42.37');
+  assert.equal(noLimit.rest, '');
 });
 
 test('the extra-usage helpers run inside the serialized bundle, money helpers included', () => {
@@ -677,7 +688,8 @@ test('the account card draws extra usage as a bar beside the weekly ones', async
   assert.equal(page.labelled('Weekly'), 2);
   // Only the account that can bill carries one.
   assert.equal(page.labelled('Extra'), 1);
-  assert.equal(page.labelled('$14.35 of $20.00 cap'), 1);
+  assert.equal(page.labelled('$14.35'), 1);
+  assert.equal(page.labelled(' of $20.00 cap'), 1);
 });
 
 test('the serialized helpers run in the page\'s own scope, not just parse', () => {
@@ -778,17 +790,17 @@ test('the page carries the threshold control and wires it', () => {
   const html = renderDashboardHtml();
   assert.ok(html.includes('id="thrVal"'), 'the percentage field');
   assert.ok(html.includes('id="thrSet"'), 'the Set button');
-  assert.ok(html.includes("getElementById('thrSet').addEventListener"), 'the click handler');
+  assert.ok(html.includes("byId('thrSet').addEventListener"), 'the click handler');
   // Enter in the field is the same action: a number typed and left alone would
   // otherwise look applied without being saved.
-  assert.ok(html.includes("getElementById('thrVal').addEventListener"), 'the Enter handler');
+  assert.ok(html.includes("byId('thrVal').addEventListener"), 'the Enter handler');
 });
 
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, seriesBars, seriesTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -844,15 +856,30 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     removeAttribute: k => rootAttrs.delete(k),
     getAttribute: k => (rootAttrs.has(k) ? rootAttrs.get(k) : null),
   };
-  const document = { getElementById: byId, createElement: () => stubEl(), documentElement };
+  const docListeners = new Map();
+  const document = {
+    getElementById: byId, createElement: () => stubEl(), createElementNS: () => stubEl(), documentElement,
+    addEventListener: (type, fn) => { if (!docListeners.has(type)) docListeners.set(type, []); docListeners.get(type).push(fn); },
+  };
+  const keydown = key => { for (const fn of docListeners.get('keydown') || []) fn({ key }); };
   const html = renderDashboardHtml();
   const script = inlineScripts(html).at(-1);
   new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', script)(
     document, localStorage, fetch, () => 1, () => {});
-  const answer = async (status, body = {}) => {
-    requests.shift().resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
+  // The chart's history is its own fetch, sent after a status that shows a
+  // client. `answer` resolves the oldest request that is NOT that one, so a
+  // test about the controls reads the same whether or not a chart is on the
+  // page; `answerSeries` resolves it.
+  const isSeries = r => r.url === '/teamclaude/usage/series';
+  const settle = async (index, status, body) => {
+    assert.notEqual(index, -1, 'no such request pending');
+    const [req] = requests.splice(index, 1);
+    req.resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
     await new Promise(r => setImmediate(r));
   };
+  const answer = (status, body = {}) => settle(requests.findIndex(r => !isSeries(r)), status, body);
+  const answerSeries = (body, status = 200) => settle(requests.findIndex(isSeries), status, body);
+  const pending = () => requests.filter(r => !isSeries(r));
   // Click the control carrying this label, whoever built it. A render replaces
   // a table by building new elements rather than mutating the old ones, so the
   // mark is what keeps `labelled` counting what is on the page now instead of
@@ -865,7 +892,16 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     el.fire('click');
   };
   const labelled = label => built.slice(mark).filter(e => e.textContent === label).length;
-  return { byId, store, requests, answer, rootAttrs, click, labelled };
+  // Controls that carry no text of their own (the settings gear) are found by
+  // the title the page gives them.
+  const clickTitled = title => {
+    const el = built.find(e => e.title === title && e.listens('click'));
+    assert.ok(el, `no clickable element titled ${title}`);
+    mark = built.length;
+    el.fire('click');
+  };
+  const titled = title => built.slice(mark).filter(e => e.title === title).length;
+  return { byId, store, requests, pending, answer, answerSeries, rootAttrs, click, clickTitled, titled, labelled, keydown };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
@@ -894,7 +930,7 @@ for (const status of [401, 403]) {
 test('a first poll that fails shows its error instead of a blank page', async () => {
   const page = bootPage();
   await page.answer(500);
-  assert.equal(page.byId('err').style.display, 'block');
+  assert.equal(page.byId('err').style.display, 'flex');
   assert.match(page.byId('err').textContent, /status 500/);
   assert.equal(page.byId('app').style.display, '');
 });
@@ -908,11 +944,13 @@ test('the Most used chart draws a bar per client and switches measure without po
   assert.equal(page.byId('clientChartWrap').style.display, '');
   // Each client is named once by its bar and once by its table row.
   assert.equal(page.labelled('alice'), 2);
-  assert.equal(page.labelled('100 tok · 91%'), 1);
+  assert.equal(page.labelled('100 tok'), 1);
+  assert.equal(page.labelled(' · 91%'), 1);
   page.click('Requests');
-  assert.equal(page.requests.length, 0, 'the measure re-renders the last status rather than fetching');
+  assert.equal(page.pending().length, 0, 'the measure re-renders the last status rather than fetching');
   assert.equal(page.labelled('bob'), 2);
-  assert.equal(page.labelled('9 req · 75%'), 1);
+  assert.equal(page.labelled('9 req'), 1);
+  assert.equal(page.labelled(' · 75%'), 1);
 });
 
 test('viewerCan mirrors the server: operator everything, tenant the nudges, readonly nothing', () => {
@@ -936,26 +974,89 @@ const ROLE_STATUS = viewer => ({
 test('a read-only viewer is shown no controls, and told why', async () => {
   const page = bootPage();
   await page.answer(200, ROLE_STATUS({ client: 'watcher', role: 'readonly' }));
-  for (const label of ['switch', 'disable', 'prioritize', 'deprioritize']) {
-    assert.equal(page.labelled(label), 0, label);
-  }
+  // Every account control lives behind the settings gear, which it does not get.
+  assert.equal(page.titled('Settings for alice@example.com'), 0);
+  assert.equal(page.titled('Settings for bob@example.com'), 0);
   assert.equal(page.byId('reload').style.display, 'none');
   assert.equal(page.byId('probe').style.display, 'none');
   assert.equal(page.byId('thrWrap').style.display, 'none');
-  assert.equal(page.labelled('watcher'), 1, 'the summary names who is signed in');
-  assert.equal(page.labelled(' (read-only)'), 1);
+  assert.equal(page.labelled('watcher'), 1, 'the header names who is signed in');
+  assert.equal(page.labelled('read-only'), 1, 'and as what');
 });
 
 test('an admin viewer gets every control', async () => {
   const page = bootPage();
   await page.answer(200, ROLE_STATUS({ client: 'boss', role: 'operator' }));
-  // bob is not current, so it carries the switch; both carry the account controls.
-  assert.equal(page.labelled('switch'), 1);
-  assert.equal(page.labelled('disable'), 2);
-  assert.equal(page.labelled('prioritize'), 2);
+  assert.equal(page.titled('Settings for alice@example.com'), 1);
+  assert.equal(page.titled('Settings for bob@example.com'), 1);
   assert.equal(page.byId('reload').style.display, '');
   assert.equal(page.byId('thrWrap').style.display, '');
-  assert.equal(page.labelled(' (admin)'), 1);
+  assert.equal(page.labelled('admin'), 1);
+
+  // bob is not current: its dialog offers the switch, and the account controls.
+  page.clickTitled('Settings for bob@example.com');
+  assert.equal(page.byId('settingsWrap').style.display, '', 'the dialog opens');
+  assert.equal(page.labelled('Switch to this'), 1);
+  assert.equal(page.labelled('Priority'), 1);
+  assert.equal(page.labelled('Enabled'), 1);
+  // alice is current: the dialog says so instead of offering to switch.
+  page.clickTitled('Settings for alice@example.com');
+  assert.equal(page.labelled('In use'), 1);
+  assert.equal(page.labelled('Switch to this'), 0);
+});
+
+test('the settings dialog sends the switch, the priority steps and the toggle', async () => {
+  const page = bootPage();
+  await page.answer(200, ROLE_STATUS({ client: 'boss', role: 'operator' }));
+  page.clickTitled('Settings for bob@example.com');
+  const sent = () => {
+    const r = page.pending().at(-1);
+    return { url: r.url, body: JSON.parse(r.init.body) };
+  };
+  page.click('Switch to this');
+  assert.deepEqual(sent(), { url: '/teamclaude/switch', body: { account: 'bob@example.com' } });
+  await page.answer(200, { ok: true, account: 'bob@example.com', eligible: true });
+  // The number, not a rank: rotation picks the lowest first, so + moves it later.
+  page.clickTitled('Settings for bob@example.com');
+  page.click('+');
+  assert.deepEqual(sent(), { url: '/teamclaude/priority', body: { account: 'bob@example.com', priority: 1 } });
+  page.clickTitled('Settings for bob@example.com');
+  page.click('−');
+  assert.deepEqual(sent(), { url: '/teamclaude/priority', body: { account: 'bob@example.com', priority: -1 } });
+  page.clickTitled('Disable bob@example.com');
+  assert.deepEqual(sent(), { url: '/teamclaude/disable', body: { account: 'bob@example.com', disabled: true } });
+});
+
+test('a disabled account\'s dialog offers to enable it, not to switch to it', async () => {
+  const page = bootPage();
+  const status = ROLE_STATUS({ client: 'boss', role: 'operator' });
+  status.accounts[1].disabled = true;
+  await page.answer(200, status);
+  page.clickTitled('Settings for bob@example.com');
+  assert.equal(page.labelled('Switch to this'), 0);
+  assert.equal(page.labelled('Enable the account to switch to it'), 1);
+  page.clickTitled('Enable bob@example.com');
+  const r = page.pending().at(-1);
+  assert.equal(r.url, '/teamclaude/disable');
+  assert.deepEqual(JSON.parse(r.init.body), { account: 'bob@example.com', disabled: false });
+});
+
+test('a plain client key may switch from the dialog, and nothing more', async () => {
+  const page = bootPage();
+  await page.answer(200, ROLE_STATUS({ client: 'alice', role: 'tenant' }));
+  page.clickTitled('Settings for bob@example.com');
+  assert.equal(page.labelled('Switch to this'), 1);
+  assert.equal(page.labelled('Priority'), 0);
+  assert.equal(page.labelled('Enabled'), 0);
+});
+
+test('Escape closes the settings dialog', async () => {
+  const page = bootPage();
+  await page.answer(200, ROLE_STATUS({ client: 'boss', role: 'operator' }));
+  page.clickTitled('Settings for bob@example.com');
+  assert.equal(page.byId('settingsWrap').style.display, '');
+  page.keydown('Escape');
+  assert.equal(page.byId('settingsWrap').style.display, 'none');
 });
 
 test('Add account sends the start with the key and no body, and the finish with the trimmed code', () => {
@@ -1287,4 +1388,136 @@ test('selecting a window relabels every table it governs', async () => {
 
   page.click('Total');
   assert.equal(page.byId('clientsHeading').textContent, 'Clients', 'and back again');
+});
+
+// ── Usage over time ─────────────────────────────────────────
+
+// A series the way GET /teamclaude/usage/series answers: 24 hourly buckets,
+// oldest first, ending at `end`.
+const HOUR = 3600_000;
+const END = 1_000 * HOUR;
+const hourly = (values) => { const a = new Array(24).fill(0); values.forEach(([i, v]) => { a[i] = v; }); return a; };
+const SERIES = {
+  slotMs: HOUR / 4, bucketMs: HOUR, buckets: 24, end: END,
+  clients: {
+    alice: { requests: hourly([[23, 2], [10, 1]]), inputTokens: hourly([[23, 100], [10, 50]]), outputTokens: hourly([[23, 20]]) },
+    bob: { requests: hourly([[23, 5]]), inputTokens: hourly([[23, 10]]), outputTokens: hourly([[20, 30]]) },
+    carol: { requests: hourly([[22, 1]]), inputTokens: hourly([[22, 7]]), outputTokens: hourly([]) },
+    dave: { requests: hourly([[23, 1]]), inputTokens: hourly([[23, 3]]), outputTokens: hourly([]) },
+  },
+};
+
+test('seriesBars stacks the two biggest clients and folds the rest into others', () => {
+  const chart = seriesBars(SERIES, '24h', 'tokens');
+  assert.equal(chart.bars.length, 24);
+  assert.deepEqual(chart.legend, ['alice', 'bob'], 'ranked by tokens over the shown range');
+  assert.equal(chart.hasOthers, true);
+  const last = chart.bars[23];
+  assert.deepEqual(last.parts, [120, 10]);
+  assert.equal(last.others, 3);
+  assert.equal(last.total, 133);
+  assert.equal(last.end, END);
+  assert.equal(last.start, END - HOUR);
+  assert.equal(chart.bars[0].start, END - 24 * HOUR);
+  assert.equal(chart.peak, 133);
+  assert.equal(chart.total, 120 + 50 + 10 + 30 + 7 + 3);
+  assert.equal(chart.spanMs, 24 * HOUR);
+});
+
+test('seriesBars shows the last five hours for 5h, and Total as the whole day', () => {
+  const five = seriesBars(SERIES, '5h', 'tokens');
+  assert.equal(five.bars.length, 5);
+  assert.equal(five.bars[0].start, END - 5 * HOUR);
+  // alice's bucket 10 is outside the five hours, so it does not count toward her rank.
+  assert.equal(five.total, 120 + 10 + 30 + 7 + 3);
+  assert.deepEqual(seriesBars(SERIES, 'total', 'tokens').bars.length, 24);
+});
+
+test('seriesBars ranks and sums by requests when asked', () => {
+  const chart = seriesBars(SERIES, '24h', 'requests');
+  assert.deepEqual(chart.legend, ['bob', 'alice']);
+  assert.deepEqual(chart.bars[23].parts, [5, 2]);
+  assert.equal(chart.bars[23].others, 1);
+  assert.equal(chart.total, 2 + 1 + 5 + 1 + 1);
+});
+
+test('seriesBars tolerates nothing to draw', () => {
+  for (const series of [null, {}, { buckets: 0, clients: {} }]) {
+    const chart = seriesBars(series, '24h', 'tokens');
+    assert.deepEqual(chart.bars, []);
+    assert.equal(chart.total, 0);
+    assert.deepEqual(chart.legend, []);
+  }
+  const quiet = seriesBars({ ...SERIES, clients: { alice: { requests: hourly([]), inputTokens: hourly([]), outputTokens: hourly([]) } } }, '24h', 'tokens');
+  assert.equal(quiet.bars.length, 24, 'a quiet day still has its hours');
+  assert.deepEqual(quiet.legend, [], 'and names nobody');
+  assert.equal(quiet.hasOthers, false);
+});
+
+test('seriesTicks label the axis the way the design does', () => {
+  assert.deepEqual(seriesTicks(24 * HOUR), ['-24h', '-18h', '-12h', '-6h', 'now']);
+  assert.deepEqual(seriesTicks(5 * HOUR), ['-5h', '-4h', '-3h', '-2h', '-1h', 'now']);
+  assert.deepEqual(seriesTicks(0), []);
+});
+
+test('meterTone bands a meter on the legend\'s thresholds', () => {
+  assert.equal(meterTone(0), 'ok');
+  assert.equal(meterTone(0.59), 'ok');
+  assert.equal(meterTone(0.6), 'warn');
+  assert.equal(meterTone(0.89), 'warn');
+  assert.equal(meterTone(0.9), 'bad');
+  assert.equal(meterTone(1.2), 'bad');
+  assert.equal(meterTone(null), 'ok');
+});
+
+test('the chart helpers run inside the serialized bundle', () => {
+  const script = inlineScripts(renderDashboardHtml()).at(-1);
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const isolated = new Function(`${bundle}; return { seriesBars, seriesTicks, meterTone };`)();
+  assert.deepEqual(isolated.seriesBars(SERIES, '5h', 'requests'), seriesBars(SERIES, '5h', 'requests'));
+  assert.deepEqual(isolated.seriesTicks(24 * HOUR), seriesTicks(24 * HOUR));
+  assert.equal(isolated.meterTone(0.7), 'warn');
+});
+
+test('a status with a client fetches the usage series and draws it', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], clients: { alice: { requests: 3, inputTokens: 150, outputTokens: 20 } } });
+  const req = page.requests.find(r => r.url === '/teamclaude/usage/series');
+  assert.ok(req, 'the chart asks for its history');
+  assert.equal(req.init.headers['x-api-key'], '', 'with the same key as the status poll');
+  assert.equal(page.byId('seriesWrap').style.display, '');
+  assert.equal(page.byId('seriesTotal').textContent, '—', 'nothing to total before the history lands');
+  await page.answerSeries(SERIES);
+  assert.equal(page.byId('seriesTotal').textContent, '220 tok');
+  assert.equal(page.byId('seriesCaption').textContent, 'Tokens · last 24h, hourly');
+  assert.equal(page.labelled('others'), 1, 'the legend names the fold');
+  page.click('Last 5h');
+  assert.equal(page.byId('seriesCaption').textContent, 'Tokens · last 5h, hourly', 'the window control redraws it');
+  assert.equal(page.labelled('-5h'), 1);
+  page.click('Requests');
+  assert.equal(page.byId('seriesTotal').textContent, '9 req');
+  assert.equal(page.pending().length, 0, 'redrawn from the fetched series, not re-fetched');
+});
+
+test('a series that fails to load says so in the chart', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], clients: { alice: { requests: 1 } } });
+  await page.answerSeries({}, 500);
+  assert.equal(page.labelled('Usage history unavailable: status 500'), 1);
+});
+
+test('no client, no chart and no series fetch', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  assert.equal(page.byId('seriesWrap').style.display, 'none');
+  assert.equal(page.byId('usageRow').style.display, 'none');
+  assert.equal(page.requests.some(r => r.url === '/teamclaude/usage/series'), false);
+});
+
+test('the page embeds its fonts, and the policy admits only those', () => {
+  const html = renderDashboardHtml();
+  assert.match(html, /@font-face \{ font-family: 'Geist'; src: url\(data:font\/woff2;base64,/);
+  assert.match(html, /@font-face \{ font-family: 'Geist Mono'; src: url\(data:font\/woff2;base64,/);
+  assert.doesNotMatch(html, /fonts\.googleapis|fonts\.gstatic/);
+  assert.match(dashboardCsp(), /(^|; )font-src data:(;|$)/);
 });

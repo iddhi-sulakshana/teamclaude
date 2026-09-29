@@ -3,14 +3,16 @@
 //
 // The page itself contains NO data — it is a static asset whose script fetches
 // /teamclaude/status (same origin) with the proxy key and re-renders every few
-// seconds. That split is what lets the asset be served without the key (a
+// seconds, and /teamclaude/usage/series, behind the same gate, for the usage-
+// over-time chart. That split is what lets the asset be served without the key (a
 // browser address bar cannot send x-api-key) while every byte of actual status
 // stays behind the existing gate. The key is asked for only when the server
 // refuses the page without one (401/403; loopback browsers are exempt), and is
 // kept in localStorage; a later refusal (wrong or rotated key) asks again.
 //
 // Self-contained on purpose: no external scripts, styles, or fonts, so the
-// page works on air-gapped deployments and adds no third-party surface. All
+// page works on air-gapped deployments and adds no third-party surface. Its
+// typeface (Geist) is embedded rather than fetched, for the same reason. All
 // rendering uses textContent — status fields (account names, client names) are
 // operator/OAuth-derived, but they still never reach innerHTML.
 
@@ -19,6 +21,7 @@ import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js'
 import { USAGE_WINDOWS } from './client-usage.js';
 import { formatMoney } from './oauth.js';
 import { resolveMaxSpendMinor, spendCapReached } from './model.js';
+import { GEIST_WOFF2, GEIST_MONO_WOFF2 } from './dashboard-fonts.js';
 
 export function renderDashboardHtml() {
   return PAGE;
@@ -63,6 +66,9 @@ export function dashboardCsp(html = PAGE) {
     "default-src 'none'",
     `script-src ${hashes}`,
     "style-src 'unsafe-inline'",
+    // The two Geist faces, inlined into the page's own stylesheet as data:
+    // URLs (dashboard-fonts.js). Nothing else can be a font source.
+    "font-src data:",
     "connect-src 'self'",
     "base-uri 'none'",
     "form-action 'none'",
@@ -204,13 +210,16 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   var status = a.disabled ? 'disabled' : (a.status || 'unknown');
   var recent = Number.isFinite(a.sessions) ? a.sessions : 0;
   var known = Number.isFinite(a.knownSessions) ? a.knownSessions : 0;
-  var badges = [
-    { cls: 'provider ' + (a.provider || 'unknown'), text: providerLabel(a.provider) },
-    { cls: 'meta', text: a.type || 'unknown' },
-    { cls: 'meta priority', text: 'prio ' + (a.priority || 0) },
-  ];
+  // What sets this account apart, and nothing every card would repeat: the
+  // common case — a Claude OAuth account, active — earns no badge for any of
+  // the three, so the ones that do show are the ones worth reading. Current
+  // leads, as the card's accent border already says.
+  var badges = [];
   if (isCurrent) badges.push({ cls: 'current', text: 'current' });
-  badges.push({ cls: status, text: status });
+  badges.push({ cls: 'meta priority', text: 'prio ' + (a.priority || 0) });
+  if (status !== 'active') badges.push({ cls: status, text: status });
+  if (a.provider && a.provider !== 'anthropic') badges.push({ cls: 'provider ' + a.provider, text: providerLabel(a.provider) });
+  if (a.type && a.type !== 'oauth') badges.push({ cls: 'meta', text: a.type });
   if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
   if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
   // Free Codex rate-limit reset credits this account holds — what it could
@@ -277,17 +286,19 @@ export function extraUsageText(account) {
   return 'Extra usage: ' + amount + ' spent this month, ' + why;
 }
 
-// The card's Extra bar, drawn beside Session and Weekly: this month's extra
+// The card's Extra meter, drawn beside Session and Weekly: this month's extra
 // usage against the ceiling that binds first — the operator's `maxSpend` when
-// it is below upstream's monthly limit, else that limit. The value names which
-// ("of $20.00 cap"), so a bar filling toward the cap is not read as one filling
-// toward the limit. `ratio` is null with neither ceiling known (an empty bar
-// behind the bare amount), and unclamped: upstream can report a month past its
-// limit. `off` marks an account that billed this month and cannot now. Shown
-// for exactly the accounts extraUsageText has words for.
+// it is below upstream's monthly limit, else that limit. `used` is the amount
+// and `rest` what it is measured against ("of $20.00 cap"), apart so the card
+// can set the amount the way it sets the other meters' percentages; naming the
+// cap keeps a meter filling toward it from being read as one filling toward
+// the limit. `ratio` is null with neither ceiling known (an empty meter behind
+// the bare amount), and unclamped: upstream can report a month past its limit.
+// `off` marks an account that billed this month and cannot now. Shown for
+// exactly the accounts extraUsageText has words for.
 /**
  * @param {Record<string, any>|null|undefined} account
- * @returns {{ ratio: number|null, value: string, title: string, off: boolean }|null}
+ * @returns {{ ratio: number|null, used: string, rest: string, title: string, off: boolean }|null}
  */
 export function extraUsageBar(account) {
   var title = extraUsageText(account);
@@ -300,9 +311,78 @@ export function extraUsageBar(account) {
   var capBinds = capMinor != null && (limitMinor == null || capMinor < limitMinor);
   var ceiling = capBinds ? capMinor : limitMinor;
   var ratio = ceiling == null ? null : ceiling > 0 ? used / ceiling : (used > 0 ? 1 : 0);
-  var value = formatMoney({ currency: spend.currency, exponent: spend.exponent, usedMinor: used, limitMinor: ceiling })
-    + (capBinds ? ' cap' : '') + (spend.enabled ? '' : ' · off');
-  return { ratio: ratio, value: value, title: title, off: !spend.enabled };
+  var money = function (/** @type {number} */ minor) {
+    return formatMoney({ currency: spend.currency, exponent: spend.exponent, usedMinor: minor, limitMinor: null });
+  };
+  var rest = (ceiling == null ? '' : ' of ' + money(ceiling) + (capBinds ? ' cap' : ''))
+    + (spend.enabled ? '' : ' · off');
+  return { ratio: ratio, used: money(used), rest: rest, title: title, off: !spend.enabled };
+}
+
+// A meter's colour band, on the thresholds the Accounts legend names: under
+// 60% is fine, 60–90% is worth a look, 90% and over is nearly gone.
+/** @param {number|null|undefined} ratio */
+export function meterTone(ratio) {
+  if (ratio == null || !isFinite(ratio)) return 'ok';
+  return ratio >= 0.9 ? 'bad' : ratio >= 0.6 ? 'warn' : 'ok';
+}
+
+// The usage-over-time chart, from GET /teamclaude/usage/series: one bar per
+// bucket of the window shown — the last five for `5h`, the whole day for `24h`
+// and for `total`, which has no series of its own (the chart says so) — each
+// stacked by client. The two biggest clients over the shown range get a
+// segment of their own and the rest share one, which is what the legend can
+// name without turning into a second table. `parts` are in legend order, so a
+// bar's bottom segment is always the biggest client's.
+/**
+ * @param {any} series
+ * @param {string} [view]
+ * @param {string} [metric]
+ */
+export function seriesBars(series, view, metric) {
+  var s = series || {};
+  var n = Number.isInteger(s.buckets) && s.buckets > 0 ? s.buckets : 0;
+  var bucketMs = s.bucketMs || 0;
+  var shown = view === '5h' && bucketMs ? Math.min(n, Math.max(1, Math.round(5 * 3600000 / bucketMs))) : n;
+  var from = n - shown;
+  var clients = s.clients || {};
+  var at = function (/** @type {any} */ c, /** @type {number} */ i) {
+    if (metric === 'requests') return (c.requests || [])[i] || 0;
+    return ((c.inputTokens || [])[i] || 0) + ((c.outputTokens || [])[i] || 0);
+  };
+  var ranked = Object.keys(clients).map(function (name) {
+    var sum = 0;
+    for (var i = from; i < n; i++) sum += at(clients[name], i);
+    return { name: name, sum: sum };
+  }).filter(function (r) { return r.sum > 0; });
+  ranked.sort(function (x, y) { return (y.sum - x.sum) || (x.name < y.name ? -1 : x.name > y.name ? 1 : 0); });
+  var legend = ranked.slice(0, 2).map(function (r) { return r.name; });
+  var rest = ranked.slice(2).map(function (r) { return r.name; });
+  var bars = [], peak = 0, total = 0;
+  for (var i = from; i < n; i++) {
+    var parts = legend.map(function (name) { return at(clients[name], i); });
+    var others = 0;
+    rest.forEach(function (name) { others += at(clients[name], i); });
+    var sum = others;
+    parts.forEach(function (v) { sum += v; });
+    bars.push({ start: s.end - (n - i) * bucketMs, end: s.end - (n - 1 - i) * bucketMs, parts: parts, others: others, total: sum });
+    if (sum > peak) peak = sum;
+    total += sum;
+  }
+  return { bars: bars, legend: legend, hasOthers: rest.length > 0, peak: peak, total: total, spanMs: shown * bucketMs };
+}
+
+// The chart's axis labels, oldest first and ending at "now": every hour for a
+// span of six hours or less, every quarter of the span beyond that.
+/** @param {number} spanMs */
+export function seriesTicks(spanMs) {
+  var hours = Math.round((spanMs || 0) / 3600000);
+  if (hours <= 0) return [];
+  var step = hours <= 6 ? 1 : Math.max(1, Math.round(hours / 4));
+  var out = [];
+  for (var h = hours; h > 0; h -= step) out.push('-' + h + 'h');
+  out.push('now');
+  return out;
 }
 
 // One row per CONVERSATION, from `sessions.items` (proxy.sessionDetail). A
@@ -754,7 +834,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
-  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar,
+  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, seriesBars, seriesTicks,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -771,6 +851,53 @@ const SHARED_CONSTS = [
   `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
 ].join('\n');
 
+// The dark palette is the design's own and the default; the light one is the
+// same system with the values turned over. Both are defined twice for the
+// same reason as before: once under the media query, for a viewer who has
+// stored no choice, and once under the attribute, for one who has. The media
+// rule excludes an explicit dark choice, so choosing dark on a light desktop is
+// honoured rather than overridden by the system.
+const DARK_TOKENS = `
+    color-scheme: dark;
+    --bg: #0B0C0E; --glow: rgba(217,119,87,0.10); --panel: #111215; --raised: #15161A; --raised-2: #1A1B1F;
+    --raised-hover: #1C1D22; --modal: #131417; --field: #0B0C0E;
+    --line: rgba(255,255,255,0.07); --line-btn: rgba(255,255,255,0.09); --line-strong: rgba(255,255,255,0.1);
+    --line-mid: rgba(255,255,255,0.08); --line-soft: rgba(255,255,255,0.06); --row-line: rgba(255,255,255,0.04);
+    --text: #ECECEE; --text-strong: #FFFFFF; --text-2: #D4D5D9; --muted: #B5B7BD; --dim: #8B8D94; --faint: #6F727A; --placeholder: #5D6068;
+    --chip: rgba(255,255,255,0.06); --track: rgba(255,255,255,0.05); --sel: #2A2B31; --hover-soft: rgba(255,255,255,0.06);
+    --hover-faint: rgba(255,255,255,0.03); --seg-off: rgba(255,255,255,0.1); --toggle-off: rgba(255,255,255,0.12);
+    --grid: rgba(255,255,255,0.04); --axis: rgba(255,255,255,0.08);
+    --accent: oklch(0.7 0.14 45); --accent-hover: oklch(0.76 0.13 48); --on-accent: #1A0F0A; --logo: oklch(0.68 0.14 42);
+    --accent-soft: rgba(217,119,87,0.16); --accent-text: oklch(0.82 0.12 50); --accent-line: rgba(217,119,87,0.4); --link: oklch(0.78 0.13 50);
+    --series-1: oklch(0.7 0.14 45); --series-2: oklch(0.55 0.08 45); --series-other: #3A3C43; --share-2: oklch(0.62 0.1 45);
+    --ok: oklch(0.72 0.15 150); --ok-text: oklch(0.78 0.15 150); --ok-ring: rgba(80,200,120,0.15);
+    --warn: oklch(0.8 0.14 80); --warn-text: oklch(0.84 0.13 80); --warn-soft: rgba(230,180,60,0.08); --warn-line: rgba(230,180,60,0.25);
+    --bad: oklch(0.66 0.19 25); --bad-text: #FF9A88; --bad-soft: rgba(255,100,80,0.12); --bad-line: rgba(255,100,80,0.3);
+    --scrim: rgba(5,5,7,0.72); --shadow: 0 30px 80px rgba(0,0,0,0.6);
+    --av-l: 0.35; --av-c: 0.06; --av-fg-l: 0.9;`;
+
+const LIGHT_TOKENS = `
+    color-scheme: light;
+    --bg: #F6F5F2; --glow: rgba(217,119,87,0.12); --panel: #FFFFFF; --raised: #FFFFFF; --raised-2: #F3F2EF;
+    --raised-hover: #EFEEEA; --modal: #FFFFFF; --field: #F6F5F2;
+    --line: rgba(20,20,30,0.09); --line-btn: rgba(20,20,30,0.12); --line-strong: rgba(20,20,30,0.14);
+    --line-mid: rgba(20,20,30,0.1); --line-soft: rgba(20,20,30,0.07); --row-line: rgba(20,20,30,0.05);
+    --text: #17181B; --text-strong: #000000; --text-2: #2B2C31; --muted: #4B4D54; --dim: #5F626A; --faint: #7C7F87; --placeholder: #9A9CA3;
+    --chip: rgba(20,20,30,0.05); --track: rgba(20,20,30,0.07); --sel: #E8E6E1; --hover-soft: rgba(20,20,30,0.05);
+    --hover-faint: rgba(20,20,30,0.03); --seg-off: rgba(20,20,30,0.12); --toggle-off: rgba(20,20,30,0.18);
+    --grid: rgba(20,20,30,0.06); --axis: rgba(20,20,30,0.12);
+    --accent: oklch(0.68 0.15 45); --accent-hover: oklch(0.63 0.15 45); --on-accent: #1A0F0A; --logo: oklch(0.68 0.14 42);
+    --accent-soft: rgba(217,119,87,0.14); --accent-text: oklch(0.5 0.13 45); --accent-line: rgba(217,119,87,0.55); --link: oklch(0.52 0.14 45);
+    --series-1: oklch(0.66 0.15 45); --series-2: oklch(0.8 0.08 50); --series-other: #D6D4CF; --share-2: oklch(0.76 0.09 48);
+    --ok: oklch(0.64 0.15 150); --ok-text: oklch(0.48 0.13 150); --ok-ring: rgba(40,160,90,0.18);
+    --warn: oklch(0.76 0.15 80); --warn-text: oklch(0.5 0.11 70); --warn-soft: rgba(210,160,40,0.12); --warn-line: rgba(200,150,30,0.35);
+    --bad: oklch(0.6 0.2 25); --bad-text: oklch(0.5 0.18 25); --bad-soft: rgba(220,70,50,0.09); --bad-line: rgba(220,70,50,0.3);
+    --scrim: rgba(30,30,36,0.35); --shadow: 0 30px 80px rgba(0,0,0,0.18);
+    --av-l: 0.92; --av-c: 0.05; --av-fg-l: 0.42;`;
+
+// The settings button's gear, as the design draws it (Feather's "settings").
+const GEAR_PATH = 'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z';
+
 const PAGE = `<!doctype html>
 <html lang="en">
 <head>
@@ -778,149 +905,264 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TeamClaude</title>
 <style>
-  /* Dark is the default, and stays the default for a viewer whose system says
-     nothing. The light palette is applied two ways: by the media query when no
-     choice has been stored (data-theme absent), and by the attribute when one
-     has. The media rule excludes an explicit dark choice, so choosing dark on a
-     light desktop is honoured rather than overridden by the system.
-     --chart is the Clients chart's bar colour, a token of its own because the
-     dark accent is too light for a filled data mark; each step clears 3:1 on
-     its theme's panel. */
-  :root {
-    color-scheme: dark;
-    --bg: #101418; --panel: #171d24; --line: #242c36;
-    --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd;
-    --ok: #3fb950; --warn: #d29922; --bad: #f85149;
-    --chart: #3987e5;
+  @font-face { font-family: 'Geist'; src: url(data:font/woff2;base64,${GEIST_WOFF2}) format('woff2'); font-weight: 100 900; font-style: normal; font-display: swap; }
+  @font-face { font-family: 'Geist Mono'; src: url(data:font/woff2;base64,${GEIST_MONO_WOFF2}) format('woff2'); font-weight: 100 900; font-style: normal; font-display: swap; }
+  :root {${DARK_TOKENS}
   }
   @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]) {
-      color-scheme: light;
-      --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
-      --text: #1f2328; --dim: #59636e; --accent: #0969da;
-      --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
-      --chart: #0969da;
+    :root:not([data-theme="dark"]) {${LIGHT_TOKENS}
     }
   }
-  :root[data-theme="light"] {
-    color-scheme: light;
-    --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
-    --text: #1f2328; --dim: #59636e; --accent: #0969da;
-    --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
-    --chart: #0969da;
+  :root[data-theme="light"] {${LIGHT_TOKENS}
   }
   * { box-sizing: border-box; margin: 0; }
-  body { background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; padding: 24px; }
-  main { max-width: 860px; margin: 0 auto; }
-  h1 { font-size: 18px; margin-bottom: 4px; }
-  h2 { font-size: 13px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; margin: 24px 0 8px; }
-  .sub { color: var(--dim); margin-bottom: 16px; }
-  .sub b { color: var(--text); font-weight: 600; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; }
-  .row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-  .name { font-weight: 600; }
-  .tag { font-size: 12px; color: var(--dim); }
-  .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
-  .badge.active { color: var(--ok); border-color: var(--ok); }
-  .badge.throttled { color: var(--warn); border-color: var(--warn); }
-  .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
-  .badge.current { color: var(--accent); border-color: var(--accent); }
-  .badge.provider { color: var(--text); }
-  .badge.provider.codex { color: var(--accent); border-color: var(--accent); }
-  .badge.meta { color: var(--dim); }
-  .badge.sessions { color: var(--text); }
-  .badge.sessions.known { color: var(--dim); }
-  .badge.extra-usage { color: var(--warn); border-color: var(--warn); }
-  .badge.extra-usage.billing { color: var(--bad); border-color: var(--bad); }
-  .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
-  .quota .lbl { color: var(--dim); font-size: 12px; }
-  .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
-  .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
-  .bar i { display: block; height: 100%; border-radius: 4px; background: var(--ok); }
-  .bar i.warn { background: var(--warn); }
-  .bar i.bad { background: var(--bad); }
-  .bar i.off { background: var(--dim); }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 6px 10px; font-variant-numeric: tabular-nums; }
-  th { color: var(--dim); font-size: 12px; font-weight: 500; border-bottom: 1px solid var(--line); }
-  td { border-bottom: 1px solid var(--line); }
+  html { background: var(--bg); }
+  body { min-height: 100vh; background: radial-gradient(1200px 500px at 50% -200px, var(--glow), transparent 70%), var(--bg); color: var(--text); font: 14px/1.5 'Geist', ui-sans-serif, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  .mono, td.num, .chart-total, .ticks, .acct-foot, .meter-top .mv, .share .val, .rt-to, .rt-fam span, .stepper .val, #key { font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button { font: inherit; }
+  input::placeholder { color: var(--placeholder); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 40px 28px 56px; }
+  #app { display: flex; flex-direction: column; gap: 28px; }
+
+  /* Header */
+  .top { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 20px; }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .logo { width: 40px; height: 40px; flex: none; border-radius: 11px; background: var(--logo); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 17px; color: var(--on-accent); letter-spacing: -0.02em; }
+  .brand-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .title { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.2; }
+  .who { font-size: 13px; color: var(--dim); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .who b { color: var(--text); font-weight: 500; }
+  .pill { font-size: 11px; padding: 2px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .btn { height: 34px; padding: 0 14px; border-radius: 9px; border: 1px solid var(--line-btn); background: var(--raised); color: var(--text-2); font-size: 13px; cursor: pointer; white-space: nowrap; }
+  .btn:hover { background: var(--raised-hover); color: var(--text-strong); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.primary { border: none; background: var(--accent); color: var(--on-accent); font-weight: 600; padding: 0 15px; }
+  .btn.primary:hover { background: var(--accent-hover); color: var(--on-accent); }
+  .btn.sm { height: 30px; padding: 0 12px; border-radius: 8px; font-size: 12px; background: var(--raised-2); color: var(--text); }
+  .btn.ghost { height: 28px; padding: 0 11px; border-radius: 7px; background: transparent; color: var(--muted); font-size: 12px; }
+  .btn.ghost:hover { background: var(--hover-soft); color: var(--text-strong); }
+  .btn.outline { height: 32px; padding: 0 13px; border-radius: 8px; border-color: var(--line-strong); background: transparent; }
+  .btn.outline:hover { background: var(--hover-soft); }
+  .btn.go { height: 32px; padding: 0 14px; border-radius: 8px; border: none; background: var(--accent); color: var(--on-accent); font-weight: 600; flex: none; }
+  .btn.go:hover { background: var(--accent-hover); color: var(--on-accent); }
+
+  /* Summary strip */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .stat { background: var(--panel); padding: 18px 20px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .stat.thr { padding: 14px 20px; }
+  .stat .k { font-size: 12px; color: var(--dim); }
+  .stat .v { font-size: 16px; font-weight: 500; display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .stat .v.stack { flex-direction: column; align-items: flex-start; gap: 4px; font-size: 14px; }
+  .stat .v .line { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; }
+  .stat .v .sub { color: var(--dim); font-weight: 400; }
+  #statConv { gap: 5px; }
+  .live { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--ok-ring); flex: none; }
+  .live.none { background: var(--faint); box-shadow: none; }
+  .ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .thr-row { display: flex; align-items: center; gap: 8px; }
+  .field { display: flex; align-items: center; height: 30px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--field); padding: 0 10px; gap: 4px; }
+  .field input { width: 44px; background: transparent; border: none; outline: none; color: var(--text); font: 14px 'Geist Mono', ui-monospace, monospace; text-align: right; -moz-appearance: textfield; appearance: textfield; }
+  .field input::-webkit-inner-spin-button, .field input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  .field span { color: var(--dim); font-size: 13px; }
+
+  /* Messages */
+  #problems { display: none; }
+  .alert { border-radius: 10px; padding: 10px 14px; font-size: 13px; display: flex; gap: 10px; align-items: flex-start; border: 1px solid transparent; }
+  .alert + .alert { margin-top: 8px; }
+  .alert::before { content: ''; width: 6px; height: 6px; border-radius: 50%; margin-top: 7px; flex: none; background: currentColor; }
+  .alert.bad { background: var(--bad-soft); color: var(--bad-text); border-color: var(--bad-line); }
+  .alert.warn { background: var(--warn-soft); color: var(--warn-text); border-color: var(--warn-line); }
+  #err { display: none; }
+  #note { display: none; font-size: 12px; padding: 8px 12px; border-radius: 9px; background: var(--panel); border: 1px solid var(--line); color: var(--dim); }
+  #note.ok, .set-note.ok { color: var(--ok-text); }
+  #note.warn, .set-note.warn { color: var(--warn-text); }
+  #note.error, .set-note.error { color: var(--bad-text); }
+
+  /* Sections */
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 20px; align-items: start; }
+  .sec { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .sec-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; min-height: 30px; }
+  .sec-title-row { display: flex; align-items: baseline; gap: 10px; }
+  .sec-title { font-size: 13px; font-weight: 500; color: var(--dim); letter-spacing: 0.01em; }
+  .sec-count { font-size: 12px; color: var(--faint); }
+  .panel { border-radius: 14px; border: 1px solid var(--line); background: var(--panel); min-width: 0; }
+  .panel.pad { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+  .tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .seg { display: flex; padding: 3px; border-radius: 9px; background: var(--raised); border: 1px solid var(--line); gap: 2px; }
+  .seg button { height: 24px; padding: 0 10px; border-radius: 6px; border: none; background: transparent; color: var(--dim); font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .seg button:hover { color: var(--text); }
+  .seg button.sel { background: var(--sel); color: var(--text); }
+  #dimViewSlot { display: none; justify-content: flex-end; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--dim); align-items: center; flex-wrap: wrap; }
+  .legend span { display: flex; align-items: center; gap: 6px; }
+  .sw { width: 8px; height: 8px; border-radius: 2px; flex: none; display: inline-block; }
+  .sw.s0 { background: var(--series-1); } .sw.s1 { background: var(--series-2); } .sw.so { background: var(--series-other); }
+  .sw.ok { background: var(--ok); } .sw.warn { background: var(--warn); } .sw.bad { background: var(--bad); }
+
+  /* Usage over time */
+  .chart-top { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+  .chart-id { display: flex; flex-direction: column; gap: 4px; }
+  .chart-cap { font-size: 12px; color: var(--faint); }
+  .chart-total { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.2; }
+  .bars { position: relative; height: 150px; display: flex; align-items: flex-end; gap: 4px; border-bottom: 1px solid var(--axis); background: repeating-linear-gradient(to top, transparent 0, transparent 49px, var(--grid) 49px, var(--grid) 50px); }
+  .col { flex: 1; height: 100%; min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; gap: 1px; border-radius: 3px 3px 0 0; overflow: hidden; opacity: .92; cursor: default; }
+  .col:hover { opacity: 1; background: var(--hover-faint); }
+  .col i { display: block; flex: none; }
+  .col i.s0 { background: var(--series-1); } .col i.s1 { background: var(--series-2); } .col i.so { background: var(--series-other); }
+  .bars-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--faint); text-align: center; padding: 0 12px; }
+  .ticks { display: flex; justify-content: space-between; font-size: 11px; color: var(--faint); }
+
+  /* Most used */
+  .share-lead { font-size: 12px; color: var(--faint); }
+  .shares { display: flex; flex-direction: column; gap: 14px; }
+  .share { display: grid; grid-template-columns: 84px 1fr auto; gap: 14px; align-items: center; font-size: 13px; }
+  .share .n { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .track { height: 8px; border-radius: 4px; background: var(--track); overflow: hidden; }
+  .track i { display: block; height: 100%; border-radius: 4px; background: var(--share-2); transition: width .4s ease; }
+  .track i.top { background: var(--accent); }
+  .share .val { font-size: 12px; color: var(--dim); min-width: 112px; text-align: right; white-space: nowrap; }
+  .share .val b { color: var(--text); font-weight: 400; }
+  .foot-note { font-size: 12px; color: var(--faint); line-height: 1.55; border-top: 1px solid var(--line-soft); padding-top: 14px; }
+
+  /* Accounts */
+  .acct-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr)); gap: 14px; }
+  .acct { border-radius: 14px; border: 1px solid var(--line); background: var(--panel); padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; transition: opacity .2s; min-width: 0; }
+  .acct.current { border-color: var(--accent-line); }
+  .acct.off { opacity: .5; }
+  .acct-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  .acct-id { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .acct-name-row { display: flex; align-items: center; gap: 9px; min-width: 0; }
+  .avatar { width: 28px; height: 28px; flex: none; border-radius: 8px; background: oklch(var(--av-l) var(--av-c) var(--h, 45)); color: oklch(var(--av-fg-l) 0.06 var(--h, 45)); font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: center; }
+  .avatar.lg { width: 34px; height: 34px; border-radius: 9px; font-size: 14px; }
+  .acct-name { font-size: 14.5px; font-weight: 600; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .chip { font-size: 11px; line-height: 1; padding: 4px 7px; border-radius: 5px; background: var(--chip); color: var(--muted); white-space: nowrap; }
+  .chip.current, .chip.provider { background: var(--accent-soft); color: var(--accent-text); }
+  .chip.disabled, .chip.error, .chip.exhausted, .chip.extra-usage.billing { background: var(--bad-soft); color: var(--bad-text); }
+  .chip.throttled, .chip.extra-usage { background: var(--warn-soft); color: var(--warn-text); }
+  .gear { width: 30px; height: 30px; flex: none; border-radius: 8px; border: 1px solid var(--line-strong); background: transparent; color: var(--muted); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; }
+  .gear:hover { background: var(--hover-soft); color: var(--text-strong); }
+  .blocked { font-size: 12px; color: var(--warn-text); background: var(--warn-soft); border-radius: 8px; padding: 8px 10px; display: flex; align-items: center; gap: 8px; }
+  .blocked::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); flex: none; }
+  .blocked.bad { color: var(--bad-text); background: var(--bad-soft); }
+  .blocked.bad::before { background: var(--bad); }
+  .meters { display: flex; flex-direction: column; gap: 11px; }
+  .meter { display: flex; flex-direction: column; gap: 6px; }
+  .meter-top { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }
+  .meter-top .lbl { color: var(--dim); }
+  .meter-top .mv { color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .meter-top .mv b { color: var(--text); font-weight: 400; }
+  .mbar { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
+  .mbar i { display: block; height: 100%; border-radius: 3px; background: var(--ok); }
+  .mbar i.warn { background: var(--warn); } .mbar i.bad { background: var(--bad); } .mbar i.off { background: var(--faint); }
+  .acct-note { font-size: 12px; color: var(--faint); }
+  .acct-foot { font-size: 12px; color: var(--faint); border-top: 1px solid var(--line-soft); padding-top: 11px; }
+
+  /* Routing */
+  .rt-row { display: grid; grid-template-columns: 1.1fr 1fr 1.2fr; gap: 12px; padding: 16px 20px; font-size: 13px; align-items: start; border-bottom: 1px solid var(--line-soft); }
+  .rt-row:last-child { border-bottom: none; }
+  .rt-row.head { padding: 12px 20px; font-size: 12px; color: var(--faint); }
+  .rt-fam { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .rt-fam b { font-weight: 500; }
+  .rt-fam span { font-size: 12px; color: var(--faint); }
+  .rt-to { font-size: 12.5px; overflow-wrap: anywhere; display: flex; flex-direction: column; gap: 3px; }
+  .rt-to .bad-t { color: var(--bad-text); }
+  .rt-note { font-family: 'Geist', ui-sans-serif, system-ui, sans-serif; font-size: 12px; color: var(--faint); }
+  .rt-note.pin { color: var(--accent-text); }
+  .rt-note.warn { color: var(--warn-text); }
+  .rt-can { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .rt-count { display: flex; align-items: center; gap: 8px; }
+  .rt-count b { color: var(--ok-text); font-weight: 500; white-space: nowrap; }
+  .segs { flex: 1; display: flex; gap: 2px; max-width: 96px; }
+  .segs i { flex: 1; height: 5px; border-radius: 2px; background: var(--seg-off); }
+  .segs i.on { background: var(--ok); }
+  .soft { color: var(--dim); }
+  .dimtext { font-size: 12px; color: var(--faint); }
+
+  /* Tables */
+  .tbl-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; min-width: 440px; }
+  table.wide { min-width: 980px; }
+  th, td { text-align: left; padding: 14px 12px; }
+  th { padding-top: 12px; padding-bottom: 12px; font-size: 12px; font-weight: 400; color: var(--faint); border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+  th:first-child, td:first-child { padding-left: 20px; }
+  th:last-child, td:last-child { padding-right: 20px; }
+  td { font-size: 13px; border-bottom: 1px solid var(--row-line); white-space: nowrap; }
   tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--hover-faint); }
   td.num, th.num { text-align: right; }
-  /* Clients chart: one series, so one colour and no legend — the heading
-     names what is plotted. Bars cap at 16px with a rounded end and a square
-     baseline; the row, not the painted bar, is the hover and focus target. */
-  #clientChartCard { position: relative; }
-  .chart-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
-  .chart-head .lead { color: var(--dim); font-size: 12px; }
-  .chart-head .seg { display: flex; gap: 6px; margin-left: auto; }
-  .chart-head .seg button { font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
-  .chart-head .seg button:hover { color: var(--text); border-color: var(--text); }
-  .chart-head .seg button.sel { color: var(--text); border-color: var(--accent); }
-  .crow { display: grid; grid-template-columns: minmax(64px, 140px) 1fr 108px; gap: 10px; align-items: center; min-height: 28px; padding: 0 6px; border-radius: 6px; }
-  .crow:hover, .crow:focus-visible { background: var(--bg); outline: none; }
-  .crow:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
-  .crow .cname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .crow .ctrack { height: 16px; }
-  .crow .cbar { height: 100%; background: var(--chart); border-radius: 0 4px 4px 0; }
-  .crow:hover .cbar, .crow:focus-visible .cbar { filter: brightness(1.15); }
-  .crow .cval { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .ctip { position: absolute; z-index: 5; display: none; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font-size: 12px; white-space: nowrap; box-shadow: 0 4px 16px rgba(0,0,0,.25); }
-  .ctip b { display: block; font-size: 13px; }
-  .ctip .dim { color: var(--dim); }
-  .chart-foot { color: var(--dim); font-size: 12px; margin-top: 8px; }
-  /* Add account panel. */
-  #loginWrap .title2 { font-weight: 600; }
-  #loginWrap ol { margin: 4px 0 0 18px; padding: 0; }
-  #loginWrap li { margin: 8px 0; }
-  #loginWrap a { color: var(--accent); }
-  #loginWrap li button { font: inherit; font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
-  #loginWrap li button:hover { color: var(--text); border-color: var(--text); }
-  #loginWrap li button:disabled { opacity: .5; cursor: default; }
-  #loginWrap #loginGo { color: var(--text); border-color: var(--accent); }
-  .loginRow { display: flex; gap: 8px; margin-top: 6px; }
-  .loginRow input { flex: 1; min-width: 0; font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
-  #loginNote { font-size: 12px; color: var(--dim); margin-top: 4px; }
-  #loginNote.ok { color: var(--ok); } #loginNote.error { color: var(--bad); }
-  @media (max-width: 520px) { .crow { grid-template-columns: minmax(56px, 96px) 1fr 92px; gap: 8px; } }
-  .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
-  .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
-  .act { font: inherit; font-size: 12px; padding: 1px 10px; border-radius: 999px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; margin-left: auto; }
-  .act:hover { background: var(--accent); color: var(--bg); }
-  .act:disabled { opacity: .5; cursor: default; }
-  #note { font-size: 12px; margin: 8px 0; display: none; }
-  #note.ok { color: var(--ok); } #note.warn { color: var(--warn); } #note.error { color: var(--bad); }
-  .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
-  .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
-  .filters select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 8px; }
-  .hint { color: var(--dim); font-size: 12px; margin-left: auto; }
-  .actions { display: flex; gap: 8px; margin: 8px 0 16px; }
-  .actions button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
-  .actions button:hover { color: var(--text); border-color: var(--text); }
-  .actions button:disabled { opacity: .5; cursor: default; }
-  .actions button.sel { color: var(--text); border-color: var(--accent); }
-  .actions .lbl { color: var(--dim); font-size: 12px; align-self: center; }
-  /* Pushed to the far end: the two buttons on the left act on the fleet as it
-     stands, while this one edits a stored setting — a gap says so without a
-     second row. */
-  .actions .thr { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 12px; color: var(--dim); }
-  .actions .thr input { width: 64px; font: inherit; font-size: 12px; padding: 4px 8px; text-align: right; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--text); }
+  td.dim { color: var(--faint); }
+  td.soft { color: var(--dim); }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
-  td.dim { color: var(--dim); }
-  .ok { color: var(--ok); }
-  .no { color: var(--dim); text-decoration: line-through; }
-  .pin { color: var(--accent); font-size: 12px; }
-  .warnt { color: var(--warn); font-size: 12px; }
-  .badt { color: var(--bad); }
-  #err { color: var(--bad); margin: 12px 0; display: none; }
-  #problems { display: none; margin: 0 0 16px; }
-  #problems div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
-  #problems .bad { background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad); }
-  #problems .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
-  #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
-  #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
-  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
-  footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
+  .ctag { display: inline-flex; align-items: center; gap: 9px; font-weight: 500; }
+  .ini { width: 22px; height: 22px; border-radius: 6px; background: var(--chip); font-size: 11px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); flex: none; }
+  .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line-soft); }
+  .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .filters select { height: 28px; background: var(--field); border: 1px solid var(--line-strong); border-radius: 8px; color: var(--text); font: inherit; font-size: 12px; padding: 0 8px; }
+  .hint { color: var(--faint); font-size: 12px; margin-left: auto; }
+
+  /* Dialogs */
+  .scrim { position: fixed; inset: 0; z-index: 50; background: var(--scrim); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .dialog { width: 100%; max-width: 520px; max-height: calc(100vh - 48px); overflow: auto; border-radius: 16px; border: 1px solid var(--line-btn); background: var(--modal); box-shadow: var(--shadow); padding: 24px; display: flex; flex-direction: column; gap: 20px; }
+  .dialog.flush { max-width: 460px; padding: 0; gap: 0; }
+  .dlg-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .dlg-title { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+  .steps { display: flex; flex-direction: column; gap: 18px; }
+  .step { display: flex; gap: 14px; align-items: flex-start; }
+  .step-n { width: 24px; height: 24px; flex: none; border-radius: 50%; background: var(--accent-soft); color: var(--accent-text); font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', ui-monospace, monospace; }
+  .step-body { display: flex; flex-direction: column; gap: 10px; flex: 1; min-width: 0; }
+  .step-text { font-size: 14px; line-height: 1.5; }
+  .row-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .link-btn { height: 32px; padding: 0 13px; border-radius: 8px; background: var(--text); color: var(--bg); font-size: 13px; font-weight: 500; display: inline-flex; align-items: center; }
+  .link-btn:hover { color: var(--bg); text-decoration: none; opacity: .9; }
+  .code-row { display: flex; gap: 8px; }
+  .code-row input { flex: 1; min-width: 0; height: 32px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--field); color: var(--text); padding: 0 12px; font: 13px 'Geist Mono', ui-monospace, monospace; outline: none; }
+  .code-row input:focus { border-color: var(--accent); }
+  #loginNote { font-size: 12px; color: var(--dim); line-height: 1.5; }
+  #loginNote.ok { color: var(--ok-text); } #loginNote.error { color: var(--bad-text); }
+  .set-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 20px 22px; border-bottom: 1px solid var(--line-soft); }
+  .set-id { display: flex; align-items: center; gap: 11px; min-width: 0; }
+  .set-id-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .set-name { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .set-sub { font-size: 12px; color: var(--dim); }
+  .set-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 22px; }
+  .set-row + .set-row { border-top: 1px solid var(--line-soft); }
+  .set-text { display: flex; flex-direction: column; gap: 3px; }
+  .set-text .t { font-size: 14px; font-weight: 500; }
+  .set-text .d { font-size: 12px; color: var(--dim); }
+  .set-note { display: none; padding: 12px 22px; font-size: 12px; color: var(--dim); border-top: 1px solid var(--line-soft); }
+  .inuse { font-size: 12px; padding: 5px 9px; border-radius: 6px; background: var(--accent-soft); color: var(--accent-text); flex: none; }
+  .stepper { display: flex; align-items: center; border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; flex: none; }
+  .stepper button { width: 32px; height: 32px; border: none; background: transparent; color: var(--muted); font-size: 15px; cursor: pointer; }
+  .stepper button:hover { background: var(--hover-soft); color: var(--text-strong); }
+  .stepper button:disabled { opacity: .5; cursor: default; }
+  .stepper .val { min-width: 34px; text-align: center; font-size: 14px; border-left: 1px solid var(--line-mid); border-right: 1px solid var(--line-mid); line-height: 32px; }
+  .toggle { width: 40px; height: 24px; flex: none; border-radius: 999px; border: none; padding: 3px; background: var(--toggle-off); cursor: pointer; display: flex; justify-content: flex-start; transition: background .15s; }
+  .toggle.on { background: var(--accent); justify-content: flex-end; }
+  .toggle:disabled { opacity: .5; cursor: default; }
+  .toggle span { width: 18px; height: 18px; border-radius: 50%; background: #FFFFFF; box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+
+  /* Key prompt and footer */
+  #keybox { display: none; max-width: 400px; margin: 12vh auto 0; }
+  .keycard { border-radius: 16px; border: 1px solid var(--line-btn); background: var(--modal); box-shadow: var(--shadow); padding: 28px; display: flex; flex-direction: column; gap: 16px; }
+  .keycard p { color: var(--dim); font-size: 13px; }
+  #key { width: 100%; height: 38px; border-radius: 9px; border: 1px solid var(--line-strong); background: var(--field); color: var(--text); padding: 0 12px; font-size: 13px; outline: none; }
+  #key:focus { border-color: var(--accent); }
+  footer { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--faint); }
+  footer .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); flex: none; }
+
+  @media (max-width: 560px) {
+    .wrap { padding: 24px 16px 40px; }
+    .rt-row { grid-template-columns: 1fr; gap: 6px; }
+    .rt-row.head { display: none; }
+    .share { grid-template-columns: 72px 1fr auto; gap: 10px; }
+    .share .val { min-width: 0; }
+  }
 </style>
 <script>
 (function () {
@@ -932,79 +1174,155 @@ const PAGE = `<!doctype html>
 </script>
 </head>
 <body>
-<main>
+<main class="wrap">
   <div id="keybox">
-    <h1>TeamClaude</h1>
-    <p class="sub">Enter your proxy key to view status.</p>
-    <input id="key" type="password" placeholder="tc-..." autocomplete="off">
-    <br><button id="go">Connect</button>
+    <div class="keycard">
+      <div class="brand"><div class="logo" aria-hidden="true">TC</div><div class="title">TeamClaude</div></div>
+      <p>Enter your proxy key to view status.</p>
+      <input id="key" type="password" placeholder="tc-..." autocomplete="off">
+      <button id="go" class="btn primary" type="button">Connect</button>
+    </div>
   </div>
   <div id="app" style="display:none">
-    <h1>TeamClaude</h1>
-    <p class="sub" id="summary"></p>
-    <div class="actions">
-      <button id="reload" type="button">Reload config</button>
-      <button id="probe" type="button">Probe quotas</button>
-      <button id="addAcct" type="button">Add account</button>
-      <button id="theme" type="button" title="Switch between following the system, light and dark"></button>
-      <span class="thr" id="thrWrap">
-        <label for="thrVal">Switch at</label>
-        <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
-        <span>%</span>
-        <button id="thrSet" type="button">Set</button>
-      </span>
-    </div>
-    <div id="loginWrap" class="card" style="display:none">
-      <div class="chart-head">
-        <span class="title2">Add a Claude account</span>
-        <span class="seg"><button id="loginClose" type="button">Close</button></span>
-      </div>
-      <ol>
-        <li>Open the sign-in link and sign in as the account to add: <a id="loginLink" target="_blank" rel="noopener noreferrer">open sign-in link</a> <button id="loginCopy" type="button">Copy link</button></li>
-        <li>Claude then shows a code. Paste it here:
-          <span class="loginRow"><input id="loginCode" type="text" placeholder="code from the sign-in page" autocomplete="off" spellcheck="false"><button id="loginGo" type="button">Add account</button></span>
-        </li>
-      </ol>
-      <div id="loginNote"></div>
-    </div>
-    <div id="err"></div>
-    <div id="problems"></div>
-    <div id="note"></div>
-    <div id="routesWrap" style="display:none">
-      <h2>Routing</h2>
-      <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
-    </div>
-    <div id="usageViewWrap" class="actions" style="display:none"></div>
-    <div id="clientChartWrap" style="display:none">
-      <h2 id="clientChartHeading">Most used</h2>
-      <div class="card" id="clientChartCard">
-        <div class="chart-head">
-          <span class="lead" id="clientChartLead"></span>
-          <span class="seg" id="clientChartMetric"></span>
+    <header class="top">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">TC</div>
+        <div class="brand-text">
+          <h1 class="title">TeamClaude</h1>
+          <div class="who" id="summary"></div>
         </div>
-        <div id="clientChart"></div>
-        <div class="chart-foot">Tokens are the uncached input and output each response reports; cached context is not counted. Traffic on the shared proxy key is not attributed to anyone.</div>
       </div>
+      <div class="toolbar">
+        <button id="reload" class="btn" type="button">Reload config</button>
+        <button id="probe" class="btn" type="button">Probe quotas</button>
+        <button id="theme" class="btn" type="button" title="Switch between following the system, light and dark"></button>
+        <button id="addAcct" class="btn primary" type="button">+ Add account</button>
+      </div>
+    </header>
+
+    <section class="stats" aria-label="Summary">
+      <div class="stat"><div class="k" id="statActiveLabel">Active account</div><div class="v" id="statActive"></div></div>
+      <div class="stat"><div class="k">Conversations</div><div class="v" id="statConv"></div></div>
+      <div class="stat"><div class="k">Uptime</div><div class="v mono" id="statUp"></div></div>
+      <div class="stat thr" id="thrWrap">
+        <label class="k" for="thrVal">Auto-switch threshold</label>
+        <div class="thr-row">
+          <span class="field"><input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal"><span>%</span></span>
+          <button id="thrSet" class="btn sm" type="button">Set</button>
+        </div>
+      </div>
+    </section>
+
+    <div id="problems"></div>
+    <div id="err" class="alert bad"></div>
+    <div id="note"></div>
+
+    <div class="cols" id="usageRow" style="display:none">
+      <section class="sec" id="seriesWrap" style="display:none">
+        <div class="sec-head"><h2 class="sec-title">Usage over time</h2></div>
+        <div class="panel pad">
+          <div class="chart-top">
+            <div class="chart-id">
+              <div class="chart-cap" id="seriesCaption"></div>
+              <div class="chart-total" id="seriesTotal"></div>
+            </div>
+            <div class="legend" id="seriesLegend"></div>
+          </div>
+          <div class="bars" id="seriesBars"></div>
+          <div class="ticks" id="seriesTicks"></div>
+        </div>
+      </section>
+      <section class="sec" id="clientChartWrap" style="display:none">
+        <div class="sec-head">
+          <h2 class="sec-title" id="clientChartHeading">Most used</h2>
+          <div class="tools">
+            <span id="clientChartViewSlot"><span class="seg" id="usageViewWrap" role="group" aria-label="Usage window"></span></span>
+            <span class="seg" id="clientChartMetric" role="group" aria-label="Measure"></span>
+          </div>
+        </div>
+        <div class="panel pad">
+          <div class="share-lead" id="clientChartLead"></div>
+          <div class="shares" id="clientChart"></div>
+          <div class="foot-note">Tokens are the uncached input and output each response reports; cached context is not counted. Traffic on the shared proxy key is not attributed to anyone.</div>
+        </div>
+      </section>
     </div>
-    <h2>Accounts</h2>
-    <div id="accounts"></div>
-    <div id="clientsWrap" style="display:none">
-      <h2 id="clientsHeading">Clients</h2>
-      <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
+
+    <section class="sec">
+      <div class="sec-head">
+        <div class="sec-title-row"><h2 class="sec-title">Accounts</h2><span class="sec-count mono" id="acctCount"></span></div>
+        <div class="legend" aria-label="Meter colours">
+          <span><i class="sw ok"></i>Under 60%</span>
+          <span><i class="sw warn"></i>60–90%</span>
+          <span><i class="sw bad"></i>Over 90%</span>
+        </div>
+      </div>
+      <div class="acct-grid" id="accounts"></div>
+    </section>
+
+    <div class="cols" id="tablesRow" style="display:none">
+      <section class="sec" id="routesWrap" style="display:none">
+        <div class="sec-head"><h2 class="sec-title">Routing</h2></div>
+        <div class="panel" id="routes"></div>
+      </section>
+      <section class="sec" id="clientsWrap" style="display:none">
+        <div class="sec-head"><h2 class="sec-title" id="clientsHeading">Clients</h2></div>
+        <div class="panel tbl-wrap"><table id="clients"></table></div>
+      </section>
     </div>
-    <div id="dimensionsWrap"></div>
-    <div id="sessionsWrap" style="display:none">
-      <h2>Sessions</h2>
-      <div class="card" style="padding:0">
+
+    <div id="dimViewSlot"></div>
+    <div id="dimensionsWrap" class="cols" style="display:none"></div>
+
+    <section class="sec" id="sessionsWrap" style="display:none">
+      <div class="sec-head"><h2 class="sec-title">Sessions</h2></div>
+      <div class="panel">
         <div class="filters">
           <label>Project <select id="fProject"></select></label>
           <label>Client <select id="fClient"></select></label>
           <span class="hint" id="sessionCount"></span>
         </div>
-        <div style="padding:4px 6px"><table id="sessions"></table></div>
+        <div class="tbl-wrap"><table id="sessions" class="wide"></table></div>
       </div>
-    </div>
-    <footer id="foot"></footer>
+    </section>
+
+    <footer><span class="dot"></span><span id="foot"></span></footer>
+  </div>
+
+  <div id="loginWrap" class="scrim" style="display:none">
+    <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
+      <div class="dlg-head">
+        <div class="dlg-title" id="loginTitle">Add a Claude account</div>
+        <button id="loginClose" class="btn ghost" type="button">Close</button>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <div class="step-n">1</div>
+          <div class="step-body">
+            <div class="step-text">Open the sign-in link and sign in as the account you want to add.</div>
+            <div class="row-btns">
+              <a id="loginLink" class="link-btn" target="_blank" rel="noopener noreferrer">Open sign-in link ↗</a>
+              <button id="loginCopy" class="btn outline" type="button">Copy link</button>
+            </div>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-n">2</div>
+          <div class="step-body">
+            <div class="step-text">Claude shows a code. Paste it here.</div>
+            <div class="code-row">
+              <input id="loginCode" type="text" placeholder="Code from the sign-in page" autocomplete="off" spellcheck="false">
+              <button id="loginGo" class="btn go" type="button">Add account</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="loginNote"></div>
+    </section>
+  </div>
+
+  <div id="settingsWrap" class="scrim" style="display:none">
+    <section class="dialog flush" id="settingsDialog" role="dialog" aria-modal="true" aria-labelledby="setName"></section>
   </div>
 </main>
 <script>
@@ -1017,29 +1335,36 @@ const PAGE = `<!doctype html>
   var lastStatus = null;
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
-  // The usage window applies to every table the usage trackers feed (Clients
-  // and each configured dimension), so it is page state rather than per-table:
-  // two controls left on different windows would invite reading one table's
-  // number against the other's. Like the sort, it survives the poll.
+  // The usage window applies to every view the usage trackers feed (the two
+  // charts, Clients and each configured dimension), so it is page state rather
+  // than per-table: two controls left on different windows would invite reading
+  // one number against the other. Like the sort, it survives the poll.
   var usageView = 'total';
   var usageButtons = [];
-  // The Most used chart's measure, page state like the window above so it
-  // survives the poll. Tokens first: it is what the Clients table sorts by.
+  // The measure both charts plot, page state like the window above.
   var CHART_METRICS = [{ key: 'tokens', label: 'Tokens' }, { key: 'requests', label: 'Requests' }];
   var chartMetric = 'tokens';
   var chartButtons = [];
-  var chartTip = null;
-  // The poll rebuilds the chart every few seconds, which would drop keyboard
-  // focus off a bar each time; the focused client's name is kept so the
-  // rebuilt row can take focus back. chartRebuilding stops the blur that a
-  // rebuild itself causes from clearing it.
-  var chartFocus = null;
-  var chartRebuilding = false;
+  // The usage-over-time series, fetched on its own (GET /teamclaude/usage/
+  // series) after each status poll that shows a client. One fetch at a time:
+  // a slow answer is not stacked behind by the next poll's.
+  var lastSeries = null;
+  var seriesError = null;
+  var seriesInFlight = false;
   // How the summary line names a signed-in client key's role.
   var VIEWER_ROLE_TEXT = { operator: 'admin', tenant: 'user', readonly: 'read-only' };
   // Add account: the state naming the sign-in link now open, or null. The
   // server holds everything else about that login; the link is only opened.
   var loginState = null;
+  // The account whose settings dialog is open, by name, and what its rows were
+  // last built from: the poll rebuilds the dialog only when that changes, so a
+  // focused control is not pulled out from under the keyboard every 5s.
+  var settingsFor = null;
+  var settingsBuiltFrom = '';
+  var settingsNote = null;
+  var AVATAR_HUES = [45, 250, 150, 300, 80, 190, 20, 120];
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  var GEAR_PATH = ${JSON.stringify(GEAR_PATH)};
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
 
 ${SHARED_CONSTS}
@@ -1052,6 +1377,8 @@ ${SHARED_HELPERS}
     if (text != null) e.textContent = text;
     return e;
   }
+
+  function byId(id) { return document.getElementById(id); }
 
   function fmtNum(n) {
     n = Number(n) || 0;
@@ -1099,103 +1426,401 @@ ${SHARED_HELPERS}
     return time;
   }
 
-  // One labelled bar. A tone replaces the colour the fill would take from its
-  // ratio; the value is whatever the row states beside it.
-  function barRow(label, ratio, valueText, tone) {
-    var row = el('div', 'quota');
-    row.appendChild(el('span', 'lbl', label));
-    var bar = el('div', 'bar');
-    var fill = el('i');
-    var pct = ratio == null ? null : Math.max(0, Math.min(1, Number(ratio)));
-    fill.style.width = (pct == null ? 0 : pct * 100) + '%';
-    if (tone) fill.className = tone;
-    else if (pct != null && pct >= 0.9) fill.className = 'bad';
-    else if (pct != null && pct >= 0.7) fill.className = 'warn';
-    bar.appendChild(fill);
-    row.appendChild(bar);
-    row.appendChild(el('span', 'val', valueText));
-    return row;
+  function fmtHM(ts) {
+    return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
-  function quotaRow(label, ratio, resetAt) {
+  function metricText(v) {
+    return fmtNum(v) + (chartMetric === 'requests' ? ' req' : ' tok');
+  }
+
+  // A share too small to round to 1% still says it is there.
+  function fmtShare(share) {
+    if (share > 0 && share < 0.005) return '<1%';
+    return Math.round(share * 100) + '%';
+  }
+
+  function initialOf(name) {
+    var m = String(name || '').match(/[A-Za-z0-9]/);
+    return m ? m[0].toUpperCase() : '?';
+  }
+
+  // The part of an address before the @, where the list it is in has little
+  // room; the full names go in the element's title.
+  function shortName(name) {
+    var s = String(name || '');
+    var at = s.indexOf('@');
+    return at > 0 ? s.slice(0, at) : s;
+  }
+
+  function isCurrentAccount(a, s) {
+    return s.currentAccounts ? s.currentAccounts[a.provider] === a.name : a.name === s.currentAccount;
+  }
+
+  function avatar(name, index, cls) {
+    var av = el('div', 'avatar' + (cls ? ' ' + cls : ''), initialOf(name));
+    av.setAttribute('aria-hidden', 'true');
+    av.style.cssText = '--h: ' + AVATAR_HUES[index % AVATAR_HUES.length];
+    return av;
+  }
+
+  function gearIcon() {
+    var svg = document.createElementNS(SVG_NS, 'svg');
+    [['width', '15'], ['height', '15'], ['viewBox', '0 0 24 24'], ['fill', 'none'], ['stroke', 'currentColor'],
+      ['stroke-width', '1.8'], ['stroke-linecap', 'round'], ['stroke-linejoin', 'round'], ['aria-hidden', 'true']]
+      .forEach(function (p) { svg.setAttribute(p[0], p[1]); });
+    var circle = document.createElementNS(SVG_NS, 'circle');
+    circle.setAttribute('cx', '12');
+    circle.setAttribute('cy', '12');
+    circle.setAttribute('r', '3');
+    svg.appendChild(circle);
+    var path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', GEAR_PATH);
+    svg.appendChild(path);
+    return svg;
+  }
+
+  // One labelled meter: the figure set bright, what it is measured against
+  // dim after it, and a bar coloured by meterTone unless a tone is given.
+  function meter(label, ratio, figure, meta, tone, title) {
+    var m = el('div', 'meter');
+    if (title) m.title = title;
+    var top = el('div', 'meter-top');
+    top.appendChild(el('span', 'lbl', label));
+    var v = el('span', 'mv');
+    v.appendChild(el('b', '', figure));
+    if (meta) v.appendChild(el('span', '', meta));
+    top.appendChild(v);
+    m.appendChild(top);
+    var bar = el('div', 'mbar');
+    var fill = el('i', tone || meterTone(ratio));
+    var pct = ratio == null ? 0 : Math.max(0, Math.min(1, Number(ratio)));
+    fill.style.width = (pct * 100) + '%';
+    bar.appendChild(fill);
+    m.appendChild(bar);
+    return m;
+  }
+
+  function quotaMeter(label, ratio, resetAt) {
     var pct = ratio == null ? null : Math.max(0, Math.min(1, Number(ratio)));
     var resetTs = parseTs(resetAt);
     var reset = !isNaN(resetTs) && resetTs > Date.now()
       ? ' · ' + fmtIn((resetTs - Date.now()) / 1000) + ' · ' + fmtClock(resetTs)
       : '';
-    return barRow(label, ratio, (pct == null ? '?' : Math.round(pct * 100) + '%') + reset);
+    return meter(label, ratio, pct == null ? '?' : Math.round(pct * 100) + '%', reset);
   }
 
-  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds, viewer) {
-    var card = el('div', 'card');
-    var head = el('div', 'row');
-    head.appendChild(el('span', 'name', a.name));
-    var isCurrent = currentAccounts
-      ? currentAccounts[a.provider] === a.name
-      : a.name === current;
-    accountBadges(a, current, currentAccounts, null, fleetThreshold, fleetThresholds).forEach(function (badge) {
-      head.appendChild(el('span', 'badge ' + badge.cls, badge.text));
+  function renderAccount(a, index, s) {
+    var viewer = s.viewer || null;
+    var isCur = isCurrentAccount(a, s);
+    var card = el('div', 'acct' + (isCur ? ' current' : '') + (a.disabled ? ' off' : ''));
+    var head = el('div', 'acct-head');
+    var id = el('div', 'acct-id');
+    var nameRow = el('div', 'acct-name-row');
+    nameRow.appendChild(avatar(a.name, index, ''));
+    var name = el('div', 'acct-name', a.name);
+    name.title = a.name;
+    nameRow.appendChild(name);
+    id.appendChild(nameRow);
+    var chips = el('div', 'chips');
+    accountBadges(a, s.currentAccount, s.currentAccounts || null, null, s.switchThreshold, s.switchThresholds).forEach(function (badge) {
+      chips.appendChild(el('span', 'chip ' + badge.cls, badge.text));
     });
-    // Last in the row so the badges sit in the same place on every card.
-    if (!isCurrent && viewerCan(viewer, 'switch')) {
-      var btn = el('button', 'act', 'switch');
-      btn.addEventListener('click', function () { doSwitch(a.name, btn); });
-      head.appendChild(btn);
-    }
-    // Account controls, in the order an operator reaches for them: take it out
-    // of rotation, or move where rotation reaches it. Only the enable/disable
-    // control is shown for a disabled account — the rest would be moving an
-    // account that nothing will select anyway.
-    // Named ctl* deliberately: var is function-scoped, and this builder already
-    // declares a "last" further down (the last-used string). A button named
-    // last here is overwritten by that before any click can fire.
-    var canControl = viewerCan(viewer, 'accounts');
-    if (canControl) {
-      var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
-      ctlDisable.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, ctlDisable); });
-      head.appendChild(ctlDisable);
-    }
-    if (canControl && !a.disabled) {
-      var ctlFirst = el('button', 'act', 'prioritize');
-      ctlFirst.addEventListener('click', function () { doControlAccount(a.name, { place: 'first' }, ctlFirst); });
-      head.appendChild(ctlFirst);
-      var ctlLast = el('button', 'act', 'deprioritize');
-      ctlLast.addEventListener('click', function () { doControlAccount(a.name, { place: 'last' }, ctlLast); });
-      head.appendChild(ctlLast);
+    id.appendChild(chips);
+    head.appendChild(id);
+    // Every control for the account lives in its settings dialog, offered to
+    // whoever may use at least one of them (a tenant may switch, no more).
+    if (viewerCan(viewer, 'switch') || viewerCan(viewer, 'accounts')) {
+      var gear = el('button', 'gear');
+      gear.type = 'button';
+      gear.title = 'Settings for ' + a.name;
+      gear.setAttribute('aria-label', 'Settings for ' + a.name);
+      gear.appendChild(gearIcon());
+      gear.addEventListener('click', function () { openSettings(a.name); });
+      head.appendChild(gear);
     }
     card.appendChild(head);
-    if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    // A disabled account says so by its dimmed card and its chip; the notice
+    // is for an account that should be serving and is not.
+    if (a.unavailable && a.unavailable !== 'disabled') {
+      card.appendChild(el('div', 'blocked' + (a.unavailable === 'error' ? ' bad' : ''),
+        'Blocked — ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    }
+    var meters = el('div', 'meters');
     var q = a.quota || {};
     if (q.unified5h != null || q.unified7d != null) {
-      card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
-      card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
+      meters.appendChild(quotaMeter('Session', q.unified5h, q.unified5hReset));
+      meters.appendChild(quotaMeter('Weekly', q.unified7d, q.unified7dReset));
       // Model-scoped weekly buckets are learned from the usage endpoint rather
       // than declared, so hard-coding the two families that have dedicated
       // fields drew an incomplete picture the moment upstream metered a third.
-      scopedWeeklyRows(q).forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
+      scopedWeeklyRows(q).forEach(function (r) { meters.appendChild(quotaMeter(r.label, r.utilization, r.resetAt)); });
     } else if (q.tokensLimit != null && q.tokensRemaining != null) {
-      card.appendChild(quotaRow('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt));
+      meters.appendChild(quotaMeter('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt));
     } else {
-      card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
+      meters.appendChild(el('div', 'acct-note', 'Quota unknown — no traffic observed yet'));
     }
-    // Extra usage, the bar after the weekly ones. The value column holds the
-    // amount; the rest (billing now, switched off and why) is the tooltip.
+    // Extra usage after the quota meters. The figure is money rather than a
+    // percentage; the rest (billing now, switched off and why) is the tooltip.
     var xu = extraUsageBar(a);
-    if (xu) {
-      var xuRow = barRow('Extra', xu.ratio, xu.value, xu.off ? 'off' : null);
-      xuRow.title = xu.title;
-      card.appendChild(xuRow);
-    }
+    if (xu) meters.appendChild(meter('Extra', xu.ratio, xu.used, xu.rest, xu.off ? 'off' : null, xu.title));
+    card.appendChild(meters);
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
-    card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
+    card.appendChild(el('div', 'acct-foot', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
     return card;
   }
 
-  // The window a usage table is showing, in its own heading. The control sits
-  // above the Clients table, but the dimension tables are below it and can be
-  // scrolled clear of it — and a five-hour figure under a bare "Input tok" is
-  // the one way this feature can state a number under the wrong label.
+  // ── Account settings dialog ──────────────────────────────────────────────
+
+  function openSettings(name) {
+    settingsFor = name;
+    settingsBuiltFrom = '';
+    settingsNote = null;
+    renderSettings();
+    if (settingsFor) byId('settingsWrap').style.display = '';
+  }
+
+  function closeSettings() {
+    settingsFor = null;
+    settingsNote = null;
+    byId('settingsWrap').style.display = 'none';
+  }
+
+  function settingsRow(title, desc) {
+    var row = el('div', 'set-row');
+    var text = el('div', 'set-text');
+    text.appendChild(el('div', 't', title));
+    text.appendChild(el('div', 'd', desc));
+    row.appendChild(text);
+    return row;
+  }
+
+  function renderSettings() {
+    if (!settingsFor || !lastStatus) return;
+    var s = lastStatus;
+    var accounts = s.accounts || [];
+    var index = -1;
+    for (var i = 0; i < accounts.length; i++) if (accounts[i].name === settingsFor) { index = i; break; }
+    // Gone from the fleet (a reload dropped it): nothing left to set.
+    if (index === -1) { closeSettings(); return; }
+    var a = accounts[index];
+    var viewer = s.viewer || null;
+    var isCur = isCurrentAccount(a, s);
+    var from = [a.priority || 0, !!a.disabled, isCur, viewer ? viewer.role : ''].join('|');
+    if (from === settingsBuiltFrom) return;
+    settingsBuiltFrom = from;
+
+    var d = byId('settingsDialog');
+    d.textContent = '';
+    var head = el('div', 'set-head');
+    var ident = el('div', 'set-id');
+    ident.appendChild(avatar(a.name, index, 'lg'));
+    var text = el('div', 'set-id-text');
+    var nm = el('div', 'set-name', a.name);
+    nm.id = 'setName';
+    nm.title = a.name;
+    text.appendChild(nm);
+    text.appendChild(el('div', 'set-sub', 'Account settings'));
+    ident.appendChild(text);
+    head.appendChild(ident);
+    var close = el('button', 'btn ghost', 'Close');
+    close.type = 'button';
+    close.addEventListener('click', closeSettings);
+    head.appendChild(close);
+    d.appendChild(head);
+
+    if (viewerCan(viewer, 'switch')) {
+      var cur = settingsRow('Current account', isCur ? 'New requests go to this account'
+        : a.disabled ? 'Enable the account to switch to it' : 'Route new requests here');
+      if (isCur) cur.appendChild(el('span', 'inuse', 'In use'));
+      else if (!a.disabled) {
+        var sw = el('button', 'btn go', 'Switch to this');
+        sw.type = 'button';
+        sw.addEventListener('click', function () { doSwitch(a.name, sw); });
+        cur.appendChild(sw);
+      }
+      d.appendChild(cur);
+    }
+    if (viewerCan(viewer, 'accounts')) {
+      // Rotation picks the LOWEST number first (prioritize puts an account
+      // below every other), so the stepper names the number, not a rank.
+      var prio = a.priority || 0;
+      var pr = settingsRow('Priority', 'Lower numbers are picked first');
+      var stepper = el('div', 'stepper');
+      var down = el('button', '', '−');
+      down.type = 'button';
+      down.setAttribute('aria-label', 'Lower the number: picked sooner');
+      down.addEventListener('click', function () { doControlAccount(a.name, { priority: prio - 1 }, down); });
+      var up = el('button', '', '+');
+      up.type = 'button';
+      up.setAttribute('aria-label', 'Raise the number: picked later');
+      up.addEventListener('click', function () { doControlAccount(a.name, { priority: prio + 1 }, up); });
+      stepper.appendChild(down);
+      stepper.appendChild(el('div', 'val', String(prio)));
+      stepper.appendChild(up);
+      pr.appendChild(stepper);
+      d.appendChild(pr);
+
+      var en = settingsRow('Enabled', 'Disabled accounts are never routed to');
+      var toggle = el('button', 'toggle' + (a.disabled ? '' : ' on'));
+      toggle.type = 'button';
+      toggle.setAttribute('role', 'switch');
+      toggle.setAttribute('aria-checked', a.disabled ? 'false' : 'true');
+      toggle.setAttribute('aria-label', 'Enabled');
+      toggle.title = (a.disabled ? 'Enable ' : 'Disable ') + a.name;
+      toggle.appendChild(el('span'));
+      toggle.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, toggle); });
+      en.appendChild(toggle);
+      d.appendChild(en);
+    }
+    var n = el('div', 'set-note');
+    n.id = 'setNote';
+    if (settingsNote) {
+      n.className = 'set-note ' + settingsNote.kind;
+      n.textContent = settingsNote.text;
+      n.style.display = 'block';
+    }
+    d.appendChild(n);
+  }
+
+  // ── Charts ───────────────────────────────────────────────────────────────
+
+  // The window and measure buttons, built once: the windows are fixed by the
+  // server that served this page.
+  function buildControls() {
+    var views = byId('usageViewWrap');
+    USAGE_VIEWS.forEach(function (v) {
+      var btn = el('button', '', v.label);
+      btn.type = 'button';
+      btn.addEventListener('click', function () {
+        usageView = v.key;
+        markSelected(usageButtons, usageView);
+        if (lastStatus) render(lastStatus);
+      });
+      views.appendChild(btn);
+      usageButtons.push({ key: v.key, btn: btn });
+    });
+    markSelected(usageButtons, usageView);
+    var metrics = byId('clientChartMetric');
+    CHART_METRICS.forEach(function (m) {
+      var btn = el('button', '', m.label);
+      btn.type = 'button';
+      btn.addEventListener('click', function () {
+        chartMetric = m.key;
+        markSelected(chartButtons, chartMetric);
+        if (lastStatus) render(lastStatus);
+      });
+      metrics.appendChild(btn);
+      chartButtons.push({ key: m.key, btn: btn });
+    });
+    markSelected(chartButtons, chartMetric);
+  }
+
+  function markSelected(buttons, key) {
+    buttons.forEach(function (b) {
+      b.btn.className = b.key === key ? 'sel' : '';
+      b.btn.setAttribute('aria-pressed', b.key === key ? 'true' : 'false');
+    });
+  }
+
+  // One bar per client, longest first, the biggest in the accent colour.
+  function renderClientChart(clients) {
+    var wrap = byId('clientChartWrap');
+    var rows = clientRanking(clients, usageView, chartMetric);
+    if (!rows.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    byId('clientChartLead').textContent = 'Share of ' + (chartMetric === 'requests' ? 'requests' : 'tokens') + ' by client key';
+    var box = byId('clientChart');
+    box.textContent = '';
+    rows.forEach(function (r, i) {
+      var row = el('div', 'share');
+      var n = el('div', 'n', r.name);
+      n.title = r.name;
+      row.appendChild(n);
+      var track = el('div', 'track');
+      var bar = el('i', i === 0 ? 'top' : '');
+      // Anything spent draws at least 2px: a bar of nothing would read as the
+      // zero it is not.
+      bar.style.width = r.value > 0 ? 'max(2px, ' + (r.ratio * 100).toFixed(2) + '%)' : '0';
+      track.appendChild(bar);
+      row.appendChild(track);
+      var val = el('div', 'val');
+      val.appendChild(el('b', '', metricText(r.value)));
+      val.appendChild(el('span', '', ' · ' + fmtShare(r.share)));
+      row.appendChild(val);
+      box.appendChild(row);
+    });
+  }
+
+  // Usage over time, drawn from the last series fetched. Total has no series
+  // of its own — the tracker keeps a day of history, not a lifetime — so it
+  // shows the day, and the caption says which span is on screen.
+  function renderSeries() {
+    var wrap = byId('seriesWrap');
+    if (!lastStatus || !Object.keys(lastStatus.clients || {}).length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    var chart = seriesBars(lastSeries, usageView, chartMetric);
+    var spanMs = chart.spanMs || (usageView === '5h' ? 5 : 24) * 3600000;
+    var hours = Math.round(spanMs / 3600000) + 'h';
+    byId('seriesCaption').textContent = (chartMetric === 'requests' ? 'Requests' : 'Tokens') + ' · last ' + hours + ', hourly';
+    byId('seriesTotal').textContent = lastSeries ? metricText(chart.total) : '—';
+    var legend = byId('seriesLegend');
+    legend.textContent = '';
+    var names = chart.legend.slice();
+    if (chart.hasOthers) names.push(null);
+    names.forEach(function (name, i) {
+      var item = el('span');
+      item.appendChild(el('i', 'sw ' + (name == null ? 'so' : 's' + i)));
+      item.appendChild(el('span', '', name == null ? 'others' : name));
+      legend.appendChild(item);
+    });
+    var box = byId('seriesBars');
+    box.textContent = '';
+    if (!lastSeries || !chart.total) {
+      box.appendChild(el('div', 'bars-empty', !lastSeries
+        ? (seriesError ? 'Usage history unavailable: ' + seriesError : 'Loading usage history…')
+        : 'No client-key traffic in the last ' + hours));
+    } else {
+      chart.bars.forEach(function (b) {
+        var col = el('div', 'col');
+        var lines = [fmtHM(b.start) + '–' + fmtHM(b.end) + ' · ' + metricText(b.total)];
+        chart.legend.forEach(function (name, i) { if (b.parts[i]) lines.push(name + ': ' + metricText(b.parts[i])); });
+        if (b.others) lines.push('others: ' + metricText(b.others));
+        col.title = lines.join('\\n');
+        // Top to bottom: others, then the legend in reverse, so the biggest
+        // client sits on the baseline of every bar.
+        var segs = [{ v: b.others, cls: 'so' }];
+        for (var i = b.parts.length - 1; i >= 0; i--) segs.push({ v: b.parts[i], cls: 's' + i });
+        segs.forEach(function (seg) {
+          if (!seg.v) return;
+          var part = el('i', seg.cls);
+          part.style.height = 'max(1px, ' + (seg.v / chart.peak * 100).toFixed(2) + '%)';
+          col.appendChild(part);
+        });
+        box.appendChild(col);
+      });
+    }
+    var ticks = byId('seriesTicks');
+    ticks.textContent = '';
+    seriesTicks(spanMs).forEach(function (t) { ticks.appendChild(el('span', '', t)); });
+  }
+
+  function pollSeries() {
+    if (seriesInFlight) return;
+    seriesInFlight = true;
+    fetch('/teamclaude/usage/series', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        if (!res.ok) throw new Error('status ' + res.status);
+        return res.json();
+      })
+      .then(function (json) { lastSeries = json; seriesError = null; })
+      .catch(function (e) { seriesError = e.message; })
+      .then(function () { seriesInFlight = false; renderSeries(); });
+  }
+
+  // ── Tables ───────────────────────────────────────────────────────────────
+
   // Last used is a lifetime figure in a table whose heading may name a window.
   // Under Total that needs no saying; under a window it does, or it reads as
   // the one thing this control must never do — a number under the wrong label.
@@ -1203,6 +1828,8 @@ ${SHARED_HELPERS}
     return usageView === 'total' ? 'Last used' : 'Last used (all time)';
   }
 
+  // The window a usage table is showing, in its own heading: the control sits
+  // with the charts, and the tables below can be scrolled clear of it.
   function usageHeading(base) {
     if (usageView === 'total') return base;
     var view = USAGE_VIEWS.filter(function (v) { return v.key === usageView; })[0];
@@ -1210,11 +1837,11 @@ ${SHARED_HELPERS}
   }
 
   function renderClients(clients) {
-    var wrap = document.getElementById('clientsWrap');
+    var wrap = byId('clientsWrap');
     var names = Object.keys(clients || {});
-    if (!names.length) { wrap.style.display = 'none'; return; }
+    if (!names.length) { wrap.style.display = 'none'; return false; }
     wrap.style.display = '';
-    document.getElementById('clientsHeading').textContent = usageHeading('Clients');
+    byId('clientsHeading').textContent = usageHeading('Clients');
     // Sorted on the window being shown, not on the lifetime total: a table
     // ordered by all-time spend while displaying the last five hours would put
     // the quiet clients on top of the busy one.
@@ -1222,7 +1849,7 @@ ${SHARED_HELPERS}
       var ua = usageFor(clients[a], usageView), ub = usageFor(clients[b], usageView);
       return (ub.inputTokens + ub.outputTokens) - (ua.inputTokens + ua.outputTokens);
     });
-    var table = document.getElementById('clients');
+    var table = byId('clients');
     table.textContent = '';
     var hr = el('tr');
     ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', lastUsedLabel()].forEach(function (h, i) {
@@ -1233,151 +1860,22 @@ ${SHARED_HELPERS}
       var c = clients[n];
       var u = usageFor(c, usageView);
       var tr = el('tr');
-      tr.appendChild(el('td', '', n));
+      var cell = el('td');
+      var tag = el('span', 'ctag');
+      tag.appendChild(el('span', 'ini', initialOf(n)));
+      tag.appendChild(el('span', '', n));
+      cell.appendChild(tag);
+      tr.appendChild(cell);
       tr.appendChild(el('td', 'num', fmtNum(u.requests)));
-      tr.appendChild(el('td', 'num', fmtNum(u.connections)));
+      tr.appendChild(el('td', 'num dim', fmtNum(u.connections)));
       tr.appendChild(el('td', 'num', fmtNum(u.inputTokens)));
       tr.appendChild(el('td', 'num', fmtNum(u.outputTokens)));
       // Last used stays the lifetime figure under every window: it answers
       // when this client was last seen at all, which a window cannot.
-      tr.appendChild(el('td', 'num', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
+      tr.appendChild(el('td', 'num soft', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
       table.appendChild(tr);
     });
-  }
-
-  // The window buttons, built once: the windows are fixed by the server that
-  // served this page. Visibility is decided per render, since the control only
-  // means something when there is a usage table under it.
-  function buildUsageViews() {
-    var wrap = document.getElementById('usageViewWrap');
-    wrap.appendChild(el('span', 'lbl', 'Usage window'));
-    USAGE_VIEWS.forEach(function (v) {
-      var btn = el('button', '', v.label);
-      btn.addEventListener('click', function () {
-        usageView = v.key;
-        markUsageView();
-        if (lastStatus) render(lastStatus);
-      });
-      wrap.appendChild(btn);
-      usageButtons.push({ key: v.key, btn: btn });
-    });
-    markUsageView();
-  }
-
-  function markUsageView() {
-    usageButtons.forEach(function (b) { b.btn.className = b.key === usageView ? 'sel' : ''; });
-  }
-
-  // The Most used chart's measure buttons and its one tooltip, built once. The
-  // tooltip lives on the card rather than in the bar list, which every render
-  // replaces wholesale.
-  function buildClientChart() {
-    var wrap = document.getElementById('clientChartMetric');
-    CHART_METRICS.forEach(function (m) {
-      var btn = el('button', '', m.label);
-      btn.setAttribute('type', 'button');
-      btn.addEventListener('click', function () {
-        chartMetric = m.key;
-        markChartMetric();
-        if (lastStatus) render(lastStatus);
-      });
-      wrap.appendChild(btn);
-      chartButtons.push({ key: m.key, btn: btn });
-    });
-    markChartMetric();
-    chartTip = el('div', 'ctip');
-    document.getElementById('clientChartCard').appendChild(chartTip);
-  }
-
-  function markChartMetric() {
-    chartButtons.forEach(function (b) {
-      b.btn.className = b.key === chartMetric ? 'sel' : '';
-      b.btn.setAttribute('aria-pressed', b.key === chartMetric ? 'true' : 'false');
-    });
-  }
-
-  // A share too small to round to 1% still says it is there.
-  function fmtShare(share) {
-    if (share > 0 && share < 0.005) return '<1%';
-    return Math.round(share * 100) + '%';
-  }
-
-  function chartValueText(r) {
-    return fmtNum(r.value) + (chartMetric === 'requests' ? ' req' : ' tok') + ' · ' + fmtShare(r.share);
-  }
-
-  // One horizontal bar per client, longest first. The value and share sit in
-  // a column of their own rather than at the bar tip, so a full-width bar never
-  // pushes its label off the card. The table under Accounts keeps every number
-  // the bars and the tooltip show, so neither is the only way to read one.
-  function renderClientChart(clients) {
-    var wrap = document.getElementById('clientChartWrap');
-    var rows = clientRanking(clients, usageView, chartMetric);
-    if (!rows.length) { wrap.style.display = 'none'; hideChartTip(); return; }
-    wrap.style.display = '';
-    document.getElementById('clientChartHeading').textContent = usageHeading('Most used');
-    document.getElementById('clientChartLead').textContent = 'Share of ' + (chartMetric === 'requests' ? 'requests' : 'tokens') + ' by client key';
-    var box = document.getElementById('clientChart');
-    chartRebuilding = true;
-    box.textContent = '';
-    var refocus = null;
-    rows.forEach(function (r) {
-      var row = el('div', 'crow');
-      row.setAttribute('tabindex', '0');
-      row.setAttribute('aria-label', r.name + ': ' + chartValueText(r));
-      row.appendChild(el('span', 'cname', r.name));
-      var track = el('div', 'ctrack');
-      var bar = el('div', 'cbar');
-      // Anything spent draws at least 2px: a bar of nothing would read as the
-      // zero it is not.
-      bar.style.width = r.value > 0 ? 'max(2px, ' + (r.ratio * 100).toFixed(2) + '%)' : '0';
-      track.appendChild(bar);
-      row.appendChild(track);
-      row.appendChild(el('span', 'cval', chartValueText(r)));
-      row.addEventListener('pointermove', function (ev) { showChartTip(r, ev, null); });
-      row.addEventListener('pointerleave', hideChartTip);
-      row.addEventListener('focus', function () { chartFocus = r.name; showChartTip(r, null, this); });
-      row.addEventListener('blur', function () { if (!chartRebuilding) { chartFocus = null; hideChartTip(); } });
-      box.appendChild(row);
-      if (r.name === chartFocus) refocus = row;
-    });
-    chartRebuilding = false;
-    if (refocus) refocus.focus();
-  }
-
-  // Value first, name second: the reader already knows which bar they are on
-  // and wants its number. Built with textContent, since client names come from
-  // the operator's config rather than from this page.
-  function showChartTip(r, ev, rowEl) {
-    if (!chartTip) return;
-    var u = r.usage;
-    chartTip.textContent = '';
-    chartTip.appendChild(el('b', '', chartMetric === 'requests'
-      ? fmtNum(u.requests) + ' requests'
-      : fmtNum(u.inputTokens + u.outputTokens) + ' tokens'));
-    chartTip.appendChild(el('div', '', r.name + ' · ' + fmtShare(r.share) + ' of the total'));
-    chartTip.appendChild(el('div', 'dim', 'in ' + fmtNum(u.inputTokens) + ' · out ' + fmtNum(u.outputTokens) + ' · ' + fmtNum(u.requests) + ' req'));
-    if (r.lastUsed) chartTip.appendChild(el('div', 'dim', 'last used ' + fmtAgo(r.lastUsed)));
-    chartTip.style.display = 'block';
-    var card = document.getElementById('clientChartCard').getBoundingClientRect();
-    var x, y;
-    if (ev) {
-      x = ev.clientX - card.left + 14;
-      y = ev.clientY - card.top + 14;
-    } else {
-      var rb = rowEl.getBoundingClientRect();
-      x = rb.left - card.left + 16;
-      y = rb.bottom - card.top + 4;
-    }
-    // Flip to the pointer's left rather than overflow the card's right edge.
-    var w = chartTip.offsetWidth;
-    if (x + w > card.width - 4) x = Math.max(4, (ev ? ev.clientX - card.left - 14 : card.width - 4) - w);
-    chartTip.style.left = x + 'px';
-    chartTip.style.top = y + 'px';
-  }
-
-  function hideChartTip() {
-    if (chartTip) chartTip.style.display = 'none';
+    return true;
   }
 
   // Header cells that re-sort in place. The sort is state, not a re-fetch, so
@@ -1413,15 +1911,15 @@ ${SHARED_HELPERS}
   ];
 
   function renderSessions(sessions) {
-    var wrap = document.getElementById('sessionsWrap');
+    var wrap = byId('sessionsWrap');
     // Absent unless proxy.sessionDetail is on — the aggregate counts in the
-    // summary line stay either way.
+    // summary strip stay either way.
     if (!sessions || !sessions.items) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
 
     var all = sessionRows(sessions);
-    var projectSel = document.getElementById('fProject');
-    var clientSel = document.getElementById('fClient');
+    var projectSel = byId('fProject');
+    var clientSel = byId('fClient');
     fillFilter(projectSel, uniqSorted(all.map(function (r) { return r.project; })), sessionFilters.project);
     fillFilter(clientSel, uniqSorted(all.map(function (r) { return r.client; })), sessionFilters.client);
     sessionFilters.project = projectSel.value;
@@ -1431,9 +1929,9 @@ ${SHARED_HELPERS}
     // Conversations, not sessions: one client session contributes a row per
     // agent it has in flight, and counting rows as sessions would report a
     // fleet carrying several times the clients it has.
-    document.getElementById('sessionCount').textContent = rows.length + ' of ' + all.length + ' conversations';
+    byId('sessionCount').textContent = rows.length + ' of ' + all.length + ' conversations';
 
-    var table = document.getElementById('sessions');
+    var table = byId('sessions');
     table.textContent = '';
     var hr = el('tr');
     SESSION_COLUMNS.forEach(function (c) { addSortableHeader(hr, 'sessions', c.label, c.key, !!c.num); });
@@ -1441,14 +1939,14 @@ ${SHARED_HELPERS}
     rows.forEach(function (r) {
       var tr = el('tr');
       tr.appendChild(el('td', r.active ? '' : 'dim', r.session));
-      tr.appendChild(el('td', r.active ? '' : 'dim', r.conversation || '—'));
+      tr.appendChild(el('td', r.active ? 'mono' : 'mono dim', r.conversation || '—'));
       tr.appendChild(el('td', '', r.client || '—'));
       tr.appendChild(el('td', '', r.project || '—'));
-      tr.appendChild(el('td', '', r.accounts || '—'));
+      tr.appendChild(el('td', 'soft', r.accounts || '—'));
       ['requests', 'cacheRead', 'cacheCreation', 'input', 'output', 'context'].forEach(function (k) {
         tr.appendChild(el('td', 'num', fmtNum(r[k])));
       });
-      tr.appendChild(el('td', 'num', r.lastSeen ? fmtAgo(r.lastSeen) : '—'));
+      tr.appendChild(el('td', 'num soft', r.lastSeen ? fmtAgo(r.lastSeen) : '—'));
       table.appendChild(tr);
     });
   }
@@ -1468,8 +1966,9 @@ ${SHARED_HELPERS}
 
   // One table per configured usage dimension (proxy.usageDimensions).
   function renderDimensions(dimensions) {
-    var wrap = document.getElementById('dimensionsWrap');
+    var wrap = byId('dimensionsWrap');
     wrap.textContent = '';
+    var any = false;
     Object.keys(dimensions || {}).forEach(function (name) {
       var entries = dimensions[name] || {};
       var rows = Object.keys(entries).map(function (key) {
@@ -1484,15 +1983,19 @@ ${SHARED_HELPERS}
         };
       });
       if (!rows.length) return;
+      any = true;
       sortState[name] = sortState[name] || { key: 'inputTokens', dir: 'desc' };
       rows = sortRows(rows, sortState[name].key, sortState[name].dir);
+      var title = name.charAt(0).toUpperCase() + name.slice(1);
 
-      wrap.appendChild(el('h2', '', usageHeading(name.charAt(0).toUpperCase() + name.slice(1))));
-      var card = el('div', 'card');
-      card.style.padding = '4px 6px';
+      var sec = el('section', 'sec');
+      var head = el('div', 'sec-head');
+      head.appendChild(el('h2', 'sec-title', usageHeading(title)));
+      sec.appendChild(head);
+      var panel = el('div', 'panel tbl-wrap');
       var table = el('table');
       var hr = el('tr');
-      [{ key: 'name', label: name.charAt(0).toUpperCase() + name.slice(1) },
+      [{ key: 'name', label: title },
         { key: 'requests', label: 'Req', num: true },
         { key: 'inputTokens', label: 'Input tok', num: true },
         { key: 'outputTokens', label: 'Output tok', num: true },
@@ -1506,64 +2009,154 @@ ${SHARED_HELPERS}
         tr.appendChild(el('td', 'num', fmtNum(r.requests)));
         tr.appendChild(el('td', 'num', fmtNum(r.inputTokens)));
         tr.appendChild(el('td', 'num', fmtNum(r.outputTokens)));
-        tr.appendChild(el('td', 'num', r.lastUsed ? fmtAgo(r.lastUsed) : '—'));
+        tr.appendChild(el('td', 'num soft', r.lastUsed ? fmtAgo(r.lastUsed) : '—'));
         table.appendChild(tr);
       });
-      card.appendChild(table);
-      wrap.appendChild(card);
+      panel.appendChild(table);
+      sec.appendChild(panel);
+      wrap.appendChild(sec);
     });
+    wrap.style.display = any ? '' : 'none';
+    return any;
   }
 
   // Where each metered family goes right now, and which accounts could take
-  // it. The last row is the default: everything without its own route lands
-  // on the current account.
+  // it. The last rows are the per-provider defaults: everything without a
+  // route of its own lands on the current account.
   function renderRoutes(s) {
-    var wrap = document.getElementById('routesWrap');
+    var wrap = byId('routesWrap');
     var rows = routeRows(s);
-    if (!rows.length) { wrap.style.display = 'none'; return; }
+    if (!rows.length) { wrap.style.display = 'none'; return false; }
     wrap.style.display = '';
-    var table = document.getElementById('routes');
-    table.textContent = '';
-    var hr = el('tr');
-    ['Family', 'Goes to', 'Can serve it'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
-    table.appendChild(hr);
+    var box = byId('routes');
+    box.textContent = '';
+    var hr = el('div', 'rt-row head');
+    ['Family', 'Goes to', 'Can serve it'].forEach(function (h) { hr.appendChild(el('div', '', h)); });
+    box.appendChild(hr);
     rows.forEach(function (r) {
-      var tr = el('tr');
-      var fam = el('td', '', r.label + (r.match ? ' ' : ''));
-      if (r.match) fam.appendChild(el('span', 'tag', r.match));
-      if (r.provider) fam.appendChild(el('span', 'tag', ' ' + providerLabel(r.provider)));
-      tr.appendChild(fam);
-      var to = el('td', r.blocked ? 'badt' : '', r.blocked ? 'blocked' : (r.target || '—'));
-      if (r.pinned) to.appendChild(el('span', 'pin', ' · pinned to ' + r.pinned));
-      if (r.pinMismatch) to.appendChild(el('span', 'warnt', ' (not eligible)'));
+      var row = el('div', 'rt-row');
+      var fam = el('div', 'rt-fam');
+      fam.appendChild(el('b', '', r.label));
+      var sub = [r.match, r.provider ? providerLabel(r.provider) : ''].filter(Boolean).join(' · ');
+      if (sub) fam.appendChild(el('span', '', sub));
+      row.appendChild(fam);
+
+      var to = el('div', 'rt-to');
+      to.appendChild(el('span', r.blocked ? 'bad-t' : '', r.blocked ? 'blocked' : (r.target || '—')));
+      if (r.pinned) to.appendChild(el('span', 'rt-note pin', 'pinned to ' + r.pinned + (r.pinMismatch ? ' (not eligible)' : '')));
       if (r.kind === 'default' && r.target !== r.current) {
-        to.appendChild(el('span', 'warnt', r.currentUnavailable
-          ? ' · current account ' + r.current + ' is blocked: ' + (UNAVAILABLE_TEXT[r.currentUnavailable] || r.currentUnavailable)
-          : ' · outranks the current account ' + r.current));
+        to.appendChild(el('span', 'rt-note warn', r.currentUnavailable
+          ? 'current account ' + r.current + ' is blocked: ' + (UNAVAILABLE_TEXT[r.currentUnavailable] || r.currentUnavailable)
+          : 'outranks the current account ' + r.current));
       }
-      tr.appendChild(to);
-      var can = el('td', r.kind === 'default' ? 'dim' : '');
-      if (r.kind === 'default') can.textContent = 'no route of its own';
-      else if (r.blocked) can.textContent = '—';
-      else if (!r.eligible.length && !r.ineligible.length) can.textContent = '—';
+      row.appendChild(to);
+
+      var can = el('div', 'rt-can');
+      var total = r.eligible.length + r.ineligible.length;
+      if (r.kind === 'default') can.appendChild(el('span', 'soft', 'No route of its own'));
+      else if (r.blocked || !total) can.appendChild(el('span', 'soft', '—'));
       else {
-        can.appendChild(el('span', 'ok', r.eligible.length + ' of ' + (r.eligible.length + r.ineligible.length) + (r.ineligible.length ? ' ' : '')));
-        if (r.ineligible.length) can.appendChild(el('span', 'no', r.ineligible.join(', ')));
+        var count = el('div', 'rt-count');
+        count.appendChild(el('b', '', r.eligible.length + ' of ' + total));
+        var segs = el('div', 'segs');
+        segs.setAttribute('aria-hidden', 'true');
+        for (var i = 0; i < total; i++) segs.appendChild(el('i', i < r.eligible.length ? 'on' : ''));
+        count.appendChild(segs);
+        can.appendChild(count);
+        if (r.ineligible.length) {
+          var un = el('div', 'dimtext', 'Unavailable: ' + r.ineligible.map(shortName).join(', '));
+          un.title = r.ineligible.join(', ');
+          can.appendChild(un);
+        }
       }
-      tr.appendChild(can);
-      table.appendChild(tr);
+      row.appendChild(can);
+      box.appendChild(row);
     });
+    return true;
   }
 
   // Top of the page and only when something is wrong: a banner that is always
   // on is a banner nobody reads.
   function renderProblems(s) {
-    var wrap = document.getElementById('problems');
+    var wrap = byId('problems');
     var list = problems(s);
     wrap.textContent = '';
     if (!list.length) { wrap.style.display = 'none'; return; }
     wrap.style.display = 'block';
-    list.forEach(function (p) { wrap.appendChild(el('div', p.severity, p.text)); });
+    list.forEach(function (p) { wrap.appendChild(el('div', 'alert ' + p.severity, p.text)); });
+  }
+
+  // ── Header and summary strip ─────────────────────────────────────────────
+
+  function renderHeader(s) {
+    var viewer = s.viewer || null;
+    var sum = byId('summary');
+    sum.textContent = '';
+    // Who this page is signed in as: the controls below appear or not by that,
+    // and a missing button should not be a puzzle.
+    if (viewer && viewer.client) {
+      var who = el('span', '', 'Signed in as ');
+      who.appendChild(el('b', '', viewer.client));
+      sum.appendChild(who);
+      sum.appendChild(el('span', 'pill', VIEWER_ROLE_TEXT[viewer.role] || viewer.role));
+    } else if (viewer) {
+      sum.appendChild(el('span', '', 'Operator access'));
+      sum.appendChild(el('span', 'pill', VIEWER_ROLE_TEXT[viewer.role] || viewer.role));
+    }
+    byId('reload').style.display = viewerCan(viewer, 'reload') ? '' : 'none';
+    // Adding an account writes a credential into the config: an account
+    // control, so it is offered to exactly those who may use the others.
+    var canAdd = viewerCan(viewer, 'accounts');
+    byId('addAcct').style.display = canAdd ? '' : 'none';
+    if (!canAdd) byId('loginWrap').style.display = 'none';
+    byId('thrWrap').style.display = viewerCan(viewer, 'threshold') ? '' : 'none';
+    var probe = s.probe || {};
+    var probeBtn = byId('probe');
+    probeBtn.style.display = viewerCan(viewer, 'probe') ? '' : 'none';
+    probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
+    probeBtn.disabled = !!probe.running;
+  }
+
+  function renderStats(s) {
+    var currentAccounts = s.currentAccounts || null;
+    var providers = currentAccounts ? Object.keys(currentAccounts).sort(function (a, b) {
+      if (a === 'anthropic') return -1;
+      if (b === 'anthropic') return 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }) : [];
+    var act = byId('statActive');
+    act.textContent = '';
+    var line = function (name, prefix) {
+      var l = el('span', 'line');
+      l.appendChild(el('span', name ? 'live' : 'live none'));
+      if (prefix) l.appendChild(el('span', 'sub', prefix));
+      var n = el('span', 'ellip', name || 'none');
+      if (name) n.title = name;
+      l.appendChild(n);
+      return l;
+    };
+    // One cursor per provider: a mixed Claude/Codex fleet has two current
+    // accounts, and naming one of them "the" active account would be wrong.
+    if (providers.length > 1) {
+      byId('statActiveLabel').textContent = 'Active accounts';
+      act.className = 'v stack';
+      providers.forEach(function (p) { act.appendChild(line(currentAccounts[p], providerLabel(p))); });
+    } else {
+      byId('statActiveLabel').textContent = 'Active account';
+      act.className = 'v';
+      act.appendChild(line(providers.length ? currentAccounts[providers[0]] : s.currentAccount, ''));
+    }
+    // Conversations, like the table below and the count above that table: one
+    // page saying "sessions" here and "conversations" there would read as two
+    // different quantities rather than one counted twice.
+    var sess = s.sessions || {};
+    var conv = byId('statConv');
+    conv.textContent = '';
+    conv.appendChild(el('span', 'mono', String(sess.active || 0)));
+    conv.appendChild(el('span', 'sub', 'active ·'));
+    conv.appendChild(el('span', 'mono', String(sess.known || 0)));
+    conv.appendChild(el('span', 'sub', 'known'));
+    byId('statUp').textContent = s.server && s.server.uptimeSeconds != null ? fmtIn(s.server.uptimeSeconds) : '—';
   }
 
   function render(s) {
@@ -1572,73 +2165,55 @@ ${SHARED_HELPERS}
     // rewriting it every POLL_MS would delete the operator's half-entered
     // number under the cursor. It also means a change made from the CLI, the
     // TUI or another browser shows up here without a refresh.
-    var thrInput = document.getElementById('thrVal');
+    var thrInput = byId('thrVal');
     if (document.activeElement !== thrInput) thrInput.value = thresholdPercentText(s.switchThreshold);
-    var sess = s.sessions || {};
-    var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
-    var sum = document.getElementById('summary');
-    sum.textContent = '';
-    var currentAccounts = s.currentAccounts || null;
-    var providerIds = currentAccounts ? Object.keys(currentAccounts).sort(function (a, b) {
-      if (a === 'anthropic') return -1;
-      if (b === 'anthropic') return 1;
-      return a < b ? -1 : a > b ? 1 : 0;
-    }) : [];
-    sum.appendChild(el('span', '', providerIds.length ? 'active accounts ' : 'active account '));
-    if (providerIds.length) {
-      providerIds.forEach(function (provider, i) {
-        if (i) sum.appendChild(el('span', '', ' · '));
-        sum.appendChild(el('span', '', providerLabel(provider) + ': '));
-        sum.appendChild(el('b', '', currentAccounts[provider] || 'none'));
-      });
-    } else {
-      sum.appendChild(el('b', '', s.currentAccount || 'none'));
-    }
-    // Conversations, like the table below it and the count above that table:
-    // one page saying "sessions" here and "conversations" there would read as
-    // two different quantities rather than one counted twice.
-    sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
-    // Who this page is signed in as, when a client key says so: the controls
-    // below appear or not by that, and a missing button should not be a puzzle.
-    var viewer = s.viewer || null;
-    if (viewer && viewer.client) {
-      sum.appendChild(el('span', '', ' · signed in as '));
-      sum.appendChild(el('b', '', viewer.client));
-      sum.appendChild(el('span', '', ' (' + (VIEWER_ROLE_TEXT[viewer.role] || viewer.role) + ')'));
-    }
-    document.getElementById('reload').style.display = viewerCan(viewer, 'reload') ? '' : 'none';
-    // Adding an account writes a credential into the config: an account
-    // control, so it is offered to exactly those who may use the others.
-    var canAdd = viewerCan(viewer, 'accounts');
-    document.getElementById('addAcct').style.display = canAdd ? '' : 'none';
-    if (!canAdd) document.getElementById('loginWrap').style.display = 'none';
-    document.getElementById('thrWrap').style.display = viewerCan(viewer, 'threshold') ? '' : 'none';
-    var probe = s.probe || {};
-    var probeBtn = document.getElementById('probe');
-    probeBtn.style.display = viewerCan(viewer, 'probe') ? '' : 'none';
-    probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
-    probeBtn.disabled = !!probe.running;
-    var acc = document.getElementById('accounts');
+    renderHeader(s);
+    renderStats(s);
+    var accounts = s.accounts || [];
+    var enabled = accounts.filter(function (a) { return !a.disabled; }).length;
+    byId('acctCount').textContent = accounts.length ? enabled + ' of ' + accounts.length + ' enabled' : '';
+    var acc = byId('accounts');
     acc.textContent = '';
-    (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.viewer)); });
+    accounts.forEach(function (a, i) { acc.appendChild(renderAccount(a, i, s)); });
     renderProblems(s);
-    renderRoutes(s);
+    var hasClients = Object.keys(s.clients || {}).length > 0;
     renderClientChart(s.clients);
-    renderClients(s.clients);
-    renderDimensions(s.usageDimensions);
-    // The control means nothing with no usage table under it. The payload
-    // already answers that: the server omits a dimension with no entries.
-    var anyUsage = Object.keys(s.clients || {}).length || Object.keys(s.usageDimensions || {}).length;
-    document.getElementById('usageViewWrap').style.display = anyUsage ? '' : 'none';
+    renderSeries();
+    byId('usageRow').style.display = hasClients ? '' : 'none';
+    var hasRoutes = renderRoutes(s);
+    var hasClientTable = renderClients(s.clients);
+    byId('tablesRow').style.display = hasRoutes || hasClientTable ? '' : 'none';
+    var hasDims = renderDimensions(s.usageDimensions);
+    // The window control sits with the charts. A fleet with dimensions but no
+    // client keys has no charts, and gets the control above its tables
+    // instead, since those tables are what it governs there.
+    var views = byId('usageViewWrap');
+    var dimSlot = byId('dimViewSlot');
+    (hasClients ? byId('clientChartViewSlot') : dimSlot).appendChild(views);
+    dimSlot.style.display = !hasClients && hasDims ? 'flex' : 'none';
     renderSessions(s.sessions);
-    document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
+    if (settingsFor) renderSettings();
+    var foot = byId('foot');
+    foot.textContent = 'Refreshes every ' + (POLL_MS / 1000) + 's · last update ';
+    foot.appendChild(el('span', 'mono', new Date().toLocaleTimeString()));
   }
 
+  // ── Controls ─────────────────────────────────────────────────────────────
+
   function note(kind, text) {
-    var n = document.getElementById('note');
+    var n = byId('note');
     n.className = kind;
     n.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' · ' + text;
     n.style.display = 'block';
+    // An outcome of a change made from the settings dialog is shown in it too:
+    // the page note is behind the dialog, where it would not be seen.
+    if (settingsFor) {
+      settingsNote = { kind: kind, text: text };
+      var sn = byId('setNote');
+      sn.className = 'set-note ' + kind;
+      sn.textContent = text;
+      sn.style.display = 'block';
+    }
   }
 
   // One manual switch. The endpoint is a nudge, not a pin: it sets the current
@@ -1665,14 +2240,14 @@ ${SHARED_HELPERS}
   }
 
   function loginNote(kind, text) {
-    var n = document.getElementById('loginNote');
+    var n = byId('loginNote');
     n.className = kind || '';
     n.textContent = text;
   }
 
-  // Asks the server for a sign-in link and opens the panel on it. Asking again
-  // replaces the link: the server keeps the old one until it lapses, but the
-  // page only ever offers the newest.
+  // Asks the server for a sign-in link and opens the dialog on it. Asking
+  // again replaces the link: the server keeps the old one until it lapses, but
+  // the page only ever offers the newest.
   function doLoginStart(btn) {
     btn.disabled = true;
     var r = loginStartRequest(localStorage.getItem(KEY));
@@ -1685,18 +2260,19 @@ ${SHARED_HELPERS}
         if (!json) return;
         if (!json.ok) { note('error', 'could not start a sign-in: ' + (json.error || 'unknown error')); return; }
         loginState = json.state;
-        document.getElementById('loginLink').setAttribute('href', json.url);
-        document.getElementById('loginCode').value = '';
+        byId('loginLink').setAttribute('href', json.url);
+        byId('loginCode').value = '';
         var mins = Math.max(1, Math.round((json.expiresAt - Date.now()) / 60000));
         loginNote('', 'The link works for ' + mins + ' minutes. If this browser is signed in to a different Claude account, open it in a private window.');
-        document.getElementById('loginWrap').style.display = '';
+        byId('loginWrap').style.display = '';
+        byId('loginCode').focus();
       })
       .catch(function (e) { note('error', 'could not start a sign-in: ' + e.message); })
       .finally(function () { btn.disabled = false; });
   }
 
   function doLoginFinish(btn) {
-    var code = document.getElementById('loginCode').value.trim();
+    var code = byId('loginCode').value.trim();
     if (!loginState) { loginNote('error', 'there is no sign-in link open; press Add account again'); return; }
     if (!code) { loginNote('error', 'paste the code Claude showed after signing in'); return; }
     btn.disabled = true;
@@ -1721,8 +2297,8 @@ ${SHARED_HELPERS}
 
   function closeLogin() {
     loginState = null;
-    document.getElementById('loginWrap').style.display = 'none';
-    document.getElementById('loginCode').value = '';
+    byId('loginWrap').style.display = 'none';
+    byId('loginCode').value = '';
   }
 
   function doControlAccount(name, spec, btn) {
@@ -1740,9 +2316,8 @@ ${SHARED_HELPERS}
         poll();
       })
       .catch(function (e) { note('error', 'change failed: ' + e.message); })
-      // Unlike doSwitch, always re-enabled: the card is rebuilt by the poll
-      // above, and a button that stayed dead after a refused change would be
-      // the only control an operator could not retry.
+      // Unlike doSwitch, always re-enabled: a control that stayed dead after a
+      // refused change would be the only one an operator could not retry.
       .finally(function () { btn.disabled = false; });
   }
 
@@ -1751,7 +2326,7 @@ ${SHARED_HELPERS}
   // across a restart. One number governs every quota bucket — a fleet using
   // per-bucket thresholds is told what the save dropped (thresholdOutcome).
   function doThreshold(btn) {
-    var input = document.getElementById('thrVal');
+    var input = byId('thrVal');
     var raw = input.value.trim();
     // Left to the server otherwise: an empty field is the one case it would see
     // as a missing key rather than a bad number, and "invalid request body" is
@@ -1797,9 +2372,9 @@ ${SHARED_HELPERS}
 
   function showKeybox() {
     if (timer) { clearInterval(timer); timer = null; }
-    document.getElementById('app').style.display = 'none';
-    document.getElementById('keybox').style.display = 'block';
-    document.getElementById('key').focus();
+    byId('app').style.display = 'none';
+    byId('keybox').style.display = 'block';
+    byId('key').focus();
   }
 
   function poll() {
@@ -1814,18 +2389,21 @@ ${SHARED_HELPERS}
       })
       .then(function (s) {
         if (!s) return;
-        document.getElementById('keybox').style.display = 'none';
-        document.getElementById('app').style.display = '';
-        document.getElementById('err').style.display = 'none';
+        byId('keybox').style.display = 'none';
+        byId('app').style.display = '';
+        byId('err').style.display = 'none';
         render(s);
+        // The chart's history is only worth asking for when there is a client
+        // to chart; the Clients table is what says so.
+        if (Object.keys(s.clients || {}).length) pollSeries();
       })
       .catch(function (e) {
-        var err = document.getElementById('err');
-        err.style.display = 'block';
+        var err = byId('err');
+        err.style.display = 'flex';
         err.textContent = 'Cannot reach the proxy: ' + e.message;
         // The banner lives inside #app, which stays hidden until a first
         // status lands; without this a first poll that fails is a blank page.
-        if (document.getElementById('keybox').style.display !== 'block') document.getElementById('app').style.display = '';
+        if (byId('keybox').style.display !== 'block') byId('app').style.display = '';
       });
   }
 
@@ -1834,14 +2412,14 @@ ${SHARED_HELPERS}
     if (!timer) timer = setInterval(poll, POLL_MS);
   }
 
-  document.getElementById('go').addEventListener('click', function () {
-    var v = document.getElementById('key').value.trim();
+  byId('go').addEventListener('click', function () {
+    var v = byId('key').value.trim();
     if (!v) return;
     localStorage.setItem(KEY, v);
     start();
   });
-  document.getElementById('key').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') document.getElementById('go').click();
+  byId('key').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') byId('go').click();
   });
   // Theme: system → light → dark → system. "system" is the absence of a
   // stored choice, so a viewer who never touches this keeps following their
@@ -1856,11 +2434,10 @@ ${SHARED_HELPERS}
   function applyTheme(theme) {
     if (theme === 'system') document.documentElement.removeAttribute('data-theme');
     else document.documentElement.setAttribute('data-theme', theme);
-    var btn = document.getElementById('theme');
     // Name the state, not the action: a button reading "Dark" while the page is
     // light is the ambiguity every theme toggle has, and this one says where it
     // is rather than where it would go.
-    btn.textContent = theme === 'system' ? 'Theme: system' : theme === 'light' ? 'Theme: light' : 'Theme: dark';
+    byId('theme').textContent = theme === 'system' ? 'Theme: system' : theme === 'light' ? 'Theme: light' : 'Theme: dark';
   }
   function storeTheme(theme) {
     try {
@@ -1873,36 +2450,47 @@ ${SHARED_HELPERS}
   // 'system' and the button would be stuck on 'light' instead of cycling.
   var theme = readTheme();
   applyTheme(theme);
-  document.getElementById('theme').addEventListener('click', function () {
+  byId('theme').addEventListener('click', function () {
     theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
     storeTheme(theme);
     applyTheme(theme);
   });
 
-  document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
-  document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
-  document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
-  document.getElementById('thrVal').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') document.getElementById('thrSet').click();
+  byId('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
+  byId('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
+  byId('thrSet').addEventListener('click', function () { doThreshold(this); });
+  byId('thrVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') byId('thrSet').click();
   });
-  buildUsageViews();
-  buildClientChart();
-  document.getElementById('addAcct').addEventListener('click', function () { doLoginStart(this); });
-  document.getElementById('loginGo').addEventListener('click', function () { doLoginFinish(this); });
-  document.getElementById('loginCode').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') document.getElementById('loginGo').click();
+  buildControls();
+  byId('addAcct').addEventListener('click', function () { doLoginStart(this); });
+  byId('loginGo').addEventListener('click', function () { doLoginFinish(this); });
+  byId('loginCode').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') byId('loginGo').click();
   });
-  document.getElementById('loginClose').addEventListener('click', closeLogin);
-  document.getElementById('loginCopy').addEventListener('click', function () {
-    var href = document.getElementById('loginLink').getAttribute('href');
+  byId('loginClose').addEventListener('click', closeLogin);
+  byId('loginCopy').addEventListener('click', function () {
+    var btn = this;
+    var href = byId('loginLink').getAttribute('href');
     var failed = function () { loginNote('error', 'could not copy; open the link instead'); };
     try {
-      navigator.clipboard.writeText(href).then(function () { loginNote('ok', 'link copied'); }, failed);
+      navigator.clipboard.writeText(href).then(function () {
+        btn.textContent = 'Copied ✓';
+        setTimeout(function () { btn.textContent = 'Copy link'; }, 1500);
+      }, failed);
     } catch (e) { failed(); }
+  });
+  // A click on the dimmed backdrop closes a dialog; one inside it does not.
+  byId('loginWrap').addEventListener('click', function (e) { if (e && e.target === this) closeLogin(); });
+  byId('settingsWrap').addEventListener('click', function (e) { if (e && e.target === this) closeSettings(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    if (settingsFor) closeSettings();
+    else if (loginState) closeLogin();
   });
 
   ['fProject', 'fClient'].forEach(function (id) {
-    document.getElementById(id).addEventListener('change', function () {
+    byId(id).addEventListener('change', function () {
       sessionFilters[id === 'fProject' ? 'project' : 'client'] = this.value;
       if (lastStatus) render(lastStatus);
     });
