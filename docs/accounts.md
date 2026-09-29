@@ -59,6 +59,16 @@ For Anthropic API key accounts (billed via Console):
 teamclaude login --api
 ```
 
+### When the key is rejected (401)
+
+A 401 on an API-key account never reaches the client. The request fails over to the next account, and the account that answered it is held out of rotation for a cooldown, then tried again. It is not benched for good, because a 401 does not always mean the key is bad: a gateway such as LiteLLM, set as the account's `upstream`, can answer one while its own upstream is unreachable.
+
+The hold lengthens while the key keeps being rejected: 1 minute after the first 401, then 5 minutes, 15 minutes, and 1 hour for every one after that. Any successful response from the account starts the sequence over. A key that really is revoked therefore costs one failed-over request per hour, and an account whose gateway recovers comes back by itself.
+
+While the hold lasts, `status`, the TUI and the dashboard show the account as blocked with "upstream rejected its API key with a 401", and the server log says how long the hold is. Reloading a config that carries a different key for the account, or disabling and re-enabling it, lifts the hold at once.
+
+An OAuth account is different. A 401 there triggers a token refresh, and an account that has no refresh token to try is taken out of rotation until it is logged in again.
+
 ## Multiple organizations
 
 One email can hold multiple accounts across different organizations (e.g. corp + personal). Dedup is keyed on account + org, and names disambiguate as `email (Org)`.

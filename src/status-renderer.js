@@ -146,6 +146,7 @@ export const UNAVAILABLE_TEXT = {
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
   routing: "the account's routing proxy is unreachable (cooldown)",
+  credential: 'upstream rejected its API key with a 401 (cooldown, then retried)',
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
@@ -543,6 +544,11 @@ function formatAccountStatus(account, now, paint) {
   const routingAt = parseTs(account.routingFailedUntil);
   if (routingAt && routingAt > now) {
     parts.push(paint.yellow(`routing proxy down, retry in ${formatDuration(routingAt - now)}`));
+  }
+
+  const credentialAt = parseTs(account.credentialRejectedUntil);
+  if (credentialAt && credentialAt > now) {
+    parts.push(paint.yellow(`API key rejected (401), retry in ${formatDuration(credentialAt - now)}`));
   }
 
   return parts.join(' / ');

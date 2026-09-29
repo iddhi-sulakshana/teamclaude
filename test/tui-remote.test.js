@@ -12,7 +12,8 @@ const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 // Every action here crosses a real socket, so wait for the thing to have
 // happened rather than for a duration: a fixed sleep is a race that a loaded
 // machine loses, and these tests run alongside the rest of the suite.
-async function waitFor(predicate, what, timeoutMs = 5000) {
+// The default is a watchdog, far above what a loaded machine adds.
+async function waitFor(predicate, what, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;

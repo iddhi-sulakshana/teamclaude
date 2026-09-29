@@ -347,20 +347,23 @@ test('a tool that blows up reports a generic failure, never the exception', asyn
 test('write tools run one at a time, so a removal cannot race a reload', async () => {
   const order = [];
   let releaseReload;
-  const reload = () => new Promise(resolve => { order.push('reload:start'); releaseReload = () => { order.push('reload:end'); resolve(0); }; });
+  // The reload announces that it was reached, so the test waits for that —
+  // not for a duration, and not against a deadline of its own: the runner's
+  // timeout bounds a write that never arrives.
+  let reachedReload;
+  const reached = new Promise(resolve => { reachedReload = resolve; });
+  const reload = () => new Promise(resolve => {
+    order.push('reload:start');
+    releaseReload = () => { order.push('reload:end'); resolve(0); };
+    reachedReload();
+  });
   const persistAccounts = async () => { order.push('persist'); };
   const { tools } = await fixture({ hooks: { reload, persistAccounts } });
 
   const first = tools.call('set_threshold', { percent: 70 });
   const second = tools.call('remove_account', { account: 'alice@example.com' });
   try {
-    // Wait for the first call to reach its reload — not for a duration — before
-    // judging what the second has done meanwhile.
-    const deadline = Date.now() + 5000;
-    while (!releaseReload) {
-      if (Date.now() > deadline) throw new Error('the first write never reached its reload');
-      await new Promise(r => setTimeout(r, 5));
-    }
+    await reached;
     assert.deepEqual(order, ['reload:start'], 'the removal must wait for the running write to finish');
   } finally {
     // Released whatever the verdict: the queue is shared by every write tool
@@ -384,15 +387,18 @@ test('a write that never settles is answered, and the queue moves on without it'
 });
 
 test('the write queue takes only so many turns; past that a call is refused at once', async () => {
+  // Each write's reload hands out its release and announces that it was
+  // reached; waitFor(n) is that announcement, not a poll against a deadline
+  // (the runner's own timeout bounds a write that never arrives).
   const releases = [];
-  const reload = () => new Promise(resolve => { releases.push(resolve); });
+  const arrivals = [];
+  const reload = () => new Promise(resolve => {
+    releases.push(resolve);
+    for (const arrival of arrivals.splice(0)) arrival();
+  });
   const { tools, disk } = await fixture({ hooks: { reload }, options: { writeQueueDepth: 2 } });
   const waitFor = async (n) => {
-    const deadline = Date.now() + 5000;
-    while (releases.length < n) {
-      if (Date.now() > deadline) throw new Error(`write ${n} never reached its reload`);
-      await new Promise(r => setTimeout(r, 5));
-    }
+    while (releases.length < n) await new Promise(resolve => arrivals.push(resolve));
   };
   const first = tools.call('set_probe_interval', { seconds: 120 });
   const second = tools.call('set_probe_interval', { seconds: 130 });

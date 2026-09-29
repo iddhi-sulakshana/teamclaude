@@ -32,6 +32,7 @@ import net from 'node:net';
 import dns from 'node:dns/promises';
 import { connectThroughProxy, handshakeOverTunnel } from './sx.js';
 import { v6Groups } from './forward-target.js';
+import { envVar } from './brand.js';
 
 const CONNECT_TIMEOUT_MS = 30000; // same budget as the CONNECT tunnel
 
@@ -44,7 +45,7 @@ const CONNECT_TIMEOUT_MS = 30000; // same budget as the CONNECT tunnel
 // dead proxy) instead of the ROUTING_FAILED that fails the account over and
 // arms its cooldown. The environment override exists for the tests, which
 // cannot wait 20s on a proxy that never answers.
-const AGENT_TIMEOUT_MS = Number(process.env.TEAMCLAUDE_ROUTING_TIMEOUT_MS) || 20_000;
+const AGENT_TIMEOUT_MS = Number(envVar('ROUTING_TIMEOUT_MS')) || 20_000;
 
 export const ROUTING_SCHEMES = ['http', 'socks4', 'socks4a', 'socks5', 'socks5h'];
 

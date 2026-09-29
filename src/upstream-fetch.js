@@ -16,6 +16,7 @@ import { tunnelTls } from './sx.js';
 import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 import { routingAgent } from './account-routing.js';
 import { AdmissionGate, DEFAULT_MAX_QUEUE, DEFAULT_QUEUE_TIMEOUT_MS } from './admission-gate.js';
+import { envVar } from './brand.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 // Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
@@ -30,7 +31,7 @@ import { AdmissionGate, DEFAULT_MAX_QUEUE, DEFAULT_QUEUE_TIMEOUT_MS } from './ad
 // per-origin and bounds the fan-out. Escape hatch:
 // TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH=1 reverts to the old global-fetch path.
 export const DEFAULT_UPSTREAM_MAX_SOCKETS = 256;
-const MAX_SOCKETS = positiveInt(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS, DEFAULT_UPSTREAM_MAX_SOCKETS);
+const MAX_SOCKETS = positiveInt(envVar('UPSTREAM_MAX_SOCKETS'), DEFAULT_UPSTREAM_MAX_SOCKETS);
 
 // Admission in front of the pool. Node's Agent queues a request past
 // maxSockets internally, without bound and without a deadline, and destroying
@@ -47,8 +48,8 @@ const MAX_SOCKETS = positiveInt(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS, DEF
 // free (a permit is held until the response body ends or is dropped).
 export const DEFAULT_UPSTREAM_MAX_QUEUE = DEFAULT_MAX_QUEUE;
 export const DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS = DEFAULT_QUEUE_TIMEOUT_MS;
-const MAX_QUEUE = nonNegativeInt(process.env.TEAMCLAUDE_UPSTREAM_MAX_QUEUE, DEFAULT_UPSTREAM_MAX_QUEUE);
-const QUEUE_TIMEOUT_MS = positiveInt(process.env.TEAMCLAUDE_UPSTREAM_QUEUE_TIMEOUT_MS, DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS);
+const MAX_QUEUE = nonNegativeInt(envVar('UPSTREAM_MAX_QUEUE'), DEFAULT_UPSTREAM_MAX_QUEUE);
+const QUEUE_TIMEOUT_MS = positiveInt(envVar('UPSTREAM_QUEUE_TIMEOUT_MS'), DEFAULT_UPSTREAM_QUEUE_TIMEOUT_MS);
 const admissionByOrigin = new Map();
 
 // Counters only (no origins, no request data): for the status endpoint.
@@ -70,7 +71,7 @@ function nonNegativeInt(value, fallback) {
 }
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
-const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH || '');
+const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(envVar('UPSTREAM_GLOBAL_FETCH') || '');
 
 // Time to wait for RESPONSE HEADERS before treating the upstream socket as dead.
 // This is NOT a limit on the response body (SSE completions can stream for
@@ -118,7 +119,7 @@ export const DEFAULT_HEADERS_TIMEOUT_MS = 120_000;
  */
 function resolveHeadersTimeout(perCall, fallbackMs) {
   if (perCall != null) return perCall;
-  const env = Number(process.env.TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS);
+  const env = Number(envVar('UPSTREAM_HEADERS_TIMEOUT_MS'));
   return env > 0 ? env : positiveInt(fallbackMs, DEFAULT_HEADERS_TIMEOUT_MS);
 }
 

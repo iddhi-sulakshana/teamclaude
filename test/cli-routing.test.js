@@ -7,6 +7,7 @@ import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { closedPort } from '../test-helpers/spawn-server.js';
 
 // `teamclaude routing` and `login --routing` drive the real CLI as a subprocess
 // against a throwaway TEAMCLAUDE_CONFIG, so the user's real config is never
@@ -200,13 +201,6 @@ function startSocks5(connects, { refuse = false } = {}) {
         up.on('error', () => client.destroy());
       }
     });
-  });
-}
-
-function closedPort() {
-  return new Promise((resolve) => {
-    const probe = net.createServer();
-    probe.listen(0, '127.0.0.1', () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
   });
 }
 
