@@ -21,7 +21,7 @@ import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
-import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
+import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames, USAGE_SLOT_MS } from './client-usage.js';
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
@@ -551,6 +551,20 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // rather than offer buttons that only ever answer 403.
         const viewer = { client: req.tcClient || null, role: who };
         res.end(JSON.stringify({ ...extra, ...status, viewer, upstreamPool: upstreamPoolStatus() }, null, 2));
+        return;
+      }
+
+      // Per-client usage over the last day, hourly: the dashboard's usage-over-
+      // time chart. Its own endpoint rather than a status field because the
+      // status payload carries each window rolled up, and this is the tally
+      // behind them — ~100 numbers per client that only the chart reads. The
+      // same readers as status: behind the same gate, and every client key sees
+      // every client, as the Clients table already shows them.
+      if (req.method === 'GET' && req.url === '/teamclaude/usage/series') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(clientUsage
+          ? clientUsage.series()
+          : { slotMs: USAGE_SLOT_MS, bucketMs: 4 * USAGE_SLOT_MS, buckets: 0, end: Date.now(), clients: {} }));
         return;
       }
 

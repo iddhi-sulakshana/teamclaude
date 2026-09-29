@@ -587,3 +587,111 @@ test('a key that stops recording does not hold its slots for the life of the pro
   assert.equal(state.bob.requests, 1, 'its lifetime counters are untouched');
   assert.equal(Object.keys(state.alice.slots).length, 1, 'the live key keeps only its current slot');
 });
+
+// ── usage over time (series) ────────────────────────────────
+
+test('series buckets each client hourly, the last bucket ending with the current slot', () => {
+  let now = T0 + 7 * 60_000;                         // a few minutes into a slot
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1, inputTokens: 100, outputTokens: 5 });
+  now -= 5 * 3600_000;                               // five hours earlier
+  t.record('alice', { requests: 2, inputTokens: 20 });
+  t.record('bob', { requests: 1, outputTokens: 7 });
+  now += 5 * 3600_000;
+
+  const s = t.series();
+  const current = Math.floor(now / USAGE_SLOT_MS);
+  assert.equal(s.buckets, 24);
+  assert.equal(s.slotMs, USAGE_SLOT_MS);
+  assert.equal(s.bucketMs, 4 * USAGE_SLOT_MS);
+  assert.equal(s.end, (current + 1) * USAGE_SLOT_MS, 'the series ends where the current slot does');
+  assert.deepEqual(Object.keys(s.clients), ['alice', 'bob']);
+  const a = s.clients.alice;
+  assert.equal(a.requests.length, 24);
+  assert.equal(a.requests[23], 1, 'now lands in the last bucket');
+  assert.equal(a.inputTokens[23], 100);
+  assert.equal(a.outputTokens[23], 5);
+  // Five hours back is twenty slots back: bucket 23 - 5.
+  assert.equal(a.requests[18], 2);
+  assert.equal(a.inputTokens[18], 20);
+  assert.equal(s.clients.bob.outputTokens[18], 7);
+  assert.equal(a.requests.reduce((x, y) => x + y, 0), 3, 'every record is counted exactly once');
+});
+
+test('series covers the retained day and no more, and drops what has aged out of it', () => {
+  let now = T0;
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1 });
+  now += 25 * 3600_000;                              // past the 24h window
+  t.record('bob', { requests: 1 });
+  const s = t.series({ buckets: 1000 });
+  assert.equal(s.buckets, 24, 'longer than retention is clamped, not padded with invented zeros');
+  assert.deepEqual(Object.keys(s.clients), ['bob'], 'a client with nothing left in the day is left out');
+});
+
+test('series can bucket finer, and keeps a hostile client name as a plain key', () => {
+  let now = T0;
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('__proto__', { requests: 1, inputTokens: 3 });
+  now -= USAGE_SLOT_MS;
+  t.record('__proto__', { requests: 1, inputTokens: 4 });
+  now += USAGE_SLOT_MS;
+  const s = t.series({ buckets: 20, slotsPerBucket: 1 });
+  assert.equal(s.bucketMs, USAGE_SLOT_MS);
+  assert.ok(Object.prototype.hasOwnProperty.call(s.clients, '__proto__'));
+  assert.deepEqual(s.clients.__proto__.inputTokens.slice(-2), [4, 3]);
+});
+
+test('series omits a client whose only traffic is WebSocket connections', () => {
+  const t = new ClientUsageTracker({ now: () => T0 });
+  t.record('alice', { connections: 1 });
+  assert.deepEqual(t.series().clients, {});
+});
+
+test('series resumes across a restart from the state file', () => {
+  let now = T0;
+  const before = new ClientUsageTracker({ now: () => now });
+  before.record('alice', { requests: 1, inputTokens: 9 });
+  const saved = before.exportState();
+  now += 2 * 3600_000;
+  const after = new ClientUsageTracker({ now: () => now });
+  after.restore(saved);
+  assert.equal(after.series().clients.alice.inputTokens[21], 9, 'two hours ago, restored');
+});
+
+test('GET /teamclaude/usage/series serves the chart behind the same gate as status', async () => {
+  const am = new AccountManager([{ name: 'acct', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  const tracker = new ClientUsageTracker();
+  tracker.record('alice', { requests: 1, inputTokens: 5, outputTokens: 6 });
+  // trustLoopback off: the test client is on loopback, and the exemption would
+  // otherwise let a key-less request through and prove nothing about the gate.
+  const proxy = createProxyServer(am, { proxy: { ...PROXY, trustLoopback: false } }, {}, null, tracker);
+  const port = await listen(proxy);
+  try {
+    const url = `http://127.0.0.1:${port}/teamclaude/usage/series`;
+    assert.equal((await fetch(url)).status, 401);
+    assert.equal((await fetch(url, { headers: { 'x-api-key': 'wrong' } })).status, 401);
+    for (const key of ['shared-key', 'bob-key']) {
+      const res = await fetch(url, { headers: { 'x-api-key': key } });
+      assert.equal(res.status, 200, key);
+      const body = await res.json();
+      assert.equal(body.buckets, 24);
+      assert.equal(body.clients.alice.inputTokens[23], 5, 'every client key sees every client, as in status');
+    }
+  } finally {
+    proxy.close();
+  }
+});
+
+test('GET /teamclaude/usage/series answers an empty series when no tracker is wired', async () => {
+  const am = new AccountManager([{ name: 'acct', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  const proxy = createProxyServer(am, { proxy: PROXY }, {});
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/usage/series`, { headers: { 'x-api-key': 'shared-key' } });
+    assert.equal(res.status, 200);
+    assert.deepEqual((await res.json()).clients, {});
+  } finally {
+    proxy.close();
+  }
+});

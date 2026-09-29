@@ -220,6 +220,55 @@ export class ClientUsageTracker {
   }
 
   /**
+   * Every client's traffic over the last day as a time series, for the
+   * dashboard's usage-over-time chart: `buckets` consecutive buckets of
+   * `slotsPerBucket` slots each, oldest first, the last one ending with the
+   * slot the clock is in now. A bucket is a whole number of slots because the
+   * slots are all that is kept — nothing finer can be reported, and a bucket
+   * cut through a slot would have to guess how its traffic divided. Bucket `i`
+   * covers [end - (buckets - i) * bucketMs, end - (buckets - 1 - i) * bucketMs).
+   *
+   * Asking for more history than retention holds returns only what is held
+   * rather than a run of zeros, which would read as "idle" when it means
+   * "not kept". A client with nothing in any bucket is left out, as export()
+   * leaves out one with nothing in any window.
+   * @param {{ buckets?: number, slotsPerBucket?: number }} [opts]
+   */
+  series({ buckets = 24, slotsPerBucket = 4 } = {}) {
+    const now = this._now();
+    const per = Math.max(1, Math.floor(slotsPerBucket));
+    const n = Math.max(0, Math.min(Math.floor(buckets), Math.floor(RETAINED_SLOTS / per)));
+    const current = Math.floor(now / USAGE_SLOT_MS);
+    const first = current - n * per + 1;
+    const zeros = () => new Array(n).fill(0);
+    // Null prototype for the reason _snapshot() gives: a client named
+    // `__proto__` must come out as an own key.
+    const clients = Object.create(null);
+    for (const [name, c] of this.clients) {
+      this._evict(c, now);
+      /** @type {{ requests: number[], inputTokens: number[], outputTokens: number[] } | null} */
+      let row = null;
+      for (const [slot, t] of c.slots) {
+        if (slot < first || slot > current) continue;
+        if (!(t.requests || t.inputTokens || t.outputTokens)) continue;
+        if (!row) row = { requests: zeros(), inputTokens: zeros(), outputTokens: zeros() };
+        const i = Math.floor((slot - first) / per);
+        row.requests[i] += t.requests;
+        row.inputTokens[i] += t.inputTokens;
+        row.outputTokens[i] += t.outputTokens;
+      }
+      if (row) clients[name] = row;
+    }
+    return {
+      slotMs: USAGE_SLOT_MS,
+      bucketMs: per * USAGE_SLOT_MS,
+      buckets: n,
+      end: (current + 1) * USAGE_SLOT_MS,
+      clients: Object.fromEntries(Object.entries(clients)),
+    };
+  }
+
+  /**
    * Snapshot for the state file. Carries the slots instead of the windows, so a
    * restart resumes the windows rather than restarting them — an upgrade is
    * exactly when someone looks at the dashboard, and a 24h figure that reads
