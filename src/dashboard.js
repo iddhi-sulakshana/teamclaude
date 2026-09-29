@@ -12,7 +12,8 @@
 //
 // Self-contained on purpose: no external scripts, styles, or fonts, so the
 // page works on air-gapped deployments and adds no third-party surface. Its
-// typeface (Geist) is embedded rather than fetched, for the same reason. All
+// typefaces (DM Sans and DM Mono) are embedded rather than fetched, for the
+// same reason. All
 // rendering uses textContent — status fields (account names, client names) are
 // operator/OAuth-derived, but they still never reach innerHTML.
 
@@ -21,7 +22,7 @@ import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js'
 import { USAGE_WINDOWS } from './client-usage.js';
 import { formatMoney } from './oauth.js';
 import { resolveMaxSpendMinor, spendCapReached } from './model.js';
-import { GEIST_WOFF2, GEIST_MONO_WOFF2 } from './dashboard-fonts.js';
+import { DM_SANS_WOFF2, DM_MONO_WOFF2 } from './dashboard-fonts.js';
 
 export function renderDashboardHtml() {
   return PAGE;
@@ -66,7 +67,7 @@ export function dashboardCsp(html = PAGE) {
     "default-src 'none'",
     `script-src ${hashes}`,
     "style-src 'unsafe-inline'",
-    // The two Geist faces, inlined into the page's own stylesheet as data:
+    // The two DM faces, inlined into the page's own stylesheet as data:
     // URLs (dashboard-fonts.js). Nothing else can be a font source.
     "font-src data:",
     "connect-src 'self'",
@@ -327,19 +328,57 @@ export function meterTone(ratio) {
   return ratio >= 0.9 ? 'bad' : ratio >= 0.6 ? 'warn' : 'ok';
 }
 
-// The usage-over-time chart, from GET /teamclaude/usage/series: one bar per
-// bucket of the window shown — the last five for `5h`, the whole day for `24h`
-// and for `total`, which has no series of its own (the chart says so) — each
-// stacked by client. The two biggest clients over the shown range get a
-// segment of their own and the rest share one, which is what the legend can
-// name without turning into a second table. `parts` are in legend order, so a
-// bar's bottom segment is always the biggest client's.
+// The overview's columns: the two busiest clients on the shown window and
+// measure, a column each, and everyone else folded into a third — what a glance
+// takes in, where the Clients list further down carries every row. Three
+// clients or fewer are each their own column, since a fold of one would only
+// hide a name. `share` is of the whole; `lift` is how high a column's figure
+// stands against the tallest column; `grow` is its width, square-rooted so a
+// client with a sliver of the traffic still has room for its label.
+// `averageLift` puts the dashed average-per-client line on the same scale as
+// `lift`. A client with nothing on the window takes no column and does not
+// pull the average down.
+/** @param {Array<{ name: string, value: number }>|null|undefined} ranking */
+export function clientGroups(ranking) {
+  var active = (ranking || []).filter(function (r) { return r.value > 0; });
+  var total = 0;
+  active.forEach(function (r) { total += r.value; });
+  /** @type {Array<{ name: string, value: number, members: string[], others: boolean, share: number, lift: number, grow: number }>} */
+  var groups = (active.length <= 3 ? active : active.slice(0, 2)).map(function (r) {
+    return { name: r.name, value: r.value, members: [r.name], others: false, share: 0, lift: 0, grow: 1 };
+  });
+  if (active.length > 3) {
+    var rest = active.slice(2);
+    var sum = 0;
+    rest.forEach(function (r) { sum += r.value; });
+    groups.push({ name: 'others', value: sum, members: rest.map(function (r) { return r.name; }), others: true, share: 0, lift: 0, grow: 1 });
+  }
+  var max = 0;
+  groups.forEach(function (g) { if (g.value > max) max = g.value; });
+  groups.forEach(function (g) {
+    g.share = total ? g.value / total : 0;
+    g.lift = max ? g.value / max : 0;
+    g.grow = 1 + 2 * Math.sqrt(g.share);
+  });
+  var average = active.length ? total / active.length : 0;
+  return { groups: groups, total: total, average: average, averageLift: max ? average / max : 0, clients: active.length };
+}
+
+// Usage over time, from GET /teamclaude/usage/series: one point per hour of
+// the window shown — the last five for `5h`, the day for `24h` and for `total`,
+// which has no series of its own (the tracker keeps a day, not a lifetime) —
+// for one client against everyone else. The one is `focus`, the client the
+// page is signed in as, when it spent anything in the span, and otherwise the
+// busiest; `main` is null only when nobody spent anything. `peakAt` is the
+// point the chart marks: the main client's busiest hour, or everyone else's
+// when the main line is flat. `last` is the newest hour's whole traffic.
 /**
  * @param {any} series
  * @param {string} [view]
  * @param {string} [metric]
+ * @param {string|null} [focus]
  */
-export function seriesBars(series, view, metric) {
+export function seriesLines(series, view, metric, focus) {
   var s = series || {};
   var n = Number.isInteger(s.buckets) && s.buckets > 0 ? s.buckets : 0;
   var bucketMs = s.bucketMs || 0;
@@ -350,26 +389,126 @@ export function seriesBars(series, view, metric) {
     if (metric === 'requests') return (c.requests || [])[i] || 0;
     return ((c.inputTokens || [])[i] || 0) + ((c.outputTokens || [])[i] || 0);
   };
+  var names = Object.keys(clients).sort();
+  /** @type {Object<string, number>} */
+  var sums = {};
+  names.forEach(function (name) {
+    var sum = 0;
+    for (var i = from; i < n; i++) sum += at(clients[name], i);
+    sums[name] = sum;
+  });
+  /** @type {string|null} */
+  var main = focus && sums[focus] > 0 ? focus : null;
+  if (!main) {
+    names.forEach(function (name) { if (sums[name] > 0 && (main === null || sums[name] > sums[main])) main = name; });
+  }
+  var hasOther = names.some(function (name) { return name !== main && sums[name] > 0; });
+  /** @type {Array<{ start: number, end: number, main: number, other: number }>} */
+  var points = [];
+  var peak = 0, total = 0;
+  for (var i = from; i < n; i++) {
+    var m = main === null ? 0 : at(clients[main], i);
+    var o = 0;
+    names.forEach(function (name) { if (name !== main) o += at(clients[name], i); });
+    points.push({ start: s.end - (n - i) * bucketMs, end: s.end - (n - 1 - i) * bucketMs, main: m, other: o });
+    if (m > peak) peak = m;
+    if (o > peak) peak = o;
+    total += m + o;
+  }
+  /** @type {'main'|'other'} */
+  var key = points.some(function (p) { return p.main > 0; }) ? 'main' : 'other';
+  var peakAt = -1;
+  points.forEach(function (p, idx) {
+    if (p[key] > 0 && (peakAt === -1 || p[key] > points[peakAt][key])) peakAt = idx;
+  });
+  var tail = points[points.length - 1];
+  return { points: points, main: main, hasOther: hasOther, peak: peak, total: total, peakAt: peakAt, last: tail ? tail.main + tail.other : 0, spanMs: shown * bucketMs };
+}
+
+// A smooth line through the points, as SVG path data: each span a cubic whose
+// control points follow the neighbouring points (Catmull–Rom), so the curve
+// passes through every hour's value instead of rounding it off. A control
+// point is kept no lower than `floor`: a curve stays inside the hull of its
+// control points, so a line of usage cannot dip below the zero it sits on and
+// read as a negative hour. Two decimals are all a 400-wide viewBox shows.
+/**
+ * @param {Array<[number, number]>} pts
+ * @param {number} [floor]
+ */
+export function smoothPath(pts, floor) {
+  if (!pts || !pts.length) return '';
+  var f = function (/** @type {number} */ v) { return String(Math.round(v * 100) / 100); };
+  var y = function (/** @type {number} */ v) { return floor == null ? v : Math.min(floor, v); };
+  var d = 'M' + f(pts[0][0]) + ',' + f(pts[0][1]);
+  for (var i = 0; i < pts.length - 1; i++) {
+    var p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+    d += ' C' + f(p1[0] + (p2[0] - p0[0]) / 6) + ',' + f(y(p1[1] + (p2[1] - p0[1]) / 6))
+      + ' ' + f(p2[0] - (p3[0] - p1[0]) / 6) + ',' + f(y(p2[1] - (p3[1] - p1[1]) / 6))
+      + ' ' + f(p2[0]) + ',' + f(p2[1]);
+  }
+  return d;
+}
+
+// Traffic by time, for the heatmap: a row per client — the busiest six on the
+// span shown, or the busiest five and one "others" row when there are more —
+// and a column per stretch of that span: four hours each across the day, one
+// each across five hours. `level` is a cell's shade, 0 for nothing and 1–4 by
+// quarters of the square root of its share of the busiest cell. Usage is
+// heavy-tailed — one client often spends ten times the next — and on a linear
+// scale every client but the busiest would sit in the faintest shade; the root
+// keeps them apart while the busiest cell still takes the darkest.
+/**
+ * @param {any} series
+ * @param {string} [view]
+ * @param {string} [metric]
+ */
+export function heatGrid(series, view, metric) {
+  var s = series || {};
+  var n = Number.isInteger(s.buckets) && s.buckets > 0 ? s.buckets : 0;
+  var bucketMs = s.bucketMs || 0;
+  var shown = view === '5h' && bucketMs ? Math.min(n, Math.max(1, Math.round(5 * 3600000 / bucketMs))) : n;
+  var from = n - shown;
+  var per = shown > 6 ? 4 : 1;
+  var count = shown ? Math.ceil(shown / per) : 0;
+  /** @type {Array<{ from: number, to: number }>} */
+  var cols = [];
+  for (var c = 0; c < count; c++) {
+    var a = Math.max(from, n - (count - c) * per), b = n - (count - 1 - c) * per;
+    cols.push({ from: a, to: b });
+  }
+  var clients = s.clients || {};
+  var at = function (/** @type {any} */ cl, /** @type {number} */ i) {
+    if (metric === 'requests') return (cl.requests || [])[i] || 0;
+    return ((cl.inputTokens || [])[i] || 0) + ((cl.outputTokens || [])[i] || 0);
+  };
   var ranked = Object.keys(clients).map(function (name) {
     var sum = 0;
     for (var i = from; i < n; i++) sum += at(clients[name], i);
     return { name: name, sum: sum };
   }).filter(function (r) { return r.sum > 0; });
   ranked.sort(function (x, y) { return (y.sum - x.sum) || (x.name < y.name ? -1 : x.name > y.name ? 1 : 0); });
-  var legend = ranked.slice(0, 2).map(function (r) { return r.name; });
-  var rest = ranked.slice(2).map(function (r) { return r.name; });
-  var bars = [], peak = 0, total = 0;
-  for (var i = from; i < n; i++) {
-    var parts = legend.map(function (name) { return at(clients[name], i); });
-    var others = 0;
-    rest.forEach(function (name) { others += at(clients[name], i); });
-    var sum = others;
-    parts.forEach(function (v) { sum += v; });
-    bars.push({ start: s.end - (n - i) * bucketMs, end: s.end - (n - 1 - i) * bucketMs, parts: parts, others: others, total: sum });
-    if (sum > peak) peak = sum;
-    total += sum;
+  var named = ranked.length > 6 ? ranked.slice(0, 5) : ranked;
+  /** @type {Array<{ name: string, others: boolean, members: string[], cells: Array<{ value: number, level: number }> }>} */
+  var rows = named.map(function (r) { return { name: r.name, others: false, members: [r.name], cells: [] }; });
+  if (ranked.length > 6) {
+    rows.push({ name: 'others', others: true, members: ranked.slice(5).map(function (r) { return r.name; }), cells: [] });
   }
-  return { bars: bars, legend: legend, hasOthers: rest.length > 0, peak: peak, total: total, spanMs: shown * bucketMs };
+  var max = 0;
+  rows.forEach(function (row) {
+    row.cells = cols.map(function (col) {
+      var v = 0;
+      row.members.forEach(function (name) { for (var i = col.from; i < col.to; i++) v += at(clients[name], i); });
+      if (v > max) max = v;
+      return { value: v, level: 0 };
+    });
+  });
+  rows.forEach(function (row) {
+    row.cells.forEach(function (cell) { cell.level = cell.value > 0 ? 1 + Math.min(3, Math.floor(Math.sqrt(cell.value / max) * 4)) : 0; });
+  });
+  return {
+    columns: cols.map(function (col) { return { start: s.end - (n - col.from) * bucketMs, end: s.end - (n - col.to) * bucketMs }; }),
+    rows: rows, max: max, spanMs: shown * bucketMs,
+  };
 }
 
 // The chart's axis labels, oldest first and ending at "now": every hour for a
@@ -834,7 +973,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
-  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, seriesBars, seriesTicks,
+  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, smoothPath, heatGrid, seriesTicks,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -851,52 +990,78 @@ const SHARED_CONSTS = [
   `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
 ].join('\n');
 
-// The dark palette is the design's own and the default; the light one is the
-// same system with the values turned over. Both are defined twice for the
-// same reason as before: once under the media query, for a viewer who has
-// stored no choice, and once under the attribute, for one who has. The media
-// rule excludes an explicit dark choice, so choosing dark on a light desktop is
-// honoured rather than overridden by the system.
+// The dark palette is the design's own and the default: true black, graphite
+// cards, violet for what is fine, lime for what is in use or worth a look,
+// coral for what is nearly gone. The light one is the same system turned over.
+// Both are defined twice for the same reason as before: once under the media
+// query, for a viewer who has stored no choice, and once under the attribute,
+// for one who has. The media rule excludes an explicit dark choice, so choosing
+// dark on a light desktop is honoured rather than overridden by the system.
 const DARK_TOKENS = `
     color-scheme: dark;
-    --bg: #0B0C0E; --glow: rgba(217,119,87,0.10); --panel: #111215; --raised: #15161A; --raised-2: #1A1B1F;
-    --raised-hover: #1C1D22; --modal: #131417; --field: #0B0C0E;
-    --line: rgba(255,255,255,0.07); --line-btn: rgba(255,255,255,0.09); --line-strong: rgba(255,255,255,0.1);
-    --line-mid: rgba(255,255,255,0.08); --line-soft: rgba(255,255,255,0.06); --row-line: rgba(255,255,255,0.04);
-    --text: #ECECEE; --text-strong: #FFFFFF; --text-2: #D4D5D9; --muted: #B5B7BD; --dim: #8B8D94; --faint: #6F727A; --placeholder: #5D6068;
-    --chip: rgba(255,255,255,0.06); --track: rgba(255,255,255,0.05); --sel: #2A2B31; --hover-soft: rgba(255,255,255,0.06);
-    --hover-faint: rgba(255,255,255,0.03); --seg-off: rgba(255,255,255,0.1); --toggle-off: rgba(255,255,255,0.12);
-    --grid: rgba(255,255,255,0.04); --axis: rgba(255,255,255,0.08);
-    --accent: oklch(0.7 0.14 45); --accent-hover: oklch(0.76 0.13 48); --on-accent: #1A0F0A; --logo: oklch(0.68 0.14 42);
-    --accent-soft: rgba(217,119,87,0.16); --accent-text: oklch(0.82 0.12 50); --accent-line: rgba(217,119,87,0.4); --link: oklch(0.78 0.13 50);
-    --series-1: oklch(0.7 0.14 45); --series-2: oklch(0.55 0.08 45); --series-other: #3A3C43; --share-2: oklch(0.62 0.1 45);
-    --ok: oklch(0.72 0.15 150); --ok-text: oklch(0.78 0.15 150); --ok-ring: rgba(80,200,120,0.15);
-    --warn: oklch(0.8 0.14 80); --warn-text: oklch(0.84 0.13 80); --warn-soft: rgba(230,180,60,0.08); --warn-line: rgba(230,180,60,0.25);
-    --bad: oklch(0.66 0.19 25); --bad-text: #FF9A88; --bad-soft: rgba(255,100,80,0.12); --bad-line: rgba(255,100,80,0.3);
-    --scrim: rgba(5,5,7,0.72); --shadow: 0 30px 80px rgba(0,0,0,0.6);
-    --av-l: 0.35; --av-c: 0.06; --av-fg-l: 0.9;`;
+    --bg: #000000; --card: #1C1C1E; --card-hover: #202023; --card-lift: #212124;
+    --raised: #2C2C2E; --raised-hover: #3A3A3C; --row-hover: #2A2A2D; --toggle-off: #48484A;
+    --line: rgba(255,255,255,0.06); --col-line: rgba(255,255,255,0.18); --dash: rgba(255,255,255,0.22); --dash-2: rgba(255,255,255,0.3);
+    --text: #F5F5F7; --text-strong: #FFFFFF; --text-2: #D1D1D6; --muted: #AEAEB2; --dim: #8E8E93; --faint: #636366;
+    --primary: #F5F5F7; --primary-hover: #FFFFFF; --on-primary: #000000; --primary-glow: 0 8px 24px rgba(255,255,255,0.14);
+    --violet: #7B4CF5; --violet-hover: #8D63FF; --lilac: #A98BFF; --lilac-hover: #C9B6FF; --on-violet: #FFFFFF;
+    --lime: #D6FF4F; --lime-text: #D6FF4F; --coral: #FF7A66; --coral-text: #FF9A88; --coral-soft: rgba(255,122,102,0.1);
+    --amber: #FFD66B; --amber-soft: rgba(255,214,107,0.1);
+    --tick-off: #2C2C2E; --tick-dim: #636366; --seg-off: #3A3A3C; --bar-dark: #2E2350;
+    --heat-0: #241C38; --heat-1: #2A2045; --heat-2: #4A33A0; --heat-3: #7B4CF5; --heat-4: #A98BFF;
+    --area: #D6FF4F; --line-other: #8E8E93; --dot-other: #AEAEB2; --logo-a: #F5F5F7; --bg-pill: #2C2C2E;
+    --av0: #D6FF4F; --av1: #A98BFF; --av2: #FFB38A; --av3: #F5F5F7; --av4: #8FE3C8; --av5: #FFD66B; --av6: #C9B6FF; --av7: #FF9A88;
+    --scrim: rgba(0,0,0,0.7); --shadow: 0 30px 80px rgba(0,0,0,0.7);`;
 
 const LIGHT_TOKENS = `
     color-scheme: light;
-    --bg: #F6F5F2; --glow: rgba(217,119,87,0.12); --panel: #FFFFFF; --raised: #FFFFFF; --raised-2: #F3F2EF;
-    --raised-hover: #EFEEEA; --modal: #FFFFFF; --field: #F6F5F2;
-    --line: rgba(20,20,30,0.09); --line-btn: rgba(20,20,30,0.12); --line-strong: rgba(20,20,30,0.14);
-    --line-mid: rgba(20,20,30,0.1); --line-soft: rgba(20,20,30,0.07); --row-line: rgba(20,20,30,0.05);
-    --text: #17181B; --text-strong: #000000; --text-2: #2B2C31; --muted: #4B4D54; --dim: #5F626A; --faint: #7C7F87; --placeholder: #9A9CA3;
-    --chip: rgba(20,20,30,0.05); --track: rgba(20,20,30,0.07); --sel: #E8E6E1; --hover-soft: rgba(20,20,30,0.05);
-    --hover-faint: rgba(20,20,30,0.03); --seg-off: rgba(20,20,30,0.12); --toggle-off: rgba(20,20,30,0.18);
-    --grid: rgba(20,20,30,0.06); --axis: rgba(20,20,30,0.12);
-    --accent: oklch(0.68 0.15 45); --accent-hover: oklch(0.63 0.15 45); --on-accent: #1A0F0A; --logo: oklch(0.68 0.14 42);
-    --accent-soft: rgba(217,119,87,0.14); --accent-text: oklch(0.5 0.13 45); --accent-line: rgba(217,119,87,0.55); --link: oklch(0.52 0.14 45);
-    --series-1: oklch(0.66 0.15 45); --series-2: oklch(0.8 0.08 50); --series-other: #D6D4CF; --share-2: oklch(0.76 0.09 48);
-    --ok: oklch(0.64 0.15 150); --ok-text: oklch(0.48 0.13 150); --ok-ring: rgba(40,160,90,0.18);
-    --warn: oklch(0.76 0.15 80); --warn-text: oklch(0.5 0.11 70); --warn-soft: rgba(210,160,40,0.12); --warn-line: rgba(200,150,30,0.35);
-    --bad: oklch(0.6 0.2 25); --bad-text: oklch(0.5 0.18 25); --bad-soft: rgba(220,70,50,0.09); --bad-line: rgba(220,70,50,0.3);
-    --scrim: rgba(30,30,36,0.35); --shadow: 0 30px 80px rgba(0,0,0,0.18);
-    --av-l: 0.92; --av-c: 0.05; --av-fg-l: 0.42;`;
+    --bg: #F2F2F7; --card: #FFFFFF; --card-hover: #FCFCFD; --card-lift: #FFFFFF;
+    --raised: #F0F0F5; --raised-hover: #E3E3E8; --row-hover: #F4F4F8; --toggle-off: #D1D1D6;
+    --line: rgba(0,0,0,0.07); --col-line: rgba(0,0,0,0.14); --dash: rgba(0,0,0,0.2); --dash-2: rgba(0,0,0,0.26);
+    --text: #1C1C1E; --text-strong: #000000; --text-2: #3A3A3C; --muted: #636366; --dim: #8E8E93; --faint: #AEAEB2;
+    --primary: #1C1C1E; --primary-hover: #000000; --on-primary: #FFFFFF; --primary-glow: 0 8px 24px rgba(0,0,0,0.16);
+    --violet: #7B4CF5; --violet-hover: #6A3BE8; --lilac: #6A3BE8; --lilac-hover: #5A2DD6; --on-violet: #FFFFFF;
+    --lime: #B5E61D; --lime-text: #587300; --coral: #F2553F; --coral-text: #C8382A; --coral-soft: rgba(242,85,63,0.1);
+    --amber: #B07D00; --amber-soft: rgba(217,154,0,0.12);
+    --tick-off: #E8E8ED; --tick-dim: #AEAEB2; --seg-off: #E3E3E8; --bar-dark: #DCD2FF;
+    --heat-0: #F3F0FB; --heat-1: #E4DBFF; --heat-2: #BCA6FF; --heat-3: #8D63FF; --heat-4: #6A3BE8;
+    --area: #9CCB00; --line-other: #AEAEB2; --dot-other: #8E8E93; --logo-a: #1C1C1E; --bg-pill: #FFFFFF;
+    --av0: #D6FF4F; --av1: #C9B6FF; --av2: #FFC9A8; --av3: #E5E5EA; --av4: #A8EBD5; --av5: #FFE08F; --av6: #DCD0FF; --av7: #FFB3A6;
+    --scrim: rgba(28,28,30,0.3); --shadow: 0 30px 80px rgba(0,0,0,0.18);`;
 
 // The settings button's gear, as the design draws it (Feather's "settings").
 const GEAR_PATH = 'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z';
+
+// A stroked line icon, the design's 24-unit grid. `inner` is the shapes.
+/** @param {string} inner @param {number} [size] @param {string} [attrs] */
+function icon(inner, size = 18, attrs = '') {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"${attrs}>${inner}</svg>`;
+}
+
+const ICONS = {
+  reload: icon('<path d="M21 12a9 9 0 1 1-3-6.7L21 8"></path><path d="M21 3v5h-5"></path>', 16, ' id="reloadIcon" stroke-width="1.8"'),
+  dark: icon('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>', 16, ' class="i-dark" stroke-width="1.8"'),
+  light: icon('<circle cx="12" cy="12" r="4"></circle><path d="M12 2.5v2M12 19.5v2M4.6 4.6l1.4 1.4M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4L6 18M18 6l1.4-1.4"></path>', 16, ' class="i-light" stroke-width="1.8"'),
+  system: icon('<circle cx="12" cy="12" r="9"></circle><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"></path>', 16, ' class="i-system" stroke-width="1.8"'),
+  usage: icon('<circle cx="12" cy="12" r="9.5"></circle><path d="M7 14l3-3 2.5 2.5L17 9"></path>'),
+  time: icon('<circle cx="12" cy="12" r="9.5"></circle><path d="M12 7v5l3 2"></path>'),
+  status: icon('<circle cx="12" cy="12" r="9.5"></circle><path d="M12 8v4M12 15.5v.5"></path>'),
+  routing: icon('<circle cx="6" cy="6" r="2.5"></circle><circle cx="18" cy="18" r="2.5"></circle><path d="M8.5 6H14a4 4 0 0 1 0 8H10a4 4 0 0 0 0 8"></path>'),
+  clients: icon('<circle cx="12" cy="12" r="9.5"></circle><path d="M8 10l2-2 2 2M10 8v8M16 14l-2 2-2-2M14 16V8"></path>'),
+  table: icon('<rect x="3.5" y="4.5" width="17" height="15" rx="3"></rect><path d="M3.5 10h17M9.5 10v9.5"></path>'),
+};
+
+// The overview's three column slots. They are markup rather than built per
+// poll, so a new window or measure moves the columns (their width and height
+// transition) instead of replacing them.
+const GROUP_SLOTS = [0, 1, 2].map(i => `
+          <div class="grp" id="grp${i}" style="display:none">
+            <div class="grp-val" id="grp${i}Val"></div>
+            <div class="grp-foot">
+              <div class="grp-lbl"><b id="grp${i}Pct"></b><span id="grp${i}Name"></span></div>
+              <div class="grp-bars" id="grp${i}Bars" aria-hidden="true"></div>
+            </div>
+          </div>`).join('');
 
 const PAGE = `<!doctype html>
 <html lang="en">
@@ -905,8 +1070,8 @@ const PAGE = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TeamClaude</title>
 <style>
-  @font-face { font-family: 'Geist'; src: url(data:font/woff2;base64,${GEIST_WOFF2}) format('woff2'); font-weight: 100 900; font-style: normal; font-display: swap; }
-  @font-face { font-family: 'Geist Mono'; src: url(data:font/woff2;base64,${GEIST_MONO_WOFF2}) format('woff2'); font-weight: 100 900; font-style: normal; font-display: swap; }
+  @font-face { font-family: 'DM Sans'; src: url(data:font/woff2;base64,${DM_SANS_WOFF2}) format('woff2'); font-weight: 400 600; font-style: normal; font-display: swap; }
+  @font-face { font-family: 'DM Mono'; src: url(data:font/woff2;base64,${DM_MONO_WOFF2}) format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
   :root {${DARK_TOKENS}
   }
   @media (prefers-color-scheme: light) {
@@ -916,252 +1081,345 @@ const PAGE = `<!doctype html>
   :root[data-theme="light"] {${LIGHT_TOKENS}
   }
   * { box-sizing: border-box; margin: 0; }
-  html { background: var(--bg); }
-  body { min-height: 100vh; background: radial-gradient(1200px 500px at 50% -200px, var(--glow), transparent 70%), var(--bg); color: var(--text); font: 14px/1.5 'Geist', ui-sans-serif, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
-  .mono, td.num, .chart-total, .ticks, .acct-foot, .meter-top .mv, .share .val, .rt-to, .rt-fam span, .stepper .val, #key { font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
-  a { color: var(--link); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  button { font: inherit; }
-  input::placeholder { color: var(--placeholder); }
-  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 40px 28px 56px; }
-  #app { display: flex; flex-direction: column; gap: 28px; }
+  html { background: var(--bg); scroll-behavior: smooth; }
+  body { min-height: 100vh; background: var(--bg); color: var(--text); font: 14px/1.5 'DM Sans', ui-sans-serif, system-ui, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; }
+  .mono, #key, .code-row input { font-family: 'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace; }
+  a { color: var(--lilac); text-decoration: none; }
+  a:hover { color: var(--lilac-hover); }
+  button { font: inherit; color: inherit; }
+  input::placeholder { color: var(--faint); }
+  :focus-visible { outline: 2px solid var(--violet); outline-offset: 2px; }
+  @keyframes tcFade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes tcPop { from { opacity: 0; transform: translateY(12px) scale(.97); } to { opacity: 1; transform: none; } }
+  @keyframes tcUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+  @keyframes tcGrow { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 28px 28px 56px; }
+  #app { display: flex; flex-direction: column; gap: 36px; }
+  #overview, #accountsSec, #routesWrap, #clientsWrap { scroll-margin-top: 20px; }
+  /* The entrance plays once, on the first status: the poll rebuilds the cards
+     every few seconds, and an animation keyed to the element would replay. */
+  .intro .rise { animation: tcUp .6s cubic-bezier(.2,.8,.2,1) both; }
+  .intro .grp-bars i { animation: tcGrow .7s cubic-bezier(.2,.8,.2,1) both; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; display: inline-block; background: var(--dim); }
+  .dot.lime { background: var(--lime); } .dot.violet { background: var(--violet); } .dot.lilac { background: var(--lilac); }
+  .dot.coral { background: var(--coral); } .dot.amber { background: var(--amber); } .dot.gray { background: var(--faint); }
+
+  /* Buttons */
+  .pill-btn { height: 42px; padding: 0 18px; border-radius: 999px; border: none; background: var(--primary); color: var(--on-primary); font-size: 13px; font-weight: 500; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; flex: none; transition: background .2s ease, color .2s ease, transform .15s ease, box-shadow .2s ease, opacity .2s ease; }
+  .pill-btn:hover { background: var(--primary-hover); color: var(--on-primary); transform: translateY(-1px); box-shadow: var(--primary-glow); }
+  .pill-btn:active { transform: scale(.95); }
+  .pill-btn:disabled { opacity: .5; cursor: default; transform: none; box-shadow: none; }
+  .pill-btn .glyph { font-size: 15px; line-height: 1; }
+  .pill-btn.md { height: 38px; padding: 0 16px; }
+  .pill-btn.sm { height: 34px; padding: 0 16px; }
+  .pill-btn.xs { height: 32px; padding: 0 14px; font-size: 12px; }
+  .pill-btn.quiet { background: var(--raised); color: var(--text); font-weight: 400; }
+  .pill-btn.quiet:hover { background: var(--raised-hover); color: var(--text); transform: none; box-shadow: none; }
+  .pill-btn.violet { background: var(--violet); color: var(--on-violet); }
+  .pill-btn.violet:hover { background: var(--violet-hover); color: var(--on-violet); transform: none; box-shadow: none; }
+  .pill-btn.xs:hover, .pill-btn.sm:hover { transform: none; box-shadow: none; }
+  .icon-btn { width: 40px; height: 40px; flex: none; border-radius: 50%; border: none; background: var(--card); color: var(--text); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; padding: 0; font-size: 16px; line-height: 1; transition: background .2s ease, color .2s ease, transform .15s ease, opacity .2s ease; }
+  .icon-btn:hover { background: var(--raised); }
+  .icon-btn:active { transform: scale(.95); }
+  .icon-btn:disabled { opacity: .5; cursor: default; }
+  .icon-btn.sm { width: 36px; height: 36px; background: var(--raised); color: var(--text-2); }
+  .icon-btn.sm:hover { background: var(--raised-hover); color: var(--text-strong); }
+  .icon-btn.gear:hover { transform: rotate(60deg); }
+  #reloadIcon { transition: transform .7s cubic-bezier(.3,1.3,.5,1); }
+  #theme svg { display: none; }
+  #theme[data-mode="system"] .i-system, #theme[data-mode="light"] .i-light, #theme[data-mode="dark"] .i-dark { display: block; }
 
   /* Header */
-  .top { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 20px; }
-  .brand { display: flex; align-items: center; gap: 14px; }
-  .logo { width: 40px; height: 40px; flex: none; border-radius: 11px; background: var(--logo); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 17px; color: var(--on-accent); letter-spacing: -0.02em; }
-  .brand-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-  .title { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.2; }
-  .who { font-size: 13px; color: var(--dim); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-  .who b { color: var(--text); font-weight: 500; }
-  .pill { font-size: 11px; padding: 2px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); }
-  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  .btn { height: 34px; padding: 0 14px; border-radius: 9px; border: 1px solid var(--line-btn); background: var(--raised); color: var(--text-2); font-size: 13px; cursor: pointer; white-space: nowrap; }
-  .btn:hover { background: var(--raised-hover); color: var(--text-strong); }
-  .btn:disabled { opacity: .5; cursor: default; }
-  .btn.primary { border: none; background: var(--accent); color: var(--on-accent); font-weight: 600; padding: 0 15px; }
-  .btn.primary:hover { background: var(--accent-hover); color: var(--on-accent); }
-  .btn.sm { height: 30px; padding: 0 12px; border-radius: 8px; font-size: 12px; background: var(--raised-2); color: var(--text); }
-  .btn.ghost { height: 28px; padding: 0 11px; border-radius: 7px; background: transparent; color: var(--muted); font-size: 12px; }
-  .btn.ghost:hover { background: var(--hover-soft); color: var(--text-strong); }
-  .btn.outline { height: 32px; padding: 0 13px; border-radius: 8px; border-color: var(--line-strong); background: transparent; }
-  .btn.outline:hover { background: var(--hover-soft); }
-  .btn.go { height: 32px; padding: 0 14px; border-radius: 8px; border: none; background: var(--accent); color: var(--on-accent); font-weight: 600; flex: none; }
-  .btn.go:hover { background: var(--accent-hover); color: var(--on-accent); }
-
-  /* Summary strip */
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
-  .stat { background: var(--panel); padding: 18px 20px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-  .stat.thr { padding: 14px 20px; }
-  .stat .k { font-size: 12px; color: var(--dim); }
-  .stat .v { font-size: 16px; font-weight: 500; display: flex; align-items: center; gap: 8px; min-width: 0; }
-  .stat .v.stack { flex-direction: column; align-items: flex-start; gap: 4px; font-size: 14px; }
-  .stat .v .line { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; }
-  .stat .v .sub { color: var(--dim); font-weight: 400; }
-  #statConv { gap: 5px; }
-  .live { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--ok-ring); flex: none; }
-  .live.none { background: var(--faint); box-shadow: none; }
-  .ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-  .thr-row { display: flex; align-items: center; gap: 8px; }
-  .field { display: flex; align-items: center; height: 30px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--field); padding: 0 10px; gap: 4px; }
-  .field input { width: 44px; background: transparent; border: none; outline: none; color: var(--text); font: 14px 'Geist Mono', ui-monospace, monospace; text-align: right; -moz-appearance: textfield; appearance: textfield; }
-  .field input::-webkit-inner-spin-button, .field input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
-  .field span { color: var(--dim); font-size: 13px; }
+  .top { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 16px; }
+  .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .logo { width: 38px; height: 38px; flex: none; border-radius: 50%; background: conic-gradient(from 200deg, var(--logo-a) 0 25%, #A98BFF 25% 60%, #7B4CF5 60%); }
+  .title { font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
+  .nav { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+  .nav a { height: 38px; padding: 0 18px; border-radius: 999px; background: var(--card); color: var(--muted); font-size: 13px; display: flex; align-items: center; transition: background .2s ease, color .2s ease, transform .15s ease; }
+  .nav a:hover { color: var(--text-strong); background: var(--raised); }
+  .nav a:active { transform: scale(.96); }
+  .nav a.sel { background: var(--primary); color: var(--on-primary); font-weight: 500; }
+  .actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+  .me { width: 40px; height: 40px; flex: none; border-radius: 50%; background: var(--lime); color: #000000; font-weight: 600; font-size: 15px; display: flex; align-items: center; justify-content: center; }
 
   /* Messages */
-  #problems { display: none; }
-  .alert { border-radius: 10px; padding: 10px 14px; font-size: 13px; display: flex; gap: 10px; align-items: flex-start; border: 1px solid transparent; }
-  .alert + .alert { margin-top: 8px; }
+  #msgs { display: none; flex-direction: column; gap: 8px; }
+  #problems { display: none; flex-direction: column; gap: 8px; }
+  .alert { border-radius: 16px; padding: 12px 16px; font-size: 13px; display: flex; gap: 10px; align-items: flex-start; }
   .alert::before { content: ''; width: 6px; height: 6px; border-radius: 50%; margin-top: 7px; flex: none; background: currentColor; }
-  .alert.bad { background: var(--bad-soft); color: var(--bad-text); border-color: var(--bad-line); }
-  .alert.warn { background: var(--warn-soft); color: var(--warn-text); border-color: var(--warn-line); }
+  .alert.bad { background: var(--coral-soft); color: var(--coral-text); }
+  .alert.warn { background: var(--amber-soft); color: var(--amber); }
   #err { display: none; }
-  #note { display: none; font-size: 12px; padding: 8px 12px; border-radius: 9px; background: var(--panel); border: 1px solid var(--line); color: var(--dim); }
-  #note.ok, .set-note.ok { color: var(--ok-text); }
-  #note.warn, .set-note.warn { color: var(--warn-text); }
-  #note.error, .set-note.error { color: var(--bad-text); }
+  #note { display: none; align-self: flex-start; align-items: center; gap: 8px; font-size: 12px; padding: 8px 14px; border-radius: 999px; background: var(--card); color: var(--muted); }
+  #note::before { content: ''; width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--dim); }
+  #note.ok::before { background: var(--lime); } #note.warn::before { background: var(--amber); } #note.error::before { background: var(--coral); }
+  #note.error { color: var(--coral-text); }
 
-  /* Sections */
-  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 20px; align-items: start; }
-  .sec { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-  .sec-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; min-height: 30px; }
-  .sec-title-row { display: flex; align-items: baseline; gap: 10px; }
-  .sec-title { font-size: 13px; font-weight: 500; color: var(--dim); letter-spacing: 0.01em; }
-  .sec-count { font-size: 12px; color: var(--faint); }
-  .panel { border-radius: 14px; border: 1px solid var(--line); background: var(--panel); min-width: 0; }
-  .panel.pad { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
-  .tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  .seg { display: flex; padding: 3px; border-radius: 9px; background: var(--raised); border: 1px solid var(--line); gap: 2px; }
-  .seg button { height: 24px; padding: 0 10px; border-radius: 6px; border: none; background: transparent; color: var(--dim); font-size: 12px; cursor: pointer; white-space: nowrap; }
+  /* Overview */
+  .overview { display: flex; flex-direction: column; gap: 28px; }
+  .ov-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .welcome { font-size: 40px; font-weight: 500; letter-spacing: -0.025em; line-height: 1.15; min-width: 0; overflow-wrap: anywhere; }
+  .welcome .who { color: var(--dim); }
+  .welcome .role { display: inline-flex; vertical-align: middle; align-items: center; height: 26px; padding: 0 11px; margin-left: 14px; border-radius: 999px; background: var(--card); color: var(--muted); font-size: 12px; font-weight: 500; letter-spacing: 0; position: relative; top: -3px; }
+  .seg { display: inline-flex; padding: 3px; border-radius: 999px; background: var(--card); gap: 2px; position: relative; flex: none; }
+  .seg button { height: 26px; padding: 0 12px; border-radius: 999px; border: none; background: transparent; color: var(--dim); font-size: 12px; cursor: pointer; position: relative; white-space: nowrap; transition: background .2s ease, color .2s ease, transform .15s ease; }
   .seg button:hover { color: var(--text); }
-  .seg button.sel { background: var(--sel); color: var(--text); }
-  #dimViewSlot { display: none; justify-content: flex-end; }
-  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--dim); align-items: center; flex-wrap: wrap; }
-  .legend span { display: flex; align-items: center; gap: 6px; }
-  .sw { width: 8px; height: 8px; border-radius: 2px; flex: none; display: inline-block; }
-  .sw.s0 { background: var(--series-1); } .sw.s1 { background: var(--series-2); } .sw.so { background: var(--series-other); }
-  .sw.ok { background: var(--ok); } .sw.warn { background: var(--warn); } .sw.bad { background: var(--bad); }
+  .seg button:active { transform: scale(.95); }
+  .seg button.sel { background: var(--raised-hover); color: var(--text); }
+  .seg.lg { padding: 4px; }
+  .seg.lg button { height: 34px; padding: 0 18px; font-size: 13px; font-weight: 500; }
+  .seg-pill { position: absolute; top: 4px; bottom: 4px; left: 4px; width: 0; border-radius: 999px; background: var(--raised-hover); transition: left .35s cubic-bezier(.2,.8,.2,1), width .35s cubic-bezier(.2,.8,.2,1); }
+  .seg.measured button.sel { background: transparent; }
+  .hero { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 32px; align-items: end; }
+  .hero-main { display: flex; flex-direction: column; gap: 18px; max-width: 380px; min-width: 0; }
+  .hero-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .hero-label { font-size: 15px; color: var(--muted); }
+  .hero-num { display: flex; align-items: flex-end; gap: 10px; min-width: 0; }
+  .big { font-size: 64px; font-weight: 600; letter-spacing: -0.04em; line-height: .9; white-space: nowrap; }
+  .big .frac { color: var(--faint); }
+  .delta { font-size: 12px; color: var(--lime-text); padding-bottom: 4px; white-space: nowrap; }
+  .routing-to { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+  .routing-to b { color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 100%; }
+  .routing-to .prov { color: var(--dim); }
+  .hero-btns { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .groups-wrap { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .groups { position: relative; display: flex; height: 190px; }
+  .avg-line { position: absolute; left: 0; right: 0; top: 72px; border-top: 1px dashed var(--dash); pointer-events: none; transition: top .6s cubic-bezier(.2,.8,.2,1); }
+  .avg-pill { position: absolute; right: 18%; top: 72px; height: 22px; padding: 0 10px; border-radius: 999px; background: var(--bg-pill); color: var(--text); font-size: 11px; display: flex; align-items: center; transform: translateY(-50%); transition: top .6s cubic-bezier(.2,.8,.2,1); }
+  .grp { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; justify-content: space-between; border-left: 1px solid var(--col-line); padding: 6px 16px 0 14px; transition: flex-grow .6s cubic-bezier(.2,.8,.2,1), padding-top .6s cubic-bezier(.2,.8,.2,1); }
+  .grp-val { font-size: 16px; font-weight: 500; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .grp-foot { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .grp-lbl { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .grp-lbl b { color: var(--text); font-weight: 500; margin-right: 7px; }
+  .grp-bars { height: 44px; display: flex; gap: 6px; overflow: hidden; }
+  .grp-bars i { display: block; height: 100%; border-radius: 4px; transform-origin: bottom; transition: filter .2s ease; }
+  .grp-bars i:hover { filter: brightness(1.35); }
+  .grp-bars i.solid { flex: 1; min-width: 40px; background: var(--violet); }
+  .grp-bars i.thin { flex: none; width: 7px; }
+  .grp-bars i.dark { background: var(--bar-dark); }
+  .groups-empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; font-size: 13px; color: var(--dim); border-left: 1px solid var(--col-line); }
+  .range { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+
+  /* Cards */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 14px; }
+  .card { border-radius: 22px; background: var(--card); padding: 20px; display: flex; flex-direction: column; gap: 16px; min-width: 0; transition: background .25s ease; }
+  .card:hover { background: var(--card-hover); }
+  .card.flush { padding: 20px 0 6px; gap: 12px; }
+  .card.flush > .card-head { padding: 0 20px; }
+  .card-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .card-title { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 500; }
+  .card-title svg { flex: none; }
+  .card-cap { font-size: 12px; color: var(--dim); white-space: nowrap; }
+  .card-foot { font-size: 11px; color: var(--dim); margin-top: auto; }
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); flex-wrap: wrap; align-items: center; min-height: 18px; }
+  .legend span { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .sw { width: 11px; height: 11px; border-radius: 3px; flex: none; display: inline-block; }
+  .sw.main { background: var(--area); } .sw.other { background: var(--line-other); }
+  .sw.ok { background: var(--violet); } .sw.warn { background: var(--lime); } .sw.bad { background: var(--coral); }
+  .legend.sm { gap: 14px; }
+  .legend.sm .sw { width: 10px; height: 10px; }
 
   /* Usage over time */
-  .chart-top { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
-  .chart-id { display: flex; flex-direction: column; gap: 4px; }
-  .chart-cap { font-size: 12px; color: var(--faint); }
-  .chart-total { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.2; }
-  .bars { position: relative; height: 150px; display: flex; align-items: flex-end; gap: 4px; border-bottom: 1px solid var(--axis); background: repeating-linear-gradient(to top, transparent 0, transparent 49px, var(--grid) 49px, var(--grid) 50px); }
-  .col { flex: 1; height: 100%; min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; gap: 1px; border-radius: 3px 3px 0 0; overflow: hidden; opacity: .92; cursor: default; }
-  .col:hover { opacity: 1; background: var(--hover-faint); }
-  .col i { display: block; flex: none; }
-  .col i.s0 { background: var(--series-1); } .col i.s1 { background: var(--series-2); } .col i.so { background: var(--series-other); }
-  .bars-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--faint); text-align: center; padding: 0 12px; }
-  .ticks { display: flex; justify-content: space-between; font-size: 11px; color: var(--faint); }
+  .plot { position: relative; height: 170px; }
+  .plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+  .plot path { transition: d .6s cubic-bezier(.2,.8,.2,1); }
+  .ga { stop-color: var(--area); stop-opacity: .22; } .gb { stop-color: var(--area); stop-opacity: 0; }
+  #seriesOther { fill: none; stroke: var(--line-other); stroke-width: 1.6; stroke-dasharray: 5 5; }
+  #seriesMain { fill: none; stroke: var(--area); stroke-width: 2; }
+  .hover-cols { position: absolute; inset: 0; display: flex; }
+  .hover-cols div { flex: 1; border-radius: 6px; }
+  .hover-cols div:hover { background: var(--line); }
+  .peak { position: absolute; top: 0; bottom: 0; left: 0; border-left: 1px dashed var(--dash-2); pointer-events: none; transition: left .6s cubic-bezier(.2,.8,.2,1); }
+  .peak-tags { position: absolute; top: 4px; left: 0; display: flex; flex-direction: column; gap: 6px; transform: translateX(8px); pointer-events: none; transition: left .6s cubic-bezier(.2,.8,.2,1); }
+  .peak-tags.flip { transform: translateX(calc(-100% - 8px)); align-items: flex-end; }
+  .tag { height: 24px; padding: 0 9px; border-radius: 999px; background: var(--raised); color: var(--text); font-size: 11px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .tag i { width: 3px; height: 12px; border-radius: 2px; background: var(--area); flex: none; }
+  .tag i.o { background: var(--dot-other); }
+  .plot-empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; font-size: 12px; color: var(--dim); text-align: center; padding: 0 12px; }
+  .ticks { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
 
-  /* Most used */
-  .share-lead { font-size: 12px; color: var(--faint); }
-  .shares { display: flex; flex-direction: column; gap: 14px; }
-  .share { display: grid; grid-template-columns: 84px 1fr auto; gap: 14px; align-items: center; font-size: 13px; }
-  .share .n { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .track { height: 8px; border-radius: 4px; background: var(--track); overflow: hidden; }
-  .track i { display: block; height: 100%; border-radius: 4px; background: var(--share-2); transition: width .4s ease; }
-  .track i.top { background: var(--accent); }
-  .share .val { font-size: 12px; color: var(--dim); min-width: 112px; text-align: right; white-space: nowrap; }
-  .share .val b { color: var(--text); font-weight: 400; }
-  .foot-note { font-size: 12px; color: var(--faint); line-height: 1.55; border-top: 1px solid var(--line-soft); padding-top: 14px; }
+  /* By time */
+  .heat { display: grid; gap: 5px; align-items: center; }
+  .heat .hd { font-size: 11px; color: var(--muted); text-align: center; padding-bottom: 4px; white-space: nowrap; overflow: hidden; }
+  .heat .rl { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 4px; }
+  .heat .cell { height: 28px; border-radius: 7px; background: var(--heat-0); transition: background .45s ease, transform .2s cubic-bezier(.3,1.5,.5,1), box-shadow .2s ease; }
+  .heat .cell:hover { transform: scale(1.12); box-shadow: 0 0 0 2px var(--heat-4); }
+  .heat .l1 { background: var(--heat-1); } .heat .l2 { background: var(--heat-2); } .heat .l3 { background: var(--heat-3); } .heat .l4 { background: var(--heat-4); }
+  .heat-empty { display: none; align-items: center; justify-content: center; min-height: 150px; font-size: 12px; color: var(--dim); text-align: center; }
+  .heat-legend { display: flex; justify-content: flex-end; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); margin-top: auto; }
+  .heat-legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .heat-legend .l1 { background: var(--heat-1); } .heat-legend .l2 { background: var(--heat-2); } .heat-legend .l3 { background: var(--heat-3); } .heat-legend .l4 { background: var(--heat-4); }
+
+  /* Proxy status */
+  #statusCard { gap: 6px; }
+  #statusCard .card-head { padding-bottom: 8px; }
+  .live { height: 26px; padding: 0 10px; border-radius: 999px; background: var(--raised); font-size: 11px; display: flex; align-items: center; gap: 6px; }
+  .kv { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--line); font-size: 13px; gap: 12px; min-width: 0; }
+  .kv.tail { border-bottom: none; padding: 10px 0; }
+  .kv .k { color: var(--muted); flex: none; }
+  .kv .v { font-weight: 500; text-align: right; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .thr-row { display: flex; gap: 6px; align-items: center; }
+  .field { display: flex; align-items: center; height: 32px; border-radius: 999px; background: var(--raised); padding: 0 12px; gap: 2px; }
+  .field input { width: 38px; background: transparent; border: none; outline: none; color: var(--text); font: inherit; font-size: 13px; text-align: right; -moz-appearance: textfield; appearance: textfield; }
+  .field input::-webkit-inner-spin-button, .field input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  .field span { color: var(--muted); }
 
   /* Accounts */
+  .sec { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .sec-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .sec-title-row { display: flex; align-items: baseline; gap: 12px; }
+  .sec-title { font-size: 24px; font-weight: 500; letter-spacing: -0.02em; }
+  .sec-count { font-size: 13px; color: var(--dim); }
   .acct-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr)); gap: 14px; }
-  .acct { border-radius: 14px; border: 1px solid var(--line); background: var(--panel); padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; transition: opacity .2s; min-width: 0; }
-  .acct.current { border-color: var(--accent-line); }
-  .acct.off { opacity: .5; }
+  .acct { border-radius: 22px; background: var(--card); padding: 20px; display: flex; flex-direction: column; gap: 16px; min-width: 0; transition: opacity .3s ease, transform .3s cubic-bezier(.2,.8,.2,1), background .25s ease, box-shadow .3s ease; }
+  .acct:hover { transform: translateY(-3px); background: var(--card-lift); }
+  .acct.current { box-shadow: inset 0 0 0 1.5px var(--violet); }
+  .acct.off { opacity: .45; }
   .acct-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-  .acct-id { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-  .acct-name-row { display: flex; align-items: center; gap: 9px; min-width: 0; }
-  .avatar { width: 28px; height: 28px; flex: none; border-radius: 8px; background: oklch(var(--av-l) var(--av-c) var(--h, 45)); color: oklch(var(--av-fg-l) 0.06 var(--h, 45)); font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: center; }
-  .avatar.lg { width: 34px; height: 34px; border-radius: 9px; font-size: 14px; }
-  .acct-name { font-size: 14.5px; font-weight: 600; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .acct-id { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .avatar { width: 40px; height: 40px; flex: none; border-radius: 50%; background: var(--av0); color: #000000; font-size: 15px; font-weight: 600; display: flex; align-items: center; justify-content: center; }
+  .avatar.av1 { background: var(--av1); } .avatar.av2 { background: var(--av2); } .avatar.av3 { background: var(--av3); } .avatar.av4 { background: var(--av4); }
+  .avatar.av5 { background: var(--av5); } .avatar.av6 { background: var(--av6); } .avatar.av7 { background: var(--av7); }
+  .avatar.lg { width: 44px; height: 44px; font-size: 16px; }
+  .acct-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .acct-name { font-size: 15px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chips { display: flex; flex-wrap: wrap; gap: 5px; }
-  .chip { font-size: 11px; line-height: 1; padding: 4px 7px; border-radius: 5px; background: var(--chip); color: var(--muted); white-space: nowrap; }
-  .chip.current, .chip.provider { background: var(--accent-soft); color: var(--accent-text); }
-  .chip.disabled, .chip.error, .chip.exhausted, .chip.extra-usage.billing { background: var(--bad-soft); color: var(--bad-text); }
-  .chip.throttled, .chip.extra-usage { background: var(--warn-soft); color: var(--warn-text); }
-  .gear { width: 30px; height: 30px; flex: none; border-radius: 8px; border: 1px solid var(--line-strong); background: transparent; color: var(--muted); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; }
-  .gear:hover { background: var(--hover-soft); color: var(--text-strong); }
-  .blocked { font-size: 12px; color: var(--warn-text); background: var(--warn-soft); border-radius: 8px; padding: 8px 10px; display: flex; align-items: center; gap: 8px; }
-  .blocked::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); flex: none; }
-  .blocked.bad { color: var(--bad-text); background: var(--bad-soft); }
-  .blocked.bad::before { background: var(--bad); }
-  .meters { display: flex; flex-direction: column; gap: 11px; }
-  .meter { display: flex; flex-direction: column; gap: 6px; }
+  .chip { height: 22px; padding: 0 9px; border-radius: 999px; background: var(--raised); color: var(--text-2); font-size: 11px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .blocked { font-size: 12px; color: var(--coral-text); background: var(--coral-soft); border-radius: 999px; padding: 7px 12px; display: flex; align-items: center; gap: 8px; align-self: flex-start; }
+  .blocked::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--coral); flex: none; }
+  .meters { display: flex; flex-direction: column; gap: 14px; }
+  .meter { display: flex; flex-direction: column; gap: 8px; }
   .meter-top { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }
-  .meter-top .lbl { color: var(--dim); }
-  .meter-top .mv { color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .meter-top .mv b { color: var(--text); font-weight: 400; }
-  .mbar { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
-  .mbar i { display: block; height: 100%; border-radius: 3px; background: var(--ok); }
-  .mbar i.warn { background: var(--warn); } .mbar i.bad { background: var(--bad); } .mbar i.off { background: var(--faint); }
-  .acct-note { font-size: 12px; color: var(--faint); }
-  .acct-foot { font-size: 12px; color: var(--faint); border-top: 1px solid var(--line-soft); padding-top: 11px; }
+  .meter-top .ml { color: var(--muted); white-space: nowrap; }
+  .meter-top .ml b { color: var(--text); font-weight: 500; margin-right: 7px; }
+  .meter-top .mv { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ticks-bar { display: flex; gap: 3px; height: 22px; }
+  .ticks-bar i { flex: 1; border-radius: 3px; background: var(--tick-off); }
+  .ticks-bar i.ok { background: var(--violet); } .ticks-bar i.warn { background: var(--lime); } .ticks-bar i.bad { background: var(--coral); } .ticks-bar i.off { background: var(--tick-dim); }
+  .acct-note { font-size: 12px; color: var(--dim); }
+  .acct-foot { font-size: 12px; color: var(--dim); border-top: 1px solid var(--line); padding-top: 12px; }
 
-  /* Routing */
-  .rt-row { display: grid; grid-template-columns: 1.1fr 1fr 1.2fr; gap: 12px; padding: 16px 20px; font-size: 13px; align-items: start; border-bottom: 1px solid var(--line-soft); }
+  /* Routing and clients */
+  .duo { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 14px; align-items: start; }
+  #routesWrap { gap: 10px; }
+  #routesWrap .card-head { padding-bottom: 6px; }
+  .rt-row { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1.2fr) minmax(0,1fr); gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--line); align-items: center; }
   .rt-row:last-child { border-bottom: none; }
-  .rt-row.head { padding: 12px 20px; font-size: 12px; color: var(--faint); }
   .rt-fam { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-  .rt-fam b { font-weight: 500; }
-  .rt-fam span { font-size: 12px; color: var(--faint); }
-  .rt-to { font-size: 12.5px; overflow-wrap: anywhere; display: flex; flex-direction: column; gap: 3px; }
-  .rt-to .bad-t { color: var(--bad-text); }
-  .rt-note { font-family: 'Geist', ui-sans-serif, system-ui, sans-serif; font-size: 12px; color: var(--faint); }
-  .rt-note.pin { color: var(--accent-text); }
-  .rt-note.warn { color: var(--warn-text); }
-  .rt-can { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-  .rt-count { display: flex; align-items: center; gap: 8px; }
-  .rt-count b { color: var(--ok-text); font-weight: 500; white-space: nowrap; }
-  .segs { flex: 1; display: flex; gap: 2px; max-width: 96px; }
-  .segs i { flex: 1; height: 5px; border-radius: 2px; background: var(--seg-off); }
-  .segs i.on { background: var(--ok); }
-  .soft { color: var(--dim); }
-  .dimtext { font-size: 12px; color: var(--faint); }
+  .rt-fam b { font-size: 14px; font-weight: 500; }
+  .rt-glob { font-size: 11px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rt-to { display: flex; flex-direction: column; gap: 5px; align-items: flex-start; min-width: 0; }
+  .target { height: 26px; padding: 0 10px; border-radius: 999px; background: var(--raised); font-size: 12px; display: inline-flex; align-items: center; gap: 6px; max-width: 100%; overflow: hidden; white-space: nowrap; }
+  .target .t { overflow: hidden; text-overflow: ellipsis; }
+  .target.bad { color: var(--coral-text); }
+  .rt-note { font-size: 11px; color: var(--dim); line-height: 1.4; }
+  .rt-note.pin { color: var(--lilac); } .rt-note.warn { color: var(--amber); }
+  .rt-can { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; text-align: right; min-width: 0; }
+  .segs { display: flex; gap: 3px; }
+  .segs i { width: 6px; height: 18px; border-radius: 2px; background: var(--seg-off); flex: none; }
+  .segs i.on { background: var(--violet); }
+  .segs.dense { width: 120px; } .segs.dense i { flex: 1; width: auto; min-width: 2px; }
+  .rt-count, .rt-none { font-size: 11px; color: var(--dim); }
+  .rt-none { font-size: 12px; }
+  #routesFoot { display: none; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); }
+  #clientsWrap { gap: 4px; }
+  #clientsWrap .card-head { padding-bottom: 10px; }
+  .cl-row { display: grid; grid-template-columns: minmax(0,1fr) auto minmax(90px,auto); gap: 12px; align-items: center; padding: 10px; margin: 0 -10px; border-radius: 14px; font-size: 13px; transition: background .2s ease, transform .2s ease; }
+  .cl-row:hover { background: var(--row-hover); transform: translateX(3px); }
+  .cl-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .last { height: 26px; padding: 0 10px; border-radius: 999px; background: var(--raised); font-size: 12px; color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .cl-val { text-align: right; white-space: nowrap; }
+  .cl-val b { font-weight: 500; }
+  .cl-val span { color: var(--dim); }
 
   /* Tables */
   .tbl-wrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; min-width: 440px; }
+  table { width: 100%; border-collapse: collapse; min-width: 440px; font-variant-numeric: tabular-nums; }
   table.wide { min-width: 980px; }
-  th, td { text-align: left; padding: 14px 12px; }
-  th { padding-top: 12px; padding-bottom: 12px; font-size: 12px; font-weight: 400; color: var(--faint); border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+  th, td { text-align: left; padding: 12px; }
+  th { font-size: 12px; font-weight: 400; color: var(--dim); border-bottom: 1px solid var(--line); white-space: nowrap; }
   th:first-child, td:first-child { padding-left: 20px; }
   th:last-child, td:last-child { padding-right: 20px; }
-  td { font-size: 13px; border-bottom: 1px solid var(--row-line); white-space: nowrap; }
+  td { font-size: 13px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   tr:last-child td { border-bottom: none; }
-  tr:hover td { background: var(--hover-faint); }
+  tr:hover td { background: var(--row-hover); }
   td.num, th.num { text-align: right; }
   td.dim { color: var(--faint); }
   td.soft { color: var(--dim); }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
-  .ctag { display: inline-flex; align-items: center; gap: 9px; font-weight: 500; }
-  .ini { width: 22px; height: 22px; border-radius: 6px; background: var(--chip); font-size: 11px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); flex: none; }
-  .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line-soft); }
-  .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
-  .filters select { height: 28px; background: var(--field); border: 1px solid var(--line-strong); border-radius: 8px; color: var(--text); font: inherit; font-size: 12px; padding: 0 8px; }
-  .hint { color: var(--faint); font-size: 12px; margin-left: auto; }
+  .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 0 20px 4px; }
+  .filters label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .filters select { height: 30px; background: var(--raised); border: none; border-radius: 999px; color: var(--text); font: inherit; font-size: 12px; padding: 0 12px; }
+  .hint { color: var(--dim); font-size: 12px; margin-left: auto; }
 
   /* Dialogs */
-  .scrim { position: fixed; inset: 0; z-index: 50; background: var(--scrim); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; padding: 24px; }
-  .dialog { width: 100%; max-width: 520px; max-height: calc(100vh - 48px); overflow: auto; border-radius: 16px; border: 1px solid var(--line-btn); background: var(--modal); box-shadow: var(--shadow); padding: 24px; display: flex; flex-direction: column; gap: 20px; }
-  .dialog.flush { max-width: 460px; padding: 0; gap: 0; }
+  .scrim { position: fixed; inset: 0; z-index: 50; background: var(--scrim); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; padding: 24px; animation: tcFade .25s ease both; }
+  .dialog { width: 100%; max-width: 500px; max-height: calc(100vh - 48px); overflow: auto; border-radius: 26px; background: var(--card); box-shadow: var(--shadow); padding: 24px; display: flex; flex-direction: column; gap: 22px; animation: tcPop .35s cubic-bezier(.2,.9,.25,1.1) both; }
+  .dialog.set { max-width: 440px; padding: 22px; gap: 16px; }
   .dlg-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-  .dlg-title { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
-  .steps { display: flex; flex-direction: column; gap: 18px; }
+  .dlg-title { font-size: 20px; font-weight: 500; letter-spacing: -0.02em; }
   .step { display: flex; gap: 14px; align-items: flex-start; }
-  .step-n { width: 24px; height: 24px; flex: none; border-radius: 50%; background: var(--accent-soft); color: var(--accent-text); font-size: 12px; font-weight: 600; display: flex; align-items: center; justify-content: center; font-family: 'Geist Mono', ui-monospace, monospace; }
-  .step-body { display: flex; flex-direction: column; gap: 10px; flex: 1; min-width: 0; }
-  .step-text { font-size: 14px; line-height: 1.5; }
+  .step-n { width: 28px; height: 28px; flex: none; border-radius: 50%; background: var(--violet); color: var(--on-violet); font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center; }
+  .step-body { display: flex; flex-direction: column; gap: 12px; flex: 1; min-width: 0; }
+  .step-text { font-size: 14px; line-height: 1.5; color: var(--text-2); }
   .row-btns { display: flex; gap: 8px; flex-wrap: wrap; }
-  .link-btn { height: 32px; padding: 0 13px; border-radius: 8px; background: var(--text); color: var(--bg); font-size: 13px; font-weight: 500; display: inline-flex; align-items: center; }
-  .link-btn:hover { color: var(--bg); text-decoration: none; opacity: .9; }
   .code-row { display: flex; gap: 8px; }
-  .code-row input { flex: 1; min-width: 0; height: 32px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--field); color: var(--text); padding: 0 12px; font: 13px 'Geist Mono', ui-monospace, monospace; outline: none; }
-  .code-row input:focus { border-color: var(--accent); }
+  .code-row input { flex: 1; min-width: 0; height: 38px; border-radius: 999px; border: 1px solid transparent; background: var(--raised); color: var(--text); padding: 0 16px; font-size: 13px; outline: none; }
+  .code-row input:focus { border-color: var(--violet); }
   #loginNote { font-size: 12px; color: var(--dim); line-height: 1.5; }
-  #loginNote.ok { color: var(--ok-text); } #loginNote.error { color: var(--bad-text); }
-  .set-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 20px 22px; border-bottom: 1px solid var(--line-soft); }
-  .set-id { display: flex; align-items: center; gap: 11px; min-width: 0; }
+  #loginNote.ok { color: var(--lime-text); } #loginNote.error { color: var(--coral-text); }
+  .set-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .set-id { display: flex; align-items: center; gap: 12px; min-width: 0; }
   .set-id-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .set-name { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .set-name { font-size: 16px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .set-sub { font-size: 12px; color: var(--dim); }
-  .set-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 22px; }
-  .set-row + .set-row { border-top: 1px solid var(--line-soft); }
+  .set-rows { border-radius: 18px; background: var(--raised); display: flex; flex-direction: column; }
+  .set-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px 16px; }
+  .set-row + .set-row { border-top: 1px solid var(--line); }
   .set-text { display: flex; flex-direction: column; gap: 3px; }
   .set-text .t { font-size: 14px; font-weight: 500; }
-  .set-text .d { font-size: 12px; color: var(--dim); }
-  .set-note { display: none; padding: 12px 22px; font-size: 12px; color: var(--dim); border-top: 1px solid var(--line-soft); }
-  .inuse { font-size: 12px; padding: 5px 9px; border-radius: 6px; background: var(--accent-soft); color: var(--accent-text); flex: none; }
-  .stepper { display: flex; align-items: center; border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; flex: none; }
-  .stepper button { width: 32px; height: 32px; border: none; background: transparent; color: var(--muted); font-size: 15px; cursor: pointer; }
-  .stepper button:hover { background: var(--hover-soft); color: var(--text-strong); }
+  .set-text .d { font-size: 12px; color: var(--muted); }
+  .set-note { display: none; font-size: 12px; color: var(--dim); padding: 0 4px; }
+  .set-note.ok { color: var(--lime-text); } .set-note.warn { color: var(--amber); } .set-note.error { color: var(--coral-text); }
+  .inuse { height: 26px; padding: 0 10px; border-radius: 999px; background: var(--card); font-size: 12px; display: inline-flex; align-items: center; gap: 6px; flex: none; }
+  .stepper { display: flex; align-items: center; gap: 4px; padding: 3px; border-radius: 999px; background: var(--card); flex: none; }
+  .stepper button { width: 30px; height: 30px; border-radius: 50%; border: none; background: transparent; color: var(--text-2); font-size: 16px; cursor: pointer; transition: background .2s ease, color .2s ease, transform .15s ease; }
+  .stepper button:hover { background: var(--raised-hover); color: var(--text-strong); }
+  .stepper button:active { transform: scale(.95); }
   .stepper button:disabled { opacity: .5; cursor: default; }
-  .stepper .val { min-width: 34px; text-align: center; font-size: 14px; border-left: 1px solid var(--line-mid); border-right: 1px solid var(--line-mid); line-height: 32px; }
-  .toggle { width: 40px; height: 24px; flex: none; border-radius: 999px; border: none; padding: 3px; background: var(--toggle-off); cursor: pointer; display: flex; justify-content: flex-start; transition: background .15s; }
-  .toggle.on { background: var(--accent); justify-content: flex-end; }
+  .stepper .val { min-width: 22px; text-align: center; font-size: 14px; font-weight: 500; }
+  .toggle { width: 44px; height: 26px; flex: none; border-radius: 999px; border: none; padding: 3px; background: var(--toggle-off); cursor: pointer; display: flex; justify-content: flex-start; transition: background .15s ease, transform .15s ease; }
+  .toggle:active { transform: scale(.95); }
+  .toggle.on { background: var(--violet); }
   .toggle:disabled { opacity: .5; cursor: default; }
-  .toggle span { width: 18px; height: 18px; border-radius: 50%; background: #FFFFFF; box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+  .toggle span { width: 20px; height: 20px; border-radius: 50%; background: #FFFFFF; box-shadow: 0 1px 3px rgba(0,0,0,0.4); transition: transform .25s cubic-bezier(.3,1.4,.5,1); }
+  .toggle.on span { transform: translateX(18px); }
 
-  /* Key prompt and footer */
+  /* Key prompt */
   #keybox { display: none; max-width: 400px; margin: 12vh auto 0; }
-  .keycard { border-radius: 16px; border: 1px solid var(--line-btn); background: var(--modal); box-shadow: var(--shadow); padding: 28px; display: flex; flex-direction: column; gap: 16px; }
-  .keycard p { color: var(--dim); font-size: 13px; }
-  #key { width: 100%; height: 38px; border-radius: 9px; border: 1px solid var(--line-strong); background: var(--field); color: var(--text); padding: 0 12px; font-size: 13px; outline: none; }
-  #key:focus { border-color: var(--accent); }
-  footer { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--faint); }
-  footer .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); flex: none; }
+  .keycard { border-radius: 26px; background: var(--card); box-shadow: var(--shadow); padding: 28px; display: flex; flex-direction: column; gap: 16px; animation: tcPop .35s cubic-bezier(.2,.9,.25,1.1) both; }
+  .keycard p { color: var(--muted); font-size: 13px; }
+  #key { width: 100%; height: 42px; border-radius: 999px; border: 1px solid transparent; background: var(--raised); color: var(--text); padding: 0 16px; font-size: 13px; outline: none; }
+  #key:focus { border-color: var(--violet); }
 
+  @media (max-width: 860px) {
+    .top { grid-template-columns: 1fr auto; }
+    .nav { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; }
+  }
   @media (max-width: 560px) {
-    .wrap { padding: 24px 16px 40px; }
-    .rt-row { grid-template-columns: 1fr; gap: 6px; }
-    .rt-row.head { display: none; }
-    .share { grid-template-columns: 72px 1fr auto; gap: 10px; }
-    .share .val { min-width: 0; }
+    .wrap { padding: 20px 16px 40px; }
+    #app { gap: 28px; }
+    .welcome { font-size: 30px; }
+    .big { font-size: 52px; }
+    .nav a { padding: 0 14px; }
+    .rt-row { grid-template-columns: 1fr; gap: 8px; }
+    .rt-can { align-items: flex-start; text-align: left; }
+    .avg-pill { right: 8%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation: none !important; transition: none !important; }
   }
 </style>
 <script>
@@ -1177,81 +1435,121 @@ const PAGE = `<!doctype html>
 <main class="wrap">
   <div id="keybox">
     <div class="keycard">
-      <div class="brand"><div class="logo" aria-hidden="true">TC</div><div class="title">TeamClaude</div></div>
+      <div class="brand"><div class="logo" aria-hidden="true"></div><div class="title">TeamClaude</div></div>
       <p>Enter your proxy key to view status.</p>
       <input id="key" type="password" placeholder="tc-..." autocomplete="off">
-      <button id="go" class="btn primary" type="button">Connect</button>
+      <button id="go" class="pill-btn" type="button">Connect</button>
     </div>
   </div>
   <div id="app" style="display:none">
     <header class="top">
-      <div class="brand">
-        <div class="logo" aria-hidden="true">TC</div>
-        <div class="brand-text">
-          <h1 class="title">TeamClaude</h1>
-          <div class="who" id="summary"></div>
-        </div>
-      </div>
-      <div class="toolbar">
-        <button id="reload" class="btn" type="button">Reload config</button>
-        <button id="probe" class="btn" type="button">Probe quotas</button>
-        <button id="theme" class="btn" type="button" title="Switch between following the system, light and dark"></button>
-        <button id="addAcct" class="btn primary" type="button">+ Add account</button>
+      <div class="brand"><div class="logo" aria-hidden="true"></div><div class="title">TeamClaude</div></div>
+      <nav class="nav" aria-label="Sections">
+        <a id="navOverview" class="sel" href="#overview">Overview</a>
+        <a id="navAccounts" href="#accountsSec">Accounts</a>
+        <a id="navRouting" href="#routesWrap">Routing</a>
+        <a id="navClients" href="#clientsWrap">Clients</a>
+      </nav>
+      <div class="actions">
+        <button id="reload" class="icon-btn" type="button" title="Reload config" aria-label="Reload config">${ICONS.reload}</button>
+        <button id="theme" class="icon-btn" type="button">${ICONS.system}${ICONS.light}${ICONS.dark}</button>
+        <div id="me" class="me" style="display:none"></div>
       </div>
     </header>
 
-    <section class="stats" aria-label="Summary">
-      <div class="stat"><div class="k" id="statActiveLabel">Active account</div><div class="v" id="statActive"></div></div>
-      <div class="stat"><div class="k">Conversations</div><div class="v" id="statConv"></div></div>
-      <div class="stat"><div class="k">Uptime</div><div class="v mono" id="statUp"></div></div>
-      <div class="stat thr" id="thrWrap">
-        <label class="k" for="thrVal">Auto-switch threshold</label>
-        <div class="thr-row">
-          <span class="field"><input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal"><span>%</span></span>
-          <button id="thrSet" class="btn sm" type="button">Set</button>
+    <div id="msgs">
+      <div id="problems"></div>
+      <div id="err" class="alert bad"></div>
+      <div id="note"></div>
+    </div>
+
+    <section id="overview" class="overview rise">
+      <div class="ov-head">
+        <h1 class="welcome" id="welcome">Welcome back</h1>
+        <div class="seg lg" id="usageViewWrap" role="group" aria-label="Usage window"><span class="seg-pill" id="viewPill" aria-hidden="true"></span></div>
+      </div>
+      <div class="hero">
+        <div class="hero-main">
+          <div class="hero-top">
+            <div class="hero-label" id="heroLabel">Tokens used</div>
+            <span class="seg" id="clientChartMetric" role="group" aria-label="Measure"></span>
+          </div>
+          <div class="hero-num">
+            <div class="big" id="heroNum"><span id="heroMain">0</span><span class="frac" id="heroFrac"></span></div>
+            <div class="delta" id="heroDelta" style="display:none"></div>
+          </div>
+          <div class="routing-to" id="statActive"></div>
+          <div class="hero-btns">
+            <button id="addAcct" class="pill-btn" type="button">Add account <span class="glyph" aria-hidden="true">+</span></button>
+            <button id="probe" class="pill-btn" type="button"><span id="probeText">Probe quotas</span> <span class="glyph" aria-hidden="true">↻</span></button>
+          </div>
+        </div>
+        <div class="groups-wrap" id="clientChartWrap" style="display:none">
+          <div class="groups" id="clientChart">
+            <div class="avg-line" id="avgLine" style="display:none"></div>
+            <div class="avg-pill" id="avgPill" style="display:none">Average</div>
+            <div class="groups-empty" id="groupsEmpty"></div>${GROUP_SLOTS}
+          </div>
+          <div class="range"><span id="rangeStart">All time</span><span>now</span></div>
         </div>
       </div>
     </section>
 
-    <div id="problems"></div>
-    <div id="err" class="alert bad"></div>
-    <div id="note"></div>
-
-    <div class="cols" id="usageRow" style="display:none">
-      <section class="sec" id="seriesWrap" style="display:none">
-        <div class="sec-head"><h2 class="sec-title">Usage over time</h2></div>
-        <div class="panel pad">
-          <div class="chart-top">
-            <div class="chart-id">
-              <div class="chart-cap" id="seriesCaption"></div>
-              <div class="chart-total" id="seriesTotal"></div>
-            </div>
-            <div class="legend" id="seriesLegend"></div>
-          </div>
-          <div class="bars" id="seriesBars"></div>
-          <div class="ticks" id="seriesTicks"></div>
+    <div class="cards" id="cardsRow">
+      <section class="card rise" id="seriesWrap" style="display:none;animation-delay:.1s">
+        <div class="card-head">
+          <h2 class="card-title">${ICONS.usage}Usage over time</h2>
+          <div class="card-cap" id="seriesCaption"></div>
         </div>
+        <div class="legend" id="seriesLegend"></div>
+        <div class="plot">
+          <svg viewBox="0 0 400 170" preserveAspectRatio="none" aria-hidden="true">
+            <defs><linearGradient id="tcArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="ga"></stop><stop offset="1" class="gb"></stop></linearGradient></defs>
+            <path id="seriesArea" fill="url(#tcArea)" d=""></path>
+            <path id="seriesOther" vector-effect="non-scaling-stroke" d=""></path>
+            <path id="seriesMain" vector-effect="non-scaling-stroke" d=""></path>
+          </svg>
+          <div class="peak" id="peakLine" style="display:none"></div>
+          <div class="peak-tags" id="peakTags" style="display:none">
+            <div class="tag"><i></i><span id="peakMain"></span></div>
+            <div class="tag" id="peakOtherTag"><i class="o"></i><span id="peakOther"></span></div>
+          </div>
+          <div class="hover-cols" id="seriesHover"></div>
+          <div class="plot-empty" id="seriesEmpty"></div>
+        </div>
+        <div class="ticks" id="seriesTicks"></div>
       </section>
-      <section class="sec" id="clientChartWrap" style="display:none">
-        <div class="sec-head">
-          <h2 class="sec-title" id="clientChartHeading">Most used</h2>
-          <div class="tools">
-            <span id="clientChartViewSlot"><span class="seg" id="usageViewWrap" role="group" aria-label="Usage window"></span></span>
-            <span class="seg" id="clientChartMetric" role="group" aria-label="Measure"></span>
+
+      <section class="card rise" id="heatWrap" style="display:none;animation-delay:.18s">
+        <div class="card-head"><h2 class="card-title">${ICONS.time}<span id="heatTitle">Tokens by time</span></h2></div>
+        <div class="heat" id="heat"></div>
+        <div class="heat-empty" id="heatEmpty"></div>
+        <div class="heat-legend" id="heatLegend"><span style="margin-right:3px">Less</span><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i><span style="margin-left:3px">More</span></div>
+      </section>
+
+      <section class="card rise" id="statusCard" style="animation-delay:.26s">
+        <div class="card-head">
+          <h2 class="card-title">${ICONS.status}Proxy status</h2>
+          <div class="live"><span class="dot lime" id="liveDot"></span><span id="liveText">Live</span></div>
+        </div>
+        <div class="kv"><span class="k">Conversations</span><span class="v" id="statConv">—</span></div>
+        <div class="kv"><span class="k">Uptime</span><span class="v" id="statUp">—</span></div>
+        <div class="kv"><span class="k">Accounts enabled</span><span class="v" id="statEnabled">—</span></div>
+        <div class="kv tail" id="thrWrap">
+          <label class="k" for="thrVal">Auto-switch at</label>
+          <div class="thr-row">
+            <span class="field"><input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal" aria-label="Auto-switch threshold"><span>%</span></span>
+            <button id="thrSet" class="pill-btn xs" type="button">Set</button>
           </div>
         </div>
-        <div class="panel pad">
-          <div class="share-lead" id="clientChartLead"></div>
-          <div class="shares" id="clientChart"></div>
-          <div class="foot-note">Tokens are the uncached input and output each response reports; cached context is not counted. Traffic on the shared proxy key is not attributed to anyone.</div>
-        </div>
+        <div class="card-foot" id="foot"></div>
       </section>
     </div>
 
-    <section class="sec">
+    <section class="sec" id="accountsSec">
       <div class="sec-head">
-        <div class="sec-title-row"><h2 class="sec-title">Accounts</h2><span class="sec-count mono" id="acctCount"></span></div>
-        <div class="legend" aria-label="Meter colours">
+        <div class="sec-title-row"><h2 class="sec-title">Accounts</h2><span class="sec-count" id="acctCount"></span></div>
+        <div class="legend sm" aria-label="Meter colours">
           <span><i class="sw ok"></i>Under 60%</span>
           <span><i class="sw warn"></i>60–90%</span>
           <span><i class="sw bad"></i>Over 90%</span>
@@ -1260,60 +1558,57 @@ const PAGE = `<!doctype html>
       <div class="acct-grid" id="accounts"></div>
     </section>
 
-    <div class="cols" id="tablesRow" style="display:none">
-      <section class="sec" id="routesWrap" style="display:none">
-        <div class="sec-head"><h2 class="sec-title">Routing</h2></div>
-        <div class="panel" id="routes"></div>
+    <div class="duo" id="tablesRow" style="display:none">
+      <section class="card rise" id="routesWrap" style="display:none;animation-delay:.3s">
+        <div class="card-head"><h2 class="card-title">${ICONS.routing}Routing</h2></div>
+        <div id="routes"></div>
+        <div id="routesFoot"></div>
       </section>
-      <section class="sec" id="clientsWrap" style="display:none">
-        <div class="sec-head"><h2 class="sec-title" id="clientsHeading">Clients</h2></div>
-        <div class="panel tbl-wrap"><table id="clients"></table></div>
+      <section class="card rise" id="clientsWrap" style="display:none;animation-delay:.36s">
+        <div class="card-head">
+          <h2 class="card-title">${ICONS.clients}<span id="clientsHeading">Clients</span></h2>
+          <span class="card-cap">Requests · tokens in / out</span>
+        </div>
+        <div id="clients"></div>
       </section>
     </div>
 
-    <div id="dimViewSlot"></div>
-    <div id="dimensionsWrap" class="cols" style="display:none"></div>
+    <div id="dimensionsWrap" class="duo" style="display:none"></div>
 
-    <section class="sec" id="sessionsWrap" style="display:none">
-      <div class="sec-head"><h2 class="sec-title">Sessions</h2></div>
-      <div class="panel">
-        <div class="filters">
-          <label>Project <select id="fProject"></select></label>
-          <label>Client <select id="fClient"></select></label>
-          <span class="hint" id="sessionCount"></span>
-        </div>
-        <div class="tbl-wrap"><table id="sessions" class="wide"></table></div>
+    <section class="card flush" id="sessionsWrap" style="display:none">
+      <div class="card-head"><h2 class="card-title">${ICONS.table}Sessions</h2></div>
+      <div class="filters">
+        <label>Project <select id="fProject"></select></label>
+        <label>Client <select id="fClient"></select></label>
+        <span class="hint" id="sessionCount"></span>
       </div>
+      <div class="tbl-wrap"><table id="sessions" class="wide"></table></div>
     </section>
-
-    <footer><span class="dot"></span><span id="foot"></span></footer>
   </div>
 
   <div id="loginWrap" class="scrim" style="display:none">
     <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
       <div class="dlg-head">
         <div class="dlg-title" id="loginTitle">Add a Claude account</div>
-        <button id="loginClose" class="btn ghost" type="button">Close</button>
+        <button id="loginClose" class="icon-btn sm" type="button" title="Close" aria-label="Close">×</button>
       </div>
-      <div class="steps">
-        <div class="step">
-          <div class="step-n">1</div>
-          <div class="step-body">
-            <div class="step-text">Open the sign-in link and sign in as the account you want to add.</div>
-            <div class="row-btns">
-              <a id="loginLink" class="link-btn" target="_blank" rel="noopener noreferrer">Open sign-in link ↗</a>
-              <button id="loginCopy" class="btn outline" type="button">Copy link</button>
-            </div>
+      <div class="step">
+        <div class="step-n">1</div>
+        <div class="step-body">
+          <div class="step-text">Open the sign-in link and sign in as the account you want to add.</div>
+          <div class="row-btns">
+            <a id="loginLink" class="pill-btn md" target="_blank" rel="noopener noreferrer">Open sign-in link ↗</a>
+            <button id="loginCopy" class="pill-btn md quiet" type="button">Copy link</button>
           </div>
         </div>
-        <div class="step">
-          <div class="step-n">2</div>
-          <div class="step-body">
-            <div class="step-text">Claude shows a code. Paste it here.</div>
-            <div class="code-row">
-              <input id="loginCode" type="text" placeholder="Code from the sign-in page" autocomplete="off" spellcheck="false">
-              <button id="loginGo" class="btn go" type="button">Add account</button>
-            </div>
+      </div>
+      <div class="step">
+        <div class="step-n">2</div>
+        <div class="step-body">
+          <div class="step-text">Claude shows a code. Paste it here.</div>
+          <div class="code-row">
+            <input id="loginCode" type="text" placeholder="Code from the sign-in page" autocomplete="off" spellcheck="false">
+            <button id="loginGo" class="pill-btn md violet" type="button">Add</button>
           </div>
         </div>
       </div>
@@ -1322,7 +1617,7 @@ const PAGE = `<!doctype html>
   </div>
 
   <div id="settingsWrap" class="scrim" style="display:none">
-    <section class="dialog flush" id="settingsDialog" role="dialog" aria-modal="true" aria-labelledby="setName"></section>
+    <section class="dialog set" id="settingsDialog" role="dialog" aria-modal="true" aria-labelledby="setName"></section>
   </div>
 </main>
 <script>
@@ -1335,23 +1630,24 @@ const PAGE = `<!doctype html>
   var lastStatus = null;
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
-  // The usage window applies to every view the usage trackers feed (the two
-  // charts, Clients and each configured dimension), so it is page state rather
-  // than per-table: two controls left on different windows would invite reading
-  // one number against the other. Like the sort, it survives the poll.
+  // The usage window applies to every view the usage trackers feed (the
+  // overview, both charts, Clients and each configured dimension), so it is
+  // page state rather than per-table: two controls left on different windows
+  // would invite reading one number against the other. Like the sort, it
+  // survives the poll.
   var usageView = 'total';
   var usageButtons = [];
-  // The measure both charts plot, page state like the window above.
+  // The measure the overview and both charts show, page state like the window.
   var CHART_METRICS = [{ key: 'tokens', label: 'Tokens' }, { key: 'requests', label: 'Requests' }];
   var chartMetric = 'tokens';
   var chartButtons = [];
-  // The usage-over-time series, fetched on its own (GET /teamclaude/usage/
-  // series) after each status poll that shows a client. One fetch at a time:
-  // a slow answer is not stacked behind by the next poll's.
+  // The usage series behind the two charts, fetched on its own (GET
+  // /teamclaude/usage/series) after each status poll that shows a client. One
+  // fetch at a time: a slow answer is not stacked behind by the next poll's.
   var lastSeries = null;
   var seriesError = null;
   var seriesInFlight = false;
-  // How the summary line names a signed-in client key's role.
+  // How the header names a signed-in client key's role.
   var VIEWER_ROLE_TEXT = { operator: 'admin', tenant: 'user', readonly: 'read-only' };
   // Add account: the state naming the sign-in link now open, or null. The
   // server holds everything else about that login; the link is only opened.
@@ -1362,10 +1658,25 @@ const PAGE = `<!doctype html>
   var settingsFor = null;
   var settingsBuiltFrom = '';
   var settingsNote = null;
-  var AVATAR_HUES = [45, 250, 150, 300, 80, 190, 20, 120];
+  var AVATARS = 8;
+  var TICKS = 30;
   var SVG_NS = 'http://www.w3.org/2000/svg';
   var GEAR_PATH = ${JSON.stringify(GEAR_PATH)};
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
+  // Motion runs only where a browser draws frames; the figure is set outright
+  // anywhere else (and under reduced motion the stylesheet stills the rest).
+  var raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : null;
+  var win = typeof window !== 'undefined' ? window : null;
+  var heroShown = null;
+  var heroToken = 0;
+  var introDone = false;
+  var reloadTurns = 0;
+  // The section nav: which section it marks, and the one last asked for, which
+  // wins when two sections share a row (Routing and Clients sit side by side).
+  var NAV = [['overview', 'navOverview'], ['accountsSec', 'navAccounts'], ['routesWrap', 'navRouting'], ['clientsWrap', 'navClients']];
+  var navPicked = 'overview';
+  var navHold = 0;
+  var spyQueued = false;
 
 ${SHARED_CONSTS}
 
@@ -1430,6 +1741,11 @@ ${SHARED_HELPERS}
     return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
+  // "3 pm", the way the heatmap heads its columns.
+  function fmtHour(ts) {
+    return new Date(ts).toLocaleTimeString([], { hour: 'numeric' }).toLowerCase();
+  }
+
   function metricText(v) {
     return fmtNum(v) + (chartMetric === 'requests' ? ' req' : ' tok');
   }
@@ -1457,16 +1773,27 @@ ${SHARED_HELPERS}
     return s.currentAccounts ? s.currentAccounts[a.provider] === a.name : a.name === s.currentAccount;
   }
 
+  function providersOf(currentAccounts) {
+    return currentAccounts ? Object.keys(currentAccounts).sort(function (a, b) {
+      if (a === 'anthropic') return -1;
+      if (b === 'anthropic') return 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }) : [];
+  }
+
+  function hasClients(s) {
+    return !!s && Object.keys(s.clients || {}).length > 0;
+  }
+
   function avatar(name, index, cls) {
-    var av = el('div', 'avatar' + (cls ? ' ' + cls : ''), initialOf(name));
+    var av = el('div', 'avatar av' + (index % AVATARS) + (cls ? ' ' + cls : ''), initialOf(name));
     av.setAttribute('aria-hidden', 'true');
-    av.style.cssText = '--h: ' + AVATAR_HUES[index % AVATAR_HUES.length];
     return av;
   }
 
   function gearIcon() {
     var svg = document.createElementNS(SVG_NS, 'svg');
-    [['width', '15'], ['height', '15'], ['viewBox', '0 0 24 24'], ['fill', 'none'], ['stroke', 'currentColor'],
+    [['width', '16'], ['height', '16'], ['viewBox', '0 0 24 24'], ['fill', 'none'], ['stroke', 'currentColor'],
       ['stroke-width', '1.8'], ['stroke-linecap', 'round'], ['stroke-linejoin', 'round'], ['aria-hidden', 'true']]
       .forEach(function (p) { svg.setAttribute(p[0], p[1]); });
     var circle = document.createElementNS(SVG_NS, 'circle');
@@ -1480,23 +1807,49 @@ ${SHARED_HELPERS}
     return svg;
   }
 
-  // One labelled meter: the figure set bright, what it is measured against
-  // dim after it, and a bar coloured by meterTone unless a tone is given.
+  // The dot a badge carries, by what it says: lime for the account in use and
+  // for live traffic, coral for what stops it serving, amber for what is worth
+  // a look, lilac for what sets it apart, grey for plain facts.
+  function chipDot(cls) {
+    var c = ' ' + cls + ' ';
+    if (c.indexOf(' current ') !== -1) return 'lime';
+    if (/ (disabled|error|exhausted|billing) /.test(c)) return 'coral';
+    if (/ (throttled|extra-usage|entitlement|upstream-rejected|quota) /.test(c)) return 'amber';
+    if (c.indexOf(' provider ') !== -1 || c.indexOf(' known ') !== -1) return 'lilac';
+    if (c.indexOf(' sessions ') !== -1) return 'lime';
+    return '';
+  }
+
+  // How recently a client was seen, as the dot on its Clients row: lime within
+  // ten minutes, lilac within the hour, grey beyond.
+  function recencyDot(ts) {
+    var t = parseTs(ts);
+    if (isNaN(t)) return 'gray';
+    var age = Date.now() - t;
+    return age < 600000 ? 'lime' : age < 3600000 ? 'lilac' : 'gray';
+  }
+
+  // One labelled meter: the figure set bright ahead of its label, what it is
+  // measured against dim on the right, and a row of ticks lit to the figure,
+  // coloured by meterTone unless a tone is given.
   function meter(label, ratio, figure, meta, tone, title) {
     var m = el('div', 'meter');
     if (title) m.title = title;
     var top = el('div', 'meter-top');
-    top.appendChild(el('span', 'lbl', label));
-    var v = el('span', 'mv');
-    v.appendChild(el('b', '', figure));
-    if (meta) v.appendChild(el('span', '', meta));
-    top.appendChild(v);
+    var l = el('span', 'ml');
+    l.appendChild(el('b', '', figure));
+    l.appendChild(el('span', '', label));
+    top.appendChild(l);
+    if (meta) top.appendChild(el('span', 'mv', meta));
     m.appendChild(top);
-    var bar = el('div', 'mbar');
-    var fill = el('i', tone || meterTone(ratio));
-    var pct = ratio == null ? 0 : Math.max(0, Math.min(1, Number(ratio)));
-    fill.style.width = (pct * 100) + '%';
-    bar.appendChild(fill);
+    var bar = el('div', 'ticks-bar');
+    bar.setAttribute('aria-hidden', 'true');
+    var cls = tone || meterTone(ratio);
+    var pct = ratio == null ? 0 : Math.max(0, Math.min(1, Number(ratio) || 0));
+    // Anything above nothing lights a tick: an unlit row would read as the
+    // zero it is not.
+    var on = pct > 0 ? Math.max(1, Math.round(pct * TICKS)) : 0;
+    for (var i = 0; i < TICKS; i++) bar.appendChild(el('i', i < on ? cls : ''));
     m.appendChild(bar);
     return m;
   }
@@ -1505,7 +1858,7 @@ ${SHARED_HELPERS}
     var pct = ratio == null ? null : Math.max(0, Math.min(1, Number(ratio)));
     var resetTs = parseTs(resetAt);
     var reset = !isNaN(resetTs) && resetTs > Date.now()
-      ? ' · ' + fmtIn((resetTs - Date.now()) / 1000) + ' · ' + fmtClock(resetTs)
+      ? fmtIn((resetTs - Date.now()) / 1000) + ' · ' + fmtClock(resetTs)
       : '';
     return meter(label, ratio, pct == null ? '?' : Math.round(pct * 100) + '%', reset);
   }
@@ -1513,25 +1866,29 @@ ${SHARED_HELPERS}
   function renderAccount(a, index, s) {
     var viewer = s.viewer || null;
     var isCur = isCurrentAccount(a, s);
-    var card = el('div', 'acct' + (isCur ? ' current' : '') + (a.disabled ? ' off' : ''));
+    var card = el('div', 'acct rise' + (isCur ? ' current' : '') + (a.disabled ? ' off' : ''));
+    card.style.animationDelay = (0.35 + Math.min(index, 10) * 0.05).toFixed(2) + 's';
     var head = el('div', 'acct-head');
     var id = el('div', 'acct-id');
-    var nameRow = el('div', 'acct-name-row');
-    nameRow.appendChild(avatar(a.name, index, ''));
+    id.appendChild(avatar(a.name, index, ''));
+    var text = el('div', 'acct-text');
     var name = el('div', 'acct-name', a.name);
     name.title = a.name;
-    nameRow.appendChild(name);
-    id.appendChild(nameRow);
+    text.appendChild(name);
     var chips = el('div', 'chips');
     accountBadges(a, s.currentAccount, s.currentAccounts || null, null, s.switchThreshold, s.switchThresholds).forEach(function (badge) {
-      chips.appendChild(el('span', 'chip ' + badge.cls, badge.text));
+      var chip = el('span', 'chip ' + badge.cls);
+      chip.appendChild(el('i', 'dot ' + chipDot(badge.cls)));
+      chip.appendChild(el('span', '', badge.text));
+      chips.appendChild(chip);
     });
-    id.appendChild(chips);
+    text.appendChild(chips);
+    id.appendChild(text);
     head.appendChild(id);
     // Every control for the account lives in its settings dialog, offered to
     // whoever may use at least one of them (a tenant may switch, no more).
     if (viewerCan(viewer, 'switch') || viewerCan(viewer, 'accounts')) {
-      var gear = el('button', 'gear');
+      var gear = el('button', 'icon-btn sm gear');
       gear.type = 'button';
       gear.title = 'Settings for ' + a.name;
       gear.setAttribute('aria-label', 'Settings for ' + a.name);
@@ -1543,8 +1900,7 @@ ${SHARED_HELPERS}
     // A disabled account says so by its dimmed card and its chip; the notice
     // is for an account that should be serving and is not.
     if (a.unavailable && a.unavailable !== 'disabled') {
-      card.appendChild(el('div', 'blocked' + (a.unavailable === 'error' ? ' bad' : ''),
-        'Blocked — ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+      card.appendChild(el('div', 'blocked', 'Blocked — ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     }
     var meters = el('div', 'meters');
     var q = a.quota || {};
@@ -1624,23 +1980,30 @@ ${SHARED_HELPERS}
     text.appendChild(el('div', 'set-sub', 'Account settings'));
     ident.appendChild(text);
     head.appendChild(ident);
-    var close = el('button', 'btn ghost', 'Close');
+    var close = el('button', 'icon-btn sm', '×');
     close.type = 'button';
+    close.title = 'Close';
+    close.setAttribute('aria-label', 'Close');
     close.addEventListener('click', closeSettings);
     head.appendChild(close);
     d.appendChild(head);
 
+    var rows = el('div', 'set-rows');
     if (viewerCan(viewer, 'switch')) {
-      var cur = settingsRow('Current account', isCur ? 'New requests go to this account'
-        : a.disabled ? 'Enable the account to switch to it' : 'Route new requests here');
-      if (isCur) cur.appendChild(el('span', 'inuse', 'In use'));
-      else if (!a.disabled) {
-        var sw = el('button', 'btn go', 'Switch to this');
+      var cur = settingsRow('Current account', isCur ? 'New requests go here'
+        : a.disabled ? 'Enable it to switch' : 'Route new requests here');
+      if (isCur) {
+        var use = el('span', 'inuse');
+        use.appendChild(el('i', 'dot lime'));
+        use.appendChild(el('span', '', 'In use'));
+        cur.appendChild(use);
+      } else if (!a.disabled) {
+        var sw = el('button', 'pill-btn sm', 'Switch');
         sw.type = 'button';
         sw.addEventListener('click', function () { doSwitch(a.name, sw); });
         cur.appendChild(sw);
       }
-      d.appendChild(cur);
+      rows.appendChild(cur);
     }
     if (viewerCan(viewer, 'accounts')) {
       // Rotation picks the LOWEST number first (prioritize puts an account
@@ -1660,7 +2023,7 @@ ${SHARED_HELPERS}
       stepper.appendChild(el('div', 'val', String(prio)));
       stepper.appendChild(up);
       pr.appendChild(stepper);
-      d.appendChild(pr);
+      rows.appendChild(pr);
 
       var en = settingsRow('Enabled', 'Disabled accounts are never routed to');
       var toggle = el('button', 'toggle' + (a.disabled ? '' : ' on'));
@@ -1672,8 +2035,9 @@ ${SHARED_HELPERS}
       toggle.appendChild(el('span'));
       toggle.addEventListener('click', function () { doControlAccount(a.name, { disabled: !a.disabled }, toggle); });
       en.appendChild(toggle);
-      d.appendChild(en);
+      rows.appendChild(en);
     }
+    d.appendChild(rows);
     var n = el('div', 'set-note');
     n.id = 'setNote';
     if (settingsNote) {
@@ -1684,10 +2048,11 @@ ${SHARED_HELPERS}
     d.appendChild(n);
   }
 
-  // ── Charts ───────────────────────────────────────────────────────────────
+  // ── Overview ─────────────────────────────────────────────────────────────
 
-  // The window and measure buttons, built once: the windows are fixed by the
-  // server that served this page.
+  // The window and measure buttons, and the overview columns' bars, built
+  // once: the windows are fixed by the server that served this page, and the
+  // bars are the columns' texture rather than data.
   function buildControls() {
     var views = byId('usageViewWrap');
     USAGE_VIEWS.forEach(function (v) {
@@ -1696,6 +2061,7 @@ ${SHARED_HELPERS}
       btn.addEventListener('click', function () {
         usageView = v.key;
         markSelected(usageButtons, usageView);
+        movePill();
         if (lastStatus) render(lastStatus);
       });
       views.appendChild(btn);
@@ -1715,6 +2081,22 @@ ${SHARED_HELPERS}
       chartButtons.push({ key: m.key, btn: btn });
     });
     markSelected(chartButtons, chartMetric);
+    // The first column one solid block, the second a run of strokes shading
+    // darker, the third fainter strokes: the columns tell clients apart by
+    // their pattern as well as their place.
+    byId('grp0Bars').appendChild(el('i', 'solid'));
+    var i, bar;
+    for (i = 0; i < 18; i++) {
+      bar = el('i', 'thin');
+      bar.style.background = 'oklch(' + (0.62 - i * 0.012).toFixed(3) + ' ' + (0.2 - i * 0.004).toFixed(3) + ' 290)';
+      bar.style.animationDelay = (0.12 + i * 0.025).toFixed(3) + 's';
+      byId('grp1Bars').appendChild(bar);
+    }
+    for (i = 0; i < 6; i++) {
+      bar = el('i', 'thin dark');
+      bar.style.animationDelay = (0.24 + i * 0.025).toFixed(3) + 's';
+      byId('grp2Bars').appendChild(bar);
+    }
   }
 
   function markSelected(buttons, key) {
@@ -1724,86 +2106,282 @@ ${SHARED_HELPERS}
     });
   }
 
-  // One bar per client, longest first, the biggest in the accent colour.
-  function renderClientChart(clients) {
-    var wrap = byId('clientChartWrap');
-    var rows = clientRanking(clients, usageView, chartMetric);
-    if (!rows.length) { wrap.style.display = 'none'; return; }
-    wrap.style.display = '';
-    byId('clientChartLead').textContent = 'Share of ' + (chartMetric === 'requests' ? 'requests' : 'tokens') + ' by client key';
-    var box = byId('clientChart');
-    box.textContent = '';
-    rows.forEach(function (r, i) {
-      var row = el('div', 'share');
-      var n = el('div', 'n', r.name);
-      n.title = r.name;
-      row.appendChild(n);
-      var track = el('div', 'track');
-      var bar = el('i', i === 0 ? 'top' : '');
-      // Anything spent draws at least 2px: a bar of nothing would read as the
-      // zero it is not.
-      bar.style.width = r.value > 0 ? 'max(2px, ' + (r.ratio * 100).toFixed(2) + '%)' : '0';
-      track.appendChild(bar);
-      row.appendChild(track);
-      var val = el('div', 'val');
-      val.appendChild(el('b', '', metricText(r.value)));
-      val.appendChild(el('span', '', ' · ' + fmtShare(r.share)));
-      row.appendChild(val);
-      box.appendChild(row);
+  // The window control's highlight slides to the chosen button. It is placed
+  // by measuring that button, which a hidden page cannot do; until it has been
+  // measured the button marks itself instead.
+  function movePill() {
+    var cur = usageButtons.filter(function (b) { return b.key === usageView; })[0];
+    if (!cur) return;
+    var left = cur.btn.offsetLeft, width = cur.btn.offsetWidth;
+    if (typeof left !== 'number' || typeof width !== 'number' || !width) return;
+    var pill = byId('viewPill');
+    pill.style.left = left + 'px';
+    pill.style.width = width + 'px';
+    byId('usageViewWrap').className = 'seg lg measured';
+  }
+
+  function viewLabel() {
+    var view = USAGE_VIEWS.filter(function (v) { return v.key === usageView; })[0];
+    return view ? view.label : '';
+  }
+
+  // Where the overview's span starts, under its columns.
+  function rangeStartText() {
+    if (usageView === 'total') return 'All time';
+    var n = parseInt(usageView, 10);
+    var unit = usageView.slice(-1) === 'd' ? ' day' : ' hour';
+    return n + unit + (n === 1 ? '' : 's') + ' ago';
+  }
+
+  // The overview's big figure: every client key's traffic on the shown window
+  // and measure. A fleet with no client keys has nothing windowed to show, so
+  // it gets what the accounts themselves have served since the proxy started,
+  // cache included as on their cards, and the label says so.
+  function heroFigure(s) {
+    var requests = chartMetric === 'requests';
+    if (hasClients(s)) {
+      var total = 0;
+      clientRanking(s.clients, usageView, chartMetric).forEach(function (r) { total += r.value; });
+      return {
+        value: total, label: requests ? 'Requests served' : 'Tokens used',
+        title: 'Every client key\\'s ' + (requests ? 'requests' : 'uncached input and output tokens') + ', ' + (usageView === 'total' ? 'all time' : viewLabel().toLowerCase())
+          + '. Traffic on the shared proxy key is not attributed to anyone.',
+      };
+    }
+    var sum = 0;
+    (s.accounts || []).forEach(function (a) {
+      var u = a.usage || {};
+      sum += requests ? (u.totalRequests || 0) : accountTokens(u);
+    });
+    return {
+      value: sum, label: (requests ? 'Requests served' : 'Tokens served') + ' since start',
+      title: 'What every account has served since the proxy started' + (requests ? '' : ', cache reads and writes included'),
+    };
+  }
+
+  function drawHero(v) {
+    var str = fmtNum(Math.round(v));
+    var cut = str.search(/[.km]/);
+    byId('heroMain').textContent = cut < 0 ? str : str.slice(0, cut);
+    byId('heroFrac').textContent = cut < 0 ? '' : str.slice(cut);
+  }
+
+  // A new figure counts up (or down) from the one on screen rather than
+  // jumping, the first from zero.
+  function setHero(value) {
+    var token = ++heroToken;
+    var from = heroShown == null ? 0 : heroShown;
+    if (!raf || from === value) { heroShown = value; drawHero(value); return; }
+    var t0 = null;
+    raf(function step(now) {
+      if (token !== heroToken) return;
+      if (t0 == null) t0 = now;
+      var p = Math.min(1, (now - t0) / 700);
+      heroShown = from + (value - from) * (1 - Math.pow(1 - p, 3));
+      drawHero(heroShown);
+      if (p < 1) raf(step);
+      else heroShown = value;
     });
   }
 
-  // Usage over time, drawn from the last series fetched. Total has no series
-  // of its own — the tracker keeps a day of history, not a lifetime — so it
-  // shows the day, and the caption says which span is on screen.
+  function renderHero(s) {
+    var fig = heroFigure(s);
+    var label = byId('heroLabel');
+    label.textContent = fig.label;
+    label.title = fig.title;
+    setHero(fig.value);
+    // Where a new request goes: one cursor per provider, since a mixed
+    // Claude/Codex fleet has two current accounts and naming one of them "the"
+    // current account would be wrong.
+    var box = byId('statActive');
+    box.textContent = '';
+    box.appendChild(el('span', '', 'Routing to'));
+    var ca = s.currentAccounts || null;
+    var providers = providersOf(ca);
+    var add = function (name, provider, first) {
+      if (!first) box.appendChild(el('span', 'prov', '·'));
+      var n = el('b', '', name || 'nothing — no account can serve');
+      if (name) n.title = name;
+      box.appendChild(n);
+      if (provider) box.appendChild(el('span', 'prov', providerLabel(provider)));
+    };
+    if (providers.length > 1) providers.forEach(function (p, i) { add(ca[p], p, i === 0); });
+    else add(providers.length ? ca[providers[0]] : s.currentAccount, null, true);
+  }
+
+  // The newest hour on top of the figure, once the series has landed.
+  function renderDelta() {
+    var d = byId('heroDelta');
+    var lines = hasClients(lastStatus) && lastSeries ? seriesLines(lastSeries, usageView, chartMetric, null) : null;
+    if (!lines || !lines.last) { d.style.display = 'none'; return; }
+    d.textContent = '+' + fmtNum(lines.last) + ' last hour';
+    d.title = metricText(lines.last) + ' in the hour to ' + fmtHM(lines.points[lines.points.length - 1].end);
+    d.style.display = '';
+  }
+
+  // The overview's columns: the two busiest clients and everyone else, each
+  // figure standing as high as its share against the tallest, read against a
+  // dashed line at the average client.
+  function renderGroups(s) {
+    var wrap = byId('clientChartWrap');
+    if (!hasClients(s)) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    byId('rangeStart').textContent = rangeStartText();
+    var g = clientGroups(clientRanking(s.clients, usageView, chartMetric));
+    var empty = byId('groupsEmpty');
+    if (g.groups.length) empty.style.display = 'none';
+    else {
+      empty.textContent = usageView === 'total' ? 'No client-key traffic yet' : 'No client-key traffic in the ' + viewLabel().toLowerCase();
+      empty.style.display = 'flex';
+    }
+    var lift = function (x) { return Math.round(6 + (1 - x) * 90); };
+    for (var i = 0; i < 3; i++) {
+      var slot = byId('grp' + i), grp = g.groups[i];
+      if (!grp) { slot.style.display = 'none'; continue; }
+      slot.style.display = '';
+      slot.style.flexGrow = String(grp.grow);
+      slot.style.paddingTop = lift(grp.lift) + 'px';
+      slot.title = (grp.others ? grp.members.join(', ') : grp.name) + ' · ' + metricText(grp.value) + ' · ' + fmtShare(grp.share);
+      byId('grp' + i + 'Val').textContent = metricText(grp.value);
+      byId('grp' + i + 'Pct').textContent = fmtShare(grp.share);
+      byId('grp' + i + 'Name').textContent = grp.others ? grp.members.length + ' others' : grp.name;
+    }
+    var line = byId('avgLine'), pill = byId('avgPill');
+    if (g.clients > 1) {
+      // Through the middle of a figure standing at the average client.
+      var y = lift(g.averageLift) + 10;
+      line.style.top = y + 'px';
+      pill.style.top = y + 'px';
+      pill.title = 'Average per client: ' + metricText(g.average);
+      line.style.display = '';
+      pill.style.display = '';
+    } else {
+      line.style.display = 'none';
+      pill.style.display = 'none';
+    }
+  }
+
+  // ── Charts ───────────────────────────────────────────────────────────────
+
+  function seriesHours() {
+    return (usageView === '5h' ? 5 : 24) + 'h';
+  }
+
+  // Usage over time, drawn from the last series fetched: the signed-in client
+  // (or the busiest) against everyone else, an hour a point. Total has no
+  // series of its own — the tracker keeps a day of history, not a lifetime —
+  // so it shows the day, and the caption says which span is on screen.
   function renderSeries() {
     var wrap = byId('seriesWrap');
-    if (!lastStatus || !Object.keys(lastStatus.clients || {}).length) { wrap.style.display = 'none'; return; }
+    var s = lastStatus;
+    if (!hasClients(s)) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
-    var chart = seriesBars(lastSeries, usageView, chartMetric);
-    var spanMs = chart.spanMs || (usageView === '5h' ? 5 : 24) * 3600000;
-    var hours = Math.round(spanMs / 3600000) + 'h';
-    byId('seriesCaption').textContent = (chartMetric === 'requests' ? 'Requests' : 'Tokens') + ' · last ' + hours + ', hourly';
-    byId('seriesTotal').textContent = lastSeries ? metricText(chart.total) : '—';
+    var focus = (s.viewer && s.viewer.client) || null;
+    var L = seriesLines(lastSeries, usageView, chartMetric, focus);
+    var hours = L.spanMs ? Math.round(L.spanMs / 3600000) + 'h' : seriesHours();
+    byId('seriesCaption').textContent = (chartMetric === 'requests' ? 'Requests' : 'Tokens') + ' / hour · last ' + hours;
     var legend = byId('seriesLegend');
     legend.textContent = '';
-    var names = chart.legend.slice();
-    if (chart.hasOthers) names.push(null);
-    names.forEach(function (name, i) {
-      var item = el('span');
-      item.appendChild(el('i', 'sw ' + (name == null ? 'so' : 's' + i)));
-      item.appendChild(el('span', '', name == null ? 'others' : name));
-      legend.appendChild(item);
-    });
-    var box = byId('seriesBars');
-    box.textContent = '';
-    if (!lastSeries || !chart.total) {
-      box.appendChild(el('div', 'bars-empty', !lastSeries
+    var item = function (cls, name) {
+      var span = el('span');
+      span.appendChild(el('i', 'sw ' + cls));
+      span.appendChild(el('span', '', name));
+      legend.appendChild(span);
+    };
+    if (L.main) item('main', L.main);
+    if (L.hasOther) item('other', 'everyone else');
+    var hover = byId('seriesHover');
+    hover.textContent = '';
+    var empty = byId('seriesEmpty');
+    var drawn = !!lastSeries && L.total > 0;
+    if (!drawn) {
+      empty.textContent = !lastSeries
         ? (seriesError ? 'Usage history unavailable: ' + seriesError : 'Loading usage history…')
-        : 'No client-key traffic in the last ' + hours));
+        : 'No client-key traffic in the last ' + hours;
+      empty.style.display = 'flex';
+      ['seriesMain', 'seriesArea', 'seriesOther'].forEach(function (id) { byId(id).setAttribute('d', ''); });
+      byId('peakLine').style.display = 'none';
+      byId('peakTags').style.display = 'none';
     } else {
-      chart.bars.forEach(function (b) {
-        var col = el('div', 'col');
-        var lines = [fmtHM(b.start) + '–' + fmtHM(b.end) + ' · ' + metricText(b.total)];
-        chart.legend.forEach(function (name, i) { if (b.parts[i]) lines.push(name + ': ' + metricText(b.parts[i])); });
-        if (b.others) lines.push('others: ' + metricText(b.others));
-        col.title = lines.join('\\n');
-        // Top to bottom: others, then the legend in reverse, so the biggest
-        // client sits on the baseline of every bar.
-        var segs = [{ v: b.others, cls: 'so' }];
-        for (var i = b.parts.length - 1; i >= 0; i--) segs.push({ v: b.parts[i], cls: 's' + i });
-        segs.forEach(function (seg) {
-          if (!seg.v) return;
-          var part = el('i', seg.cls);
-          part.style.height = 'max(1px, ' + (seg.v / chart.peak * 100).toFixed(2) + '%)';
-          col.appendChild(part);
-        });
-        box.appendChild(col);
+      empty.style.display = 'none';
+      var n = L.points.length;
+      var top = L.peak * 1.15;
+      var X = function (i) { return n > 1 ? i / (n - 1) * 400 : 200; };
+      var Y = function (v) { return 165 - v / top * 150; };
+      var mainD = smoothPath(L.points.map(function (p, i) { return [X(i), Y(p.main)]; }), 165);
+      byId('seriesMain').setAttribute('d', mainD);
+      byId('seriesArea').setAttribute('d', mainD + ' L400,170 L0,170 Z');
+      byId('seriesOther').setAttribute('d', L.hasOther ? smoothPath(L.points.map(function (p, i) { return [X(i), Y(p.other)]; }), 165) : '');
+      var pk = L.points[L.peakAt];
+      var left = X(L.peakAt) / 4;
+      var peak = byId('peakLine'), tags = byId('peakTags');
+      peak.style.left = left + '%';
+      peak.style.display = '';
+      tags.style.left = left + '%';
+      // Past the middle the tags sit left of the line, so they stay on the chart.
+      tags.className = 'peak-tags' + (left > 62 ? ' flip' : '');
+      tags.style.display = '';
+      byId('peakMain').textContent = metricText(pk.main);
+      byId('peakOther').textContent = metricText(pk.other);
+      byId('peakOtherTag').style.display = L.hasOther ? '' : 'none';
+      L.points.forEach(function (p) {
+        var col = el('div');
+        col.title = fmtHM(p.start) + '–' + fmtHM(p.end) + ' · ' + L.main + ' ' + metricText(p.main)
+          + (L.hasOther ? ' · everyone else ' + metricText(p.other) : '');
+        hover.appendChild(col);
       });
     }
     var ticks = byId('seriesTicks');
     ticks.textContent = '';
-    seriesTicks(spanMs).forEach(function (t) { ticks.appendChild(el('span', '', t)); });
+    seriesTicks(L.spanMs || (usageView === '5h' ? 5 : 24) * 3600000).forEach(function (t) { ticks.appendChild(el('span', '', t)); });
+  }
+
+  // Traffic by time: a row per client, a column per stretch of the span, each
+  // cell shaded by its share of the busiest.
+  function renderHeat() {
+    var wrap = byId('heatWrap');
+    if (!hasClients(lastStatus)) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    byId('heatTitle').textContent = (chartMetric === 'requests' ? 'Requests' : 'Tokens') + ' by time';
+    var grid = byId('heat');
+    grid.textContent = '';
+    var G = heatGrid(lastSeries, usageView, chartMetric);
+    var empty = byId('heatEmpty');
+    if (!lastSeries || !G.rows.length) {
+      // Short on purpose: the chart beside it carries the whole reason.
+      empty.textContent = !lastSeries ? (seriesError ? 'History unavailable' : 'Loading…') : 'Nothing in the last ' + seriesHours();
+      empty.style.display = 'flex';
+      grid.style.display = 'none';
+      byId('heatLegend').style.display = 'none';
+      return;
+    }
+    empty.style.display = 'none';
+    grid.style.display = 'grid';
+    byId('heatLegend').style.display = '';
+    grid.style.gridTemplateColumns = '64px repeat(' + G.columns.length + ', minmax(0, 1fr))';
+    grid.appendChild(el('span'));
+    G.columns.forEach(function (c) {
+      var h = el('span', 'hd', fmtHour(c.start));
+      h.title = fmtHM(c.start) + '–' + fmtHM(c.end);
+      grid.appendChild(h);
+    });
+    G.rows.forEach(function (row) {
+      var name = row.others ? row.members.length + ' others' : row.name;
+      var label = el('span', 'rl', name);
+      label.title = row.members.join(', ');
+      grid.appendChild(label);
+      row.cells.forEach(function (cell, c) {
+        var d = el('div', 'cell' + (cell.level ? ' l' + cell.level : ''));
+        d.title = name + ' · ' + fmtHM(G.columns[c].start) + '–' + fmtHM(G.columns[c].end) + ' · ' + metricText(cell.value);
+        grid.appendChild(d);
+      });
+    });
+  }
+
+  function renderHistory() {
+    renderSeries();
+    renderHeat();
+    renderDelta();
   }
 
   function pollSeries() {
@@ -1816,7 +2394,7 @@ ${SHARED_HELPERS}
       })
       .then(function (json) { lastSeries = json; seriesError = null; })
       .catch(function (e) { seriesError = e.message; })
-      .then(function () { seriesInFlight = false; renderSeries(); });
+      .then(function () { seriesInFlight = false; renderHistory(); });
   }
 
   // ── Tables ───────────────────────────────────────────────────────────────
@@ -1829,11 +2407,11 @@ ${SHARED_HELPERS}
   }
 
   // The window a usage table is showing, in its own heading: the control sits
-  // with the charts, and the tables below can be scrolled clear of it.
+  // at the top of the page, and the tables below can be scrolled clear of it.
   function usageHeading(base) {
     if (usageView === 'total') return base;
-    var view = USAGE_VIEWS.filter(function (v) { return v.key === usageView; })[0];
-    return view ? base + ' · ' + view.label.toLowerCase() : base;
+    var label = viewLabel();
+    return label ? base + ' · ' + label.toLowerCase() : base;
   }
 
   function renderClients(clients) {
@@ -1842,38 +2420,35 @@ ${SHARED_HELPERS}
     if (!names.length) { wrap.style.display = 'none'; return false; }
     wrap.style.display = '';
     byId('clientsHeading').textContent = usageHeading('Clients');
-    // Sorted on the window being shown, not on the lifetime total: a table
+    // Sorted on the window being shown, not on the lifetime total: a list
     // ordered by all-time spend while displaying the last five hours would put
     // the quiet clients on top of the busy one.
     names.sort(function (a, b) {
       var ua = usageFor(clients[a], usageView), ub = usageFor(clients[b], usageView);
       return (ub.inputTokens + ub.outputTokens) - (ua.inputTokens + ua.outputTokens);
     });
-    var table = byId('clients');
-    table.textContent = '';
-    var hr = el('tr');
-    ['Client', 'Requests', 'WebSockets', 'Input tok', 'Output tok', lastUsedLabel()].forEach(function (h, i) {
-      hr.appendChild(el('th', i ? 'num' : '', h));
-    });
-    table.appendChild(hr);
+    var box = byId('clients');
+    box.textContent = '';
     names.forEach(function (n) {
       var c = clients[n];
       var u = usageFor(c, usageView);
-      var tr = el('tr');
-      var cell = el('td');
-      var tag = el('span', 'ctag');
-      tag.appendChild(el('span', 'ini', initialOf(n)));
-      tag.appendChild(el('span', '', n));
-      cell.appendChild(tag);
-      tr.appendChild(cell);
-      tr.appendChild(el('td', 'num', fmtNum(u.requests)));
-      tr.appendChild(el('td', 'num dim', fmtNum(u.connections)));
-      tr.appendChild(el('td', 'num', fmtNum(u.inputTokens)));
-      tr.appendChild(el('td', 'num', fmtNum(u.outputTokens)));
+      var row = el('div', 'cl-row');
+      row.title = n + ' · ' + fmtNum(u.requests) + ' requests'
+        + (u.connections ? ', ' + fmtNum(u.connections) + ' WebSockets' : '')
+        + ' · ' + fmtNum(u.inputTokens) + ' tokens in, ' + fmtNum(u.outputTokens) + ' out';
+      row.appendChild(el('span', 'cl-name', n));
       // Last used stays the lifetime figure under every window: it answers
       // when this client was last seen at all, which a window cannot.
-      tr.appendChild(el('td', 'num soft', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
-      table.appendChild(tr);
+      var last = el('span', 'last');
+      last.title = lastUsedLabel();
+      last.appendChild(el('i', 'dot ' + recencyDot(c.lastUsed)));
+      last.appendChild(el('span', '', c.lastUsed ? fmtAgo(c.lastUsed) : 'never'));
+      row.appendChild(last);
+      var val = el('span', 'cl-val');
+      val.appendChild(el('b', '', fmtNum(u.requests)));
+      val.appendChild(el('span', '', ' · ' + fmtNum(u.inputTokens) + ' / ' + fmtNum(u.outputTokens)));
+      row.appendChild(val);
+      box.appendChild(row);
     });
     return true;
   }
@@ -1913,7 +2488,7 @@ ${SHARED_HELPERS}
   function renderSessions(sessions) {
     var wrap = byId('sessionsWrap');
     // Absent unless proxy.sessionDetail is on — the aggregate counts in the
-    // summary strip stay either way.
+    // status card stay either way.
     if (!sessions || !sessions.items) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
 
@@ -1988,11 +2563,11 @@ ${SHARED_HELPERS}
       rows = sortRows(rows, sortState[name].key, sortState[name].dir);
       var title = name.charAt(0).toUpperCase() + name.slice(1);
 
-      var sec = el('section', 'sec');
-      var head = el('div', 'sec-head');
-      head.appendChild(el('h2', 'sec-title', usageHeading(title)));
+      var sec = el('section', 'card flush');
+      var head = el('div', 'card-head');
+      head.appendChild(el('h2', 'card-title', usageHeading(title)));
       sec.appendChild(head);
-      var panel = el('div', 'panel tbl-wrap');
+      var box = el('div', 'tbl-wrap');
       var table = el('table');
       var hr = el('tr');
       [{ key: 'name', label: title },
@@ -2012,17 +2587,18 @@ ${SHARED_HELPERS}
         tr.appendChild(el('td', 'num soft', r.lastUsed ? fmtAgo(r.lastUsed) : '—'));
         table.appendChild(tr);
       });
-      panel.appendChild(table);
-      sec.appendChild(panel);
+      box.appendChild(table);
+      sec.appendChild(box);
       wrap.appendChild(sec);
     });
     wrap.style.display = any ? '' : 'none';
     return any;
   }
 
-  // Where each metered family goes right now, and which accounts could take
-  // it. The last rows are the per-provider defaults: everything without a
-  // route of its own lands on the current account.
+  // Where each metered family goes right now, and how many accounts could
+  // take it. The last rows are the per-provider defaults: everything without a
+  // route of its own lands on the current account. The accounts that cannot
+  // serve a family are named under the table, which is why it is elsewhere.
   function renderRoutes(s) {
     var wrap = byId('routesWrap');
     var rows = routeRows(s);
@@ -2030,19 +2606,24 @@ ${SHARED_HELPERS}
     wrap.style.display = '';
     var box = byId('routes');
     box.textContent = '';
-    var hr = el('div', 'rt-row head');
-    ['Family', 'Goes to', 'Can serve it'].forEach(function (h) { hr.appendChild(el('div', '', h)); });
-    box.appendChild(hr);
+    var foot = byId('routesFoot');
+    foot.textContent = '';
+    var notes = 0;
     rows.forEach(function (r) {
       var row = el('div', 'rt-row');
       var fam = el('div', 'rt-fam');
       fam.appendChild(el('b', '', r.label));
-      var sub = [r.match, r.provider ? providerLabel(r.provider) : ''].filter(Boolean).join(' · ');
-      if (sub) fam.appendChild(el('span', '', sub));
+      var glob = r.kind === 'default' ? '*' : r.match;
+      var sub = [glob, r.provider && r.provider !== 'anthropic' ? providerLabel(r.provider) : ''].filter(Boolean).join(' · ');
+      if (sub) fam.appendChild(el('span', 'rt-glob mono', sub));
       row.appendChild(fam);
 
       var to = el('div', 'rt-to');
-      to.appendChild(el('span', r.blocked ? 'bad-t' : '', r.blocked ? 'blocked' : (r.target || '—')));
+      var pill = el('span', 'target' + (r.blocked ? ' bad' : ''));
+      pill.appendChild(el('i', 'dot ' + (r.blocked ? 'coral' : r.target ? 'violet' : 'gray')));
+      pill.appendChild(el('span', 't', r.blocked ? 'blocked' : (r.target || 'nothing can serve it')));
+      if (r.target) pill.title = r.target;
+      to.appendChild(pill);
       if (r.pinned) to.appendChild(el('span', 'rt-note pin', 'pinned to ' + r.pinned + (r.pinMismatch ? ' (not eligible)' : '')));
       if (r.kind === 'default' && r.target !== r.current) {
         to.appendChild(el('span', 'rt-note warn', r.currentUnavailable
@@ -2053,25 +2634,25 @@ ${SHARED_HELPERS}
 
       var can = el('div', 'rt-can');
       var total = r.eligible.length + r.ineligible.length;
-      if (r.kind === 'default') can.appendChild(el('span', 'soft', 'No route of its own'));
-      else if (r.blocked || !total) can.appendChild(el('span', 'soft', '—'));
+      if (r.kind === 'default') can.appendChild(el('span', 'rt-none', 'No route of its own'));
+      else if (r.blocked || !total) can.appendChild(el('span', 'rt-none', '—'));
       else {
-        var count = el('div', 'rt-count');
-        count.appendChild(el('b', '', r.eligible.length + ' of ' + total));
-        var segs = el('div', 'segs');
+        var segs = el('div', 'segs' + (total > 12 ? ' dense' : ''));
         segs.setAttribute('aria-hidden', 'true');
         for (var i = 0; i < total; i++) segs.appendChild(el('i', i < r.eligible.length ? 'on' : ''));
-        count.appendChild(segs);
-        can.appendChild(count);
+        can.appendChild(segs);
+        can.appendChild(el('span', 'rt-count', r.eligible.length + ' of ' + total + ' can serve'));
         if (r.ineligible.length) {
-          var un = el('div', 'dimtext', 'Unavailable: ' + r.ineligible.map(shortName).join(', '));
+          var un = el('div', '', 'Unavailable for ' + r.label + ': ' + r.ineligible.map(shortName).join(', '));
           un.title = r.ineligible.join(', ');
-          can.appendChild(un);
+          foot.appendChild(un);
+          notes++;
         }
       }
       row.appendChild(can);
       box.appendChild(row);
     });
+    foot.style.display = notes ? 'flex' : 'none';
     return true;
   }
 
@@ -2082,26 +2663,39 @@ ${SHARED_HELPERS}
     var list = problems(s);
     wrap.textContent = '';
     if (!list.length) { wrap.style.display = 'none'; return; }
-    wrap.style.display = 'block';
+    wrap.style.display = 'flex';
     list.forEach(function (p) { wrap.appendChild(el('div', 'alert ' + p.severity, p.text)); });
   }
 
-  // ── Header and summary strip ─────────────────────────────────────────────
+  // The message strip under the header takes no room while it has nothing to
+  // say: the page's gaps would otherwise open around an empty box.
+  function syncMsgs() {
+    var any = ['problems', 'err', 'note'].some(function (id) { return byId(id).style.display === 'flex'; });
+    byId('msgs').style.display = any ? 'flex' : 'none';
+  }
+
+  // ── Header and status card ───────────────────────────────────────────────
 
   function renderHeader(s) {
     var viewer = s.viewer || null;
-    var sum = byId('summary');
-    sum.textContent = '';
-    // Who this page is signed in as: the controls below appear or not by that,
-    // and a missing button should not be a puzzle.
+    // Who this page is signed in as, and as what: the controls below appear or
+    // not by that, and a missing button should not be a puzzle.
+    var h = byId('welcome');
+    h.textContent = '';
+    h.appendChild(el('span', '', 'Welcome back'));
     if (viewer && viewer.client) {
-      var who = el('span', '', 'Signed in as ');
-      who.appendChild(el('b', '', viewer.client));
-      sum.appendChild(who);
-      sum.appendChild(el('span', 'pill', VIEWER_ROLE_TEXT[viewer.role] || viewer.role));
-    } else if (viewer) {
-      sum.appendChild(el('span', '', 'Operator access'));
-      sum.appendChild(el('span', 'pill', VIEWER_ROLE_TEXT[viewer.role] || viewer.role));
+      h.appendChild(el('span', '', ', '));
+      h.appendChild(el('span', 'who', viewer.client));
+    }
+    var roleText = viewer && viewer.role ? (VIEWER_ROLE_TEXT[viewer.role] || viewer.role) : '';
+    if (roleText) h.appendChild(el('span', 'role', roleText));
+    var me = byId('me');
+    if (viewer) {
+      me.textContent = initialOf(viewer.client || roleText);
+      me.title = (viewer.client || 'Operator access') + (roleText ? ' · ' + roleText : '');
+      me.style.display = '';
+    } else {
+      me.style.display = 'none';
     }
     byId('reload').style.display = viewerCan(viewer, 'reload') ? '' : 'none';
     // Adding an account writes a credential into the config: an account
@@ -2113,50 +2707,25 @@ ${SHARED_HELPERS}
     var probe = s.probe || {};
     var probeBtn = byId('probe');
     probeBtn.style.display = viewerCan(viewer, 'probe') ? '' : 'none';
-    probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
+    byId('probeText').textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeBtn.disabled = !!probe.running;
   }
 
-  function renderStats(s) {
-    var currentAccounts = s.currentAccounts || null;
-    var providers = currentAccounts ? Object.keys(currentAccounts).sort(function (a, b) {
-      if (a === 'anthropic') return -1;
-      if (b === 'anthropic') return 1;
-      return a < b ? -1 : a > b ? 1 : 0;
-    }) : [];
-    var act = byId('statActive');
-    act.textContent = '';
-    var line = function (name, prefix) {
-      var l = el('span', 'line');
-      l.appendChild(el('span', name ? 'live' : 'live none'));
-      if (prefix) l.appendChild(el('span', 'sub', prefix));
-      var n = el('span', 'ellip', name || 'none');
-      if (name) n.title = name;
-      l.appendChild(n);
-      return l;
-    };
-    // One cursor per provider: a mixed Claude/Codex fleet has two current
-    // accounts, and naming one of them "the" active account would be wrong.
-    if (providers.length > 1) {
-      byId('statActiveLabel').textContent = 'Active accounts';
-      act.className = 'v stack';
-      providers.forEach(function (p) { act.appendChild(line(currentAccounts[p], providerLabel(p))); });
-    } else {
-      byId('statActiveLabel').textContent = 'Active account';
-      act.className = 'v';
-      act.appendChild(line(providers.length ? currentAccounts[providers[0]] : s.currentAccount, ''));
-    }
-    // Conversations, like the table below and the count above that table: one
-    // page saying "sessions" here and "conversations" there would read as two
-    // different quantities rather than one counted twice.
+  function renderStatusCard(s) {
+    // Conversations, like the Sessions table and its count: one page saying
+    // "sessions" here and "conversations" there would read as two different
+    // quantities rather than one counted twice.
     var sess = s.sessions || {};
-    var conv = byId('statConv');
-    conv.textContent = '';
-    conv.appendChild(el('span', 'mono', String(sess.active || 0)));
-    conv.appendChild(el('span', 'sub', 'active ·'));
-    conv.appendChild(el('span', 'mono', String(sess.known || 0)));
-    conv.appendChild(el('span', 'sub', 'known'));
+    byId('statConv').textContent = (sess.active || 0) + ' active · ' + (sess.known || 0) + ' known';
     byId('statUp').textContent = s.server && s.server.uptimeSeconds != null ? fmtIn(s.server.uptimeSeconds) : '—';
+    var accounts = s.accounts || [];
+    var enabled = accounts.filter(function (a) { return !a.disabled; }).length;
+    byId('statEnabled').textContent = enabled + ' of ' + accounts.length;
+  }
+
+  function setLive(ok) {
+    byId('liveDot').className = 'dot ' + (ok ? 'lime' : 'coral');
+    byId('liveText').textContent = ok ? 'Live' : 'Offline';
   }
 
   function render(s) {
@@ -2168,7 +2737,8 @@ ${SHARED_HELPERS}
     var thrInput = byId('thrVal');
     if (document.activeElement !== thrInput) thrInput.value = thresholdPercentText(s.switchThreshold);
     renderHeader(s);
-    renderStats(s);
+    renderHero(s);
+    renderStatusCard(s);
     var accounts = s.accounts || [];
     var enabled = accounts.filter(function (a) { return !a.disabled; }).length;
     byId('acctCount').textContent = accounts.length ? enabled + ' of ' + accounts.length + ' enabled' : '';
@@ -2176,26 +2746,69 @@ ${SHARED_HELPERS}
     acc.textContent = '';
     accounts.forEach(function (a, i) { acc.appendChild(renderAccount(a, i, s)); });
     renderProblems(s);
-    var hasClients = Object.keys(s.clients || {}).length > 0;
-    renderClientChart(s.clients);
-    renderSeries();
-    byId('usageRow').style.display = hasClients ? '' : 'none';
+    renderGroups(s);
+    renderHistory();
     var hasRoutes = renderRoutes(s);
-    var hasClientTable = renderClients(s.clients);
-    byId('tablesRow').style.display = hasRoutes || hasClientTable ? '' : 'none';
+    var hasClientList = renderClients(s.clients);
+    byId('tablesRow').style.display = hasRoutes || hasClientList ? '' : 'none';
+    byId('navRouting').style.display = hasRoutes ? '' : 'none';
+    byId('navClients').style.display = hasClientList ? '' : 'none';
     var hasDims = renderDimensions(s.usageDimensions);
-    // The window control sits with the charts. A fleet with dimensions but no
-    // client keys has no charts, and gets the control above its tables
-    // instead, since those tables are what it governs there.
-    var views = byId('usageViewWrap');
-    var dimSlot = byId('dimViewSlot');
-    (hasClients ? byId('clientChartViewSlot') : dimSlot).appendChild(views);
-    dimSlot.style.display = !hasClients && hasDims ? 'flex' : 'none';
+    // The window control governs the client views and the dimension tables;
+    // a fleet with neither has nothing for it to change.
+    byId('usageViewWrap').style.display = hasClients(s) || hasDims ? '' : 'none';
     renderSessions(s.sessions);
     if (settingsFor) renderSettings();
-    var foot = byId('foot');
-    foot.textContent = 'Refreshes every ' + (POLL_MS / 1000) + 's · last update ';
-    foot.appendChild(el('span', 'mono', new Date().toLocaleTimeString()));
+    byId('foot').textContent = 'Refreshes every ' + (POLL_MS / 1000) + 's · last update ' + new Date().toLocaleTimeString();
+    syncMsgs();
+    movePill();
+  }
+
+  // ── Section nav ──────────────────────────────────────────────────────────
+
+  function markNav(id) {
+    NAV.forEach(function (n) { byId(n[1]).className = n[0] === id ? 'sel' : ''; });
+  }
+
+  // The section nearest the top marks its pill as the page scrolls; the one
+  // clicked last wins a tie, and holds while the scroll it started runs.
+  function spy() {
+    if (!win || Date.now() < navHold) return;
+    var h = win.innerHeight || 800;
+    var line = h * 0.35;
+    var best = 'overview', bestTop = -Infinity, visible = [];
+    NAV.forEach(function (n) {
+      var e = byId(n[0]);
+      if (e.style.display === 'none' || typeof e.getBoundingClientRect !== 'function') return;
+      var r = e.getBoundingClientRect();
+      if (r.top < h && r.bottom > 0) visible.push(n[0]);
+      if (r.top > line) return;
+      if (r.top > bestTop + 2) { best = n[0]; bestTop = r.top; }
+      else if (Math.abs(r.top - bestTop) <= 2 && n[0] === navPicked) best = n[0];
+    });
+    // Scrolled as far as it goes, a short last section never reaches the line:
+    // the one asked for stands if it is on screen at all.
+    var doc = document.documentElement;
+    if (win.scrollY + h >= (doc.scrollHeight || 0) - 4 && visible.indexOf(navPicked) !== -1) best = navPicked;
+    markNav(best);
+  }
+
+  function onScroll() {
+    if (spyQueued || !raf) return;
+    spyQueued = true;
+    raf(function () { spyQueued = false; spy(); });
+  }
+
+  // The first status plays the entrance, once. The class comes off before the
+  // next poll rebuilds anything, so nothing replays it.
+  function showApp() {
+    var app = byId('app');
+    if (app.style.display === '') return;
+    app.style.display = '';
+    if (introDone) return;
+    introDone = true;
+    app.className = 'intro';
+    setTimeout(function () { app.className = ''; }, 1800);
   }
 
   // ── Controls ─────────────────────────────────────────────────────────────
@@ -2204,7 +2817,8 @@ ${SHARED_HELPERS}
     var n = byId('note');
     n.className = kind;
     n.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' · ' + text;
-    n.style.display = 'block';
+    n.style.display = 'flex';
+    syncMsgs();
     // An outcome of a change made from the settings dialog is shown in it too:
     // the page note is behind the dialog, where it would not be seen.
     if (settingsFor) {
@@ -2390,20 +3004,23 @@ ${SHARED_HELPERS}
       .then(function (s) {
         if (!s) return;
         byId('keybox').style.display = 'none';
-        byId('app').style.display = '';
+        showApp();
         byId('err').style.display = 'none';
+        setLive(true);
         render(s);
-        // The chart's history is only worth asking for when there is a client
-        // to chart; the Clients table is what says so.
-        if (Object.keys(s.clients || {}).length) pollSeries();
+        // The charts' history is only worth asking for when there is a client
+        // to chart; the Clients list is what says so.
+        if (hasClients(s)) pollSeries();
       })
       .catch(function (e) {
         var err = byId('err');
         err.style.display = 'flex';
         err.textContent = 'Cannot reach the proxy: ' + e.message;
+        setLive(false);
+        syncMsgs();
         // The banner lives inside #app, which stays hidden until a first
         // status lands; without this a first poll that fails is a blank page.
-        if (byId('keybox').style.display !== 'block') byId('app').style.display = '';
+        if (byId('keybox').style.display !== 'block') showApp();
       });
   }
 
@@ -2434,10 +3051,14 @@ ${SHARED_HELPERS}
   function applyTheme(theme) {
     if (theme === 'system') document.documentElement.removeAttribute('data-theme');
     else document.documentElement.setAttribute('data-theme', theme);
-    // Name the state, not the action: a button reading "Dark" while the page is
-    // light is the ambiguity every theme toggle has, and this one says where it
-    // is rather than where it would go.
-    byId('theme').textContent = theme === 'system' ? 'Theme: system' : theme === 'light' ? 'Theme: light' : 'Theme: dark';
+    // Name the state, not the action: an icon of a moon while the page is
+    // light is the ambiguity every theme toggle has, and this one shows where
+    // it is rather than where it would go.
+    var label = theme === 'system' ? 'Theme: system' : theme === 'light' ? 'Theme: light' : 'Theme: dark';
+    var btn = byId('theme');
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+    btn.setAttribute('data-mode', theme);
   }
   function storeTheme(theme) {
     try {
@@ -2456,13 +3077,31 @@ ${SHARED_HELPERS}
     applyTheme(theme);
   });
 
-  byId('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
+  byId('reload').addEventListener('click', function () {
+    reloadTurns++;
+    byId('reloadIcon').style.transform = 'rotate(' + reloadTurns * 360 + 'deg)';
+    doControl('/teamclaude/reload', 'config reload', this);
+  });
   byId('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
   byId('thrSet').addEventListener('click', function () { doThreshold(this); });
   byId('thrVal').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') byId('thrSet').click();
   });
   buildControls();
+  NAV.forEach(function (n) {
+    byId(n[1]).addEventListener('click', function () {
+      navPicked = n[0];
+      navHold = Date.now() + 900;
+      markNav(n[0]);
+    });
+  });
+  if (win && win.addEventListener) {
+    win.addEventListener('resize', movePill);
+    win.addEventListener('scroll', onScroll, { passive: true });
+  }
+  // The pill is measured in the page's own font, which may land after the
+  // first status does.
+  if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === 'function') document.fonts.ready.then(movePill);
   byId('addAcct').addEventListener('click', function () { doLoginStart(this); });
   byId('loginGo').addEventListener('click', function () { doLoginFinish(this); });
   byId('loginCode').addEventListener('keydown', function (e) {

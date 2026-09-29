@@ -6,7 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens,
-  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, seriesBars, seriesTicks,
+  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, smoothPath, heatGrid, seriesTicks,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
@@ -800,7 +800,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, seriesBars, seriesTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, smoothPath, heatGrid, seriesTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -935,22 +935,43 @@ test('a first poll that fails shows its error instead of a blank page', async ()
   assert.equal(page.byId('app').style.display, '');
 });
 
-test('the Most used chart draws a bar per client and switches measure without polling', async () => {
+test('the overview draws a column per client and switches measure without polling', async () => {
   const page = bootPage();
   await page.answer(200, { accounts: [], clients: {
     alice: { requests: 3, inputTokens: 10, outputTokens: 90 },
     bob: { requests: 9, inputTokens: 5, outputTokens: 5 },
   } });
   assert.equal(page.byId('clientChartWrap').style.display, '');
-  // Each client is named once by its bar and once by its table row.
+  // The busiest client leads, its figure and share on its own column.
+  assert.equal(page.byId('grp0Name').textContent, 'alice');
+  assert.equal(page.byId('grp0Val').textContent, '100 tok');
+  assert.equal(page.byId('grp0Pct').textContent, '91%');
+  assert.equal(page.byId('grp1Name').textContent, 'bob');
+  assert.equal(page.byId('grp2').style.display, 'none', 'two clients, two columns');
+  // The big figure is every client's traffic on the window.
+  assert.equal(page.byId('heroMain').textContent, '110');
+  assert.equal(page.byId('heroLabel').textContent, 'Tokens used');
+  // Named once by its column and once by its row in the Clients list.
   assert.equal(page.labelled('alice'), 2);
-  assert.equal(page.labelled('100 tok'), 1);
-  assert.equal(page.labelled(' · 91%'), 1);
   page.click('Requests');
   assert.equal(page.pending().length, 0, 'the measure re-renders the last status rather than fetching');
-  assert.equal(page.labelled('bob'), 2);
-  assert.equal(page.labelled('9 req'), 1);
-  assert.equal(page.labelled(' · 75%'), 1);
+  assert.equal(page.byId('grp0Name').textContent, 'bob');
+  assert.equal(page.byId('grp0Val').textContent, '9 req');
+  assert.equal(page.byId('grp0Pct').textContent, '75%');
+  assert.equal(page.byId('heroMain').textContent, '12');
+  assert.equal(page.byId('heroLabel').textContent, 'Requests served');
+});
+
+test('without client keys the overview shows what the accounts served, and says so', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [
+    { name: 'a', usage: { totalRequests: 4, totalInputTokens: 1000, totalOutputTokens: 200, totalCacheReadTokens: 800 } },
+    { name: 'b', usage: { totalRequests: 1, totalOutputTokens: 500 } },
+  ] });
+  assert.equal(page.byId('heroMain').textContent, '2');
+  assert.equal(page.byId('heroFrac').textContent, '.5k');
+  assert.equal(page.byId('heroLabel').textContent, 'Tokens served since start');
+  assert.equal(page.byId('usageViewWrap').style.display, 'none', 'nothing windowed for the control to change');
 });
 
 test('viewerCan mirrors the server: operator everything, tenant the nudges, readonly nothing', () => {
@@ -996,13 +1017,13 @@ test('an admin viewer gets every control', async () => {
   // bob is not current: its dialog offers the switch, and the account controls.
   page.clickTitled('Settings for bob@example.com');
   assert.equal(page.byId('settingsWrap').style.display, '', 'the dialog opens');
-  assert.equal(page.labelled('Switch to this'), 1);
+  assert.equal(page.labelled('Switch'), 1);
   assert.equal(page.labelled('Priority'), 1);
   assert.equal(page.labelled('Enabled'), 1);
   // alice is current: the dialog says so instead of offering to switch.
   page.clickTitled('Settings for alice@example.com');
   assert.equal(page.labelled('In use'), 1);
-  assert.equal(page.labelled('Switch to this'), 0);
+  assert.equal(page.labelled('Switch'), 0);
 });
 
 test('the settings dialog sends the switch, the priority steps and the toggle', async () => {
@@ -1013,7 +1034,7 @@ test('the settings dialog sends the switch, the priority steps and the toggle', 
     const r = page.pending().at(-1);
     return { url: r.url, body: JSON.parse(r.init.body) };
   };
-  page.click('Switch to this');
+  page.click('Switch');
   assert.deepEqual(sent(), { url: '/teamclaude/switch', body: { account: 'bob@example.com' } });
   await page.answer(200, { ok: true, account: 'bob@example.com', eligible: true });
   // The number, not a rank: rotation picks the lowest first, so + moves it later.
@@ -1033,8 +1054,8 @@ test('a disabled account\'s dialog offers to enable it, not to switch to it', as
   status.accounts[1].disabled = true;
   await page.answer(200, status);
   page.clickTitled('Settings for bob@example.com');
-  assert.equal(page.labelled('Switch to this'), 0);
-  assert.equal(page.labelled('Enable the account to switch to it'), 1);
+  assert.equal(page.labelled('Switch'), 0);
+  assert.equal(page.labelled('Enable it to switch'), 1);
   page.clickTitled('Enable bob@example.com');
   const r = page.pending().at(-1);
   assert.equal(r.url, '/teamclaude/disable');
@@ -1045,7 +1066,7 @@ test('a plain client key may switch from the dialog, and nothing more', async ()
   const page = bootPage();
   await page.answer(200, ROLE_STATUS({ client: 'alice', role: 'tenant' }));
   page.clickTitled('Settings for bob@example.com');
-  assert.equal(page.labelled('Switch to this'), 1);
+  assert.equal(page.labelled('Switch'), 1);
   assert.equal(page.labelled('Priority'), 0);
   assert.equal(page.labelled('Enabled'), 0);
 });
@@ -1208,13 +1229,14 @@ test('the theme button cycles system -> light -> dark and persists each step', (
   const click = () => page.byId('theme').fire('click');
   const stored = () => page.store.get('teamclaude-dashboard-theme');
 
-  assert.equal(page.byId('theme').textContent, 'Theme: system');
+  // An icon button: the state it names is its title (and its aria-label).
+  assert.equal(page.byId('theme').title, 'Theme: system');
   assert.equal(stored(), undefined, 'following the system stores nothing');
 
   click();
   assert.equal(page.rootAttrs.get('data-theme'), 'light');
   assert.equal(stored(), 'light');
-  assert.equal(page.byId('theme').textContent, 'Theme: light');
+  assert.equal(page.byId('theme').title, 'Theme: light');
 
   click();
   assert.equal(page.rootAttrs.get('data-theme'), 'dark');
@@ -1225,7 +1247,7 @@ test('the theme button cycles system -> light -> dark and persists each step', (
   click();
   assert.equal(page.rootAttrs.get('data-theme'), undefined);
   assert.equal(stored(), undefined);
-  assert.equal(page.byId('theme').textContent, 'Theme: system');
+  assert.equal(page.byId('theme').title, 'Theme: system');
 });
 
 test('a stored dark choice survives a reload', () => {
@@ -1236,7 +1258,7 @@ test('a stored dark choice survives a reload', () => {
   // A fresh page with that storage comes up dark without another click.
   const reloaded = bootPage({ storedTheme: first.store.get('teamclaude-dashboard-theme') });
   assert.equal(reloaded.rootAttrs.get('data-theme'), 'dark');
-  assert.equal(reloaded.byId('theme').textContent, 'Theme: dark');
+  assert.equal(reloaded.byId('theme').title, 'Theme: dark');
 });
 
 test('accountControlRequest picks the endpoint and body from the spec', () => {
@@ -1374,7 +1396,7 @@ test('selecting a window relabels every table it governs', async () => {
   });
 
   assert.equal(page.byId('clientsHeading').textContent, 'Clients');
-  assert.equal(page.labelled('Last used'), 2, 'both tables label the column plainly under Total');
+  assert.equal(page.labelled('Last used'), 1, 'the dimension table labels the column plainly under Total');
   assert.equal(page.labelled('Project'), 2, 'the dimension heading and its first column');
 
   page.click('Last 24h');
@@ -1383,11 +1405,13 @@ test('selecting a window relabels every table it governs', async () => {
   // once the control itself is scrolled out of view.
   assert.equal(page.byId('clientsHeading').textContent, 'Clients · last 24h');
   assert.equal(page.labelled('Project · last 24h'), 1, 'the dimension table names the window too');
-  assert.equal(page.labelled('Last used (all time)'), 2, 'and the one lifetime column says so');
+  assert.equal(page.labelled('Last used (all time)'), 1, 'and the one lifetime column says so');
   assert.equal(page.labelled('Last used'), 0);
+  assert.equal(page.byId('rangeStart').textContent, '24 hours ago', 'the overview names where its span starts');
 
   page.click('Total');
   assert.equal(page.byId('clientsHeading').textContent, 'Clients', 'and back again');
+  assert.equal(page.byId('rangeStart').textContent, 'All time');
 });
 
 // ── Usage over time ─────────────────────────────────────────
@@ -1407,51 +1431,137 @@ const SERIES = {
   },
 };
 
-test('seriesBars stacks the two biggest clients and folds the rest into others', () => {
-  const chart = seriesBars(SERIES, '24h', 'tokens');
-  assert.equal(chart.bars.length, 24);
-  assert.deepEqual(chart.legend, ['alice', 'bob'], 'ranked by tokens over the shown range');
-  assert.equal(chart.hasOthers, true);
-  const last = chart.bars[23];
-  assert.deepEqual(last.parts, [120, 10]);
-  assert.equal(last.others, 3);
-  assert.equal(last.total, 133);
+test('seriesLines draws the busiest client against everyone else, an hour a point', () => {
+  const lines = seriesLines(SERIES, '24h', 'tokens', null);
+  assert.equal(lines.points.length, 24);
+  assert.equal(lines.main, 'alice', 'no signed-in client: the busiest over the span');
+  assert.equal(lines.hasOther, true);
+  const last = lines.points[23];
+  assert.deepEqual([last.main, last.other], [120, 13]);
   assert.equal(last.end, END);
   assert.equal(last.start, END - HOUR);
-  assert.equal(chart.bars[0].start, END - 24 * HOUR);
-  assert.equal(chart.peak, 133);
-  assert.equal(chart.total, 120 + 50 + 10 + 30 + 7 + 3);
-  assert.equal(chart.spanMs, 24 * HOUR);
+  assert.equal(lines.points[0].start, END - 24 * HOUR);
+  assert.equal(lines.peak, 120);
+  assert.equal(lines.peakAt, 23, "the marked hour is the main client's busiest");
+  assert.equal(lines.total, 120 + 50 + 10 + 30 + 7 + 3);
+  assert.equal(lines.last, 133, 'the newest hour, everyone in it');
+  assert.equal(lines.spanMs, 24 * HOUR);
 });
 
-test('seriesBars shows the last five hours for 5h, and Total as the whole day', () => {
-  const five = seriesBars(SERIES, '5h', 'tokens');
-  assert.equal(five.bars.length, 5);
-  assert.equal(five.bars[0].start, END - 5 * HOUR);
-  // alice's bucket 10 is outside the five hours, so it does not count toward her rank.
+test('seriesLines follows the signed-in client when it spent anything, and not otherwise', () => {
+  const mine = seriesLines(SERIES, '24h', 'tokens', 'bob');
+  assert.equal(mine.main, 'bob');
+  assert.deepEqual([mine.points[20].main, mine.points[20].other], [30, 0]);
+  assert.deepEqual([mine.points[23].main, mine.points[23].other], [10, 123]);
+  // A viewer with nothing in the span would draw a flat line: the busiest leads instead.
+  assert.equal(seriesLines(SERIES, '24h', 'tokens', 'nobody').main, 'alice');
+});
+
+test('seriesLines shows the last five hours for 5h, and Total as the whole day', () => {
+  const five = seriesLines(SERIES, '5h', 'tokens', null);
+  assert.equal(five.points.length, 5);
+  assert.equal(five.points[0].start, END - 5 * HOUR);
+  // alice's bucket 10 is outside the five hours, so it does not count toward the span.
   assert.equal(five.total, 120 + 10 + 30 + 7 + 3);
-  assert.deepEqual(seriesBars(SERIES, 'total', 'tokens').bars.length, 24);
+  assert.equal(seriesLines(SERIES, 'total', 'tokens', null).points.length, 24);
 });
 
-test('seriesBars ranks and sums by requests when asked', () => {
-  const chart = seriesBars(SERIES, '24h', 'requests');
-  assert.deepEqual(chart.legend, ['bob', 'alice']);
-  assert.deepEqual(chart.bars[23].parts, [5, 2]);
-  assert.equal(chart.bars[23].others, 1);
-  assert.equal(chart.total, 2 + 1 + 5 + 1 + 1);
+test('seriesLines ranks and sums by requests when asked', () => {
+  const lines = seriesLines(SERIES, '24h', 'requests', null);
+  assert.equal(lines.main, 'bob');
+  assert.deepEqual([lines.points[23].main, lines.points[23].other], [5, 3]);
+  assert.equal(lines.total, 2 + 1 + 5 + 1 + 1);
 });
 
-test('seriesBars tolerates nothing to draw', () => {
+test('seriesLines tolerates nothing to draw', () => {
   for (const series of [null, {}, { buckets: 0, clients: {} }]) {
-    const chart = seriesBars(series, '24h', 'tokens');
-    assert.deepEqual(chart.bars, []);
-    assert.equal(chart.total, 0);
-    assert.deepEqual(chart.legend, []);
+    const lines = seriesLines(series, '24h', 'tokens', null);
+    assert.deepEqual(lines.points, []);
+    assert.equal(lines.total, 0);
+    assert.equal(lines.main, null);
+    assert.equal(lines.peakAt, -1);
+    assert.equal(lines.last, 0);
   }
-  const quiet = seriesBars({ ...SERIES, clients: { alice: { requests: hourly([]), inputTokens: hourly([]), outputTokens: hourly([]) } } }, '24h', 'tokens');
-  assert.equal(quiet.bars.length, 24, 'a quiet day still has its hours');
-  assert.deepEqual(quiet.legend, [], 'and names nobody');
-  assert.equal(quiet.hasOthers, false);
+  const quiet = seriesLines({ ...SERIES, clients: { alice: { requests: hourly([]), inputTokens: hourly([]), outputTokens: hourly([]) } } }, '24h', 'tokens', null);
+  assert.equal(quiet.points.length, 24, 'a quiet day still has its hours');
+  assert.equal(quiet.main, null, 'and names nobody');
+  assert.equal(quiet.hasOther, false);
+});
+
+test('smoothPath passes through every point and never dips below the floor', () => {
+  const d = smoothPath([[0, 165], [100, 15], [200, 165], [300, 165]], 165);
+  assert.match(d, /^M0,165 C/);
+  // Each segment ends on the next point.
+  assert.deepEqual(d.match(/ (\d+(?:\.\d+)?),(\d+(?:\.\d+)?)(?= C|$)/g).map(x => x.trim()), ['100,15', '200,165', '300,165']);
+  const ys = [...d.matchAll(/,(-?\d+(?:\.\d+)?)/g)].map(m => Number(m[1]));
+  assert.ok(ys.every(y => y <= 165), 'no control point below the baseline');
+  assert.equal(smoothPath([]), '');
+  assert.equal(smoothPath([[5, 5]]), 'M5,5');
+});
+
+test('clientGroups gives the two busiest a column each and folds the rest', () => {
+  const ranking = [
+    { name: 'a', value: 600 }, { name: 'b', value: 200 }, { name: 'c', value: 100 },
+    { name: 'd', value: 100 }, { name: 'idle', value: 0 },
+  ];
+  const g = clientGroups(ranking);
+  assert.deepEqual(g.groups.map(x => [x.name, x.value]), [['a', 600], ['b', 200], ['others', 200]]);
+  assert.deepEqual(g.groups[2].members, ['c', 'd']);
+  assert.equal(g.groups[2].others, true);
+  assert.equal(g.total, 1000);
+  assert.equal(g.groups[0].share, 0.6);
+  assert.equal(g.groups[0].lift, 1);
+  assert.equal(g.groups[1].lift, 200 / 600);
+  assert.ok(g.groups[0].grow > g.groups[1].grow, 'a bigger share, a wider column');
+  // The idle client neither takes a column nor pulls the average down.
+  assert.equal(g.clients, 4);
+  assert.equal(g.average, 250);
+  assert.equal(g.averageLift, 250 / 600);
+});
+
+test('clientGroups never folds a single client', () => {
+  // Three clients are three columns: an "others" of one would only hide a name.
+  const three = clientGroups([{ name: 'a', value: 3 }, { name: 'b', value: 2 }, { name: 'c', value: 1 }]);
+  assert.deepEqual(three.groups.map(x => x.name), ['a', 'b', 'c']);
+  assert.ok(three.groups.every(x => !x.others));
+  const none = clientGroups([{ name: 'a', value: 0 }]);
+  assert.deepEqual(none.groups, []);
+  assert.equal(none.average, 0);
+  assert.equal(none.averageLift, 0);
+  assert.deepEqual(clientGroups(null).groups, []);
+});
+
+test('heatGrid lays clients against four-hour stretches of the day', () => {
+  const g = heatGrid(SERIES, '24h', 'tokens');
+  assert.equal(g.columns.length, 6);
+  assert.deepEqual(g.columns[0], { start: END - 24 * HOUR, end: END - 20 * HOUR });
+  assert.deepEqual(g.columns[5], { start: END - 4 * HOUR, end: END });
+  assert.deepEqual(g.rows.map(r => r.name), ['alice', 'bob', 'carol', 'dave'], 'busiest first');
+  // alice: 50 in bucket 10 (column 2), 120 in bucket 23 (column 5).
+  assert.deepEqual(g.rows[0].cells.map(c => c.value), [0, 0, 50, 0, 0, 120]);
+  assert.equal(g.max, 120);
+  // Shades by quarters of the root of the share of the busiest cell (50/120
+  // is 0.65 of the way up); nothing is 0, the faintest filled cell 1.
+  assert.deepEqual(g.rows[0].cells.map(c => c.level), [0, 0, 3, 0, 0, 4]);
+  // bob's 40 in the last stretch is a third of alice's 120: a linear scale
+  // would shade it 2, the root lifts it clear of the faint end.
+  assert.equal(g.rows[1].cells[5].value, 40);
+  assert.equal(g.rows[1].cells[5].level, 3);
+  assert.equal(g.rows[3].cells[5].level, 1, 'dave\'s 3 tokens are faint, not empty');
+});
+
+test('heatGrid gives five hours a column each, and folds a seventh client into others', () => {
+  const five = heatGrid(SERIES, '5h', 'requests');
+  assert.equal(five.columns.length, 5);
+  assert.deepEqual(five.columns[4], { start: END - HOUR, end: END });
+  assert.deepEqual(five.rows.map(r => r.name), ['bob', 'alice', 'carol', 'dave']);
+  const clients = {};
+  for (let i = 0; i < 7; i++) clients['c' + i] = { requests: hourly([[23, 10 - i]]), inputTokens: hourly([]), outputTokens: hourly([]) };
+  const many = heatGrid({ ...SERIES, clients }, '24h', 'requests');
+  assert.deepEqual(many.rows.map(r => r.name), ['c0', 'c1', 'c2', 'c3', 'c4', 'others']);
+  assert.deepEqual(many.rows[5].members, ['c5', 'c6']);
+  assert.equal(many.rows[5].cells[5].value, 5 + 4);
+  assert.deepEqual(heatGrid(null, '24h', 'tokens').rows, []);
 });
 
 test('seriesTicks label the axis the way the design does', () => {
@@ -1473,8 +1583,11 @@ test('meterTone bands a meter on the legend\'s thresholds', () => {
 test('the chart helpers run inside the serialized bundle', () => {
   const script = inlineScripts(renderDashboardHtml()).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
-  const isolated = new Function(`${bundle}; return { seriesBars, seriesTicks, meterTone };`)();
-  assert.deepEqual(isolated.seriesBars(SERIES, '5h', 'requests'), seriesBars(SERIES, '5h', 'requests'));
+  const isolated = new Function(`${bundle}; return { clientGroups, seriesLines, smoothPath, heatGrid, seriesTicks, meterTone };`)();
+  assert.deepEqual(isolated.seriesLines(SERIES, '5h', 'requests', 'alice'), seriesLines(SERIES, '5h', 'requests', 'alice'));
+  assert.deepEqual(isolated.heatGrid(SERIES, '24h', 'tokens'), heatGrid(SERIES, '24h', 'tokens'));
+  assert.deepEqual(isolated.clientGroups([{ name: 'a', value: 2 }]), clientGroups([{ name: 'a', value: 2 }]));
+  assert.equal(isolated.smoothPath([[0, 1], [2, 3]], 5), smoothPath([[0, 1], [2, 3]], 5));
   assert.deepEqual(isolated.seriesTicks(24 * HOUR), seriesTicks(24 * HOUR));
   assert.equal(isolated.meterTone(0.7), 'warn');
 });
@@ -1483,41 +1596,60 @@ test('a status with a client fetches the usage series and draws it', async () =>
   const page = bootPage();
   await page.answer(200, { accounts: [], clients: { alice: { requests: 3, inputTokens: 150, outputTokens: 20 } } });
   const req = page.requests.find(r => r.url === '/teamclaude/usage/series');
-  assert.ok(req, 'the chart asks for its history');
+  assert.ok(req, 'the charts ask for their history');
   assert.equal(req.init.headers['x-api-key'], '', 'with the same key as the status poll');
   assert.equal(page.byId('seriesWrap').style.display, '');
-  assert.equal(page.byId('seriesTotal').textContent, '—', 'nothing to total before the history lands');
+  assert.equal(page.byId('heatWrap').style.display, '');
+  assert.equal(page.byId('seriesEmpty').textContent, 'Loading usage history…', 'nothing to draw before the history lands');
+  assert.equal(page.byId('heroDelta').style.display, 'none');
   await page.answerSeries(SERIES);
-  assert.equal(page.byId('seriesTotal').textContent, '220 tok');
-  assert.equal(page.byId('seriesCaption').textContent, 'Tokens · last 24h, hourly');
-  assert.equal(page.labelled('others'), 1, 'the legend names the fold');
+  assert.equal(page.byId('seriesEmpty').style.display, 'none');
+  assert.equal(page.byId('seriesCaption').textContent, 'Tokens / hour · last 24h');
+  assert.equal(page.byId('peakMain').textContent, '120 tok', "the marked hour, the main client's share of it");
+  assert.equal(page.byId('peakOther').textContent, '13 tok', "and everyone else's");
+  assert.equal(page.labelled('everyone else'), 1, 'the legend names the fold');
+  assert.equal(page.byId('heroDelta').textContent, '+133 last hour');
+  assert.equal(page.byId('heatTitle').textContent, 'Tokens by time');
   page.click('Last 5h');
-  assert.equal(page.byId('seriesCaption').textContent, 'Tokens · last 5h, hourly', 'the window control redraws it');
+  assert.equal(page.byId('seriesCaption').textContent, 'Tokens / hour · last 5h', 'the window control redraws it');
   assert.equal(page.labelled('-5h'), 1);
   page.click('Requests');
-  assert.equal(page.byId('seriesTotal').textContent, '9 req');
+  assert.equal(page.byId('peakMain').textContent, '5 req');
+  assert.equal(page.byId('heatTitle').textContent, 'Requests by time');
   assert.equal(page.pending().length, 0, 'redrawn from the fetched series, not re-fetched');
+});
+
+test('the usage chart follows the client the page is signed in as', async () => {
+  const page = bootPage();
+  await page.answer(200, { viewer: { client: 'bob', role: 'tenant' }, accounts: [], clients: { bob: { requests: 5, inputTokens: 10, outputTokens: 30 } } });
+  await page.answerSeries(SERIES);
+  // alice is the busier client of the day (the unsigned-in chart leads with
+  // her 120), but the page is bob's: his line, marked at his busiest hour.
+  assert.equal(page.byId('peakMain').textContent, '30 tok', "bob's busiest hour");
+  assert.equal(page.byId('peakOther').textContent, '0 tok', 'when nobody else was busy');
 });
 
 test('a series that fails to load says so in the chart', async () => {
   const page = bootPage();
   await page.answer(200, { accounts: [], clients: { alice: { requests: 1 } } });
   await page.answerSeries({}, 500);
-  assert.equal(page.labelled('Usage history unavailable: status 500'), 1);
+  assert.equal(page.byId('seriesEmpty').textContent, 'Usage history unavailable: status 500');
+  assert.equal(page.byId('heatEmpty').textContent, 'History unavailable');
 });
 
 test('no client, no chart and no series fetch', async () => {
   const page = bootPage();
   await page.answer(200, { accounts: [] });
   assert.equal(page.byId('seriesWrap').style.display, 'none');
-  assert.equal(page.byId('usageRow').style.display, 'none');
+  assert.equal(page.byId('heatWrap').style.display, 'none');
+  assert.equal(page.byId('clientChartWrap').style.display, 'none');
   assert.equal(page.requests.some(r => r.url === '/teamclaude/usage/series'), false);
 });
 
 test('the page embeds its fonts, and the policy admits only those', () => {
   const html = renderDashboardHtml();
-  assert.match(html, /@font-face \{ font-family: 'Geist'; src: url\(data:font\/woff2;base64,/);
-  assert.match(html, /@font-face \{ font-family: 'Geist Mono'; src: url\(data:font\/woff2;base64,/);
+  assert.match(html, /@font-face \{ font-family: 'DM Sans'; src: url\(data:font\/woff2;base64,/);
+  assert.match(html, /@font-face \{ font-family: 'DM Mono'; src: url\(data:font\/woff2;base64,/);
   assert.doesNotMatch(html, /fonts\.googleapis|fonts\.gstatic/);
   assert.match(dashboardCsp(), /(^|; )font-src data:(;|$)/);
 });
