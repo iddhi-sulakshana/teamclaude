@@ -67,6 +67,9 @@ import {
   upsertRoute,
   setAccountDisabled,
   setAccountPriority,
+  addClientKey,
+  removeClientKey,
+  setClientKeyRole,
 } from './config-ops.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -687,6 +690,30 @@ async function serverCommand() {
     /** @type {{ name: string, disabled: boolean }|undefined} */
     let result;
     await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountDisabled(diskConfig, account, disabled, spec); });
+    return result;
+  };
+
+  // The dashboard's Users card (POST /teamclaude/users/{add,remove,role}), the
+  // same way: the op under the config lock, the reload left to the endpoint.
+  // The reload copies proxy.clientKeys into the running config, which both
+  // auth gates read per request, so a new key works and a removed one stops
+  // working as soon as the call returns.
+  hooks.addUser = async (/** @type {any} */ spec) => {
+    /** @type {{ name: string, role: string, key: string }|undefined} */
+    let result;
+    await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = addClientKey(diskConfig, spec); });
+    return result;
+  };
+  hooks.removeUser = async (/** @type {string} */ name, /** @type {any} */ spec) => {
+    /** @type {{ name: string, removed: number }|undefined} */
+    let result;
+    await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = removeClientKey(diskConfig, name, spec); });
+    return result;
+  };
+  hooks.setUserRole = async (/** @type {string} */ name, /** @type {unknown} */ role, /** @type {any} */ spec) => {
+    /** @type {{ name: string, role: string }|undefined} */
+    let result;
+    await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setClientKeyRole(diskConfig, name, role, spec); });
     return result;
   };
 

@@ -10,7 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
-  usageFor, USAGE_VIEWS, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
+  usageFor, USAGE_VIEWS, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 import { normalizeSpend } from '../src/oauth.js';
@@ -813,7 +813,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -1180,6 +1180,151 @@ test('Add account is not offered to a read-only viewer', async () => {
   await page.answer(200, ROLE_STATUS({ client: 'watcher', role: 'readonly' }));
   assert.equal(page.byId('addAcct').style.display, 'none');
   assert.equal(page.byId('loginWrap').style.display, 'none');
+});
+
+// ── Users card ───────────────────────────────────────────────────────────────
+
+test('userRequest posts each user change with the key, and only the fields it names', () => {
+  const add = userRequest('add', { name: ' dave ', role: 'readonly' }, 'tc-k');
+  assert.equal(add.url, '/teamclaude/users/add');
+  assert.equal(add.init.method, 'POST');
+  assert.equal(add.init.headers['x-api-key'], 'tc-k');
+  assert.deepEqual(JSON.parse(add.init.body), { name: 'dave', role: 'readonly' }, 'the typed name is trimmed');
+  const rm = userRequest('remove', { name: 'bob', role: 'admin' }, null);
+  assert.equal(rm.url, '/teamclaude/users/remove');
+  assert.deepEqual(JSON.parse(rm.init.body), { name: 'bob' });
+  assert.equal(rm.init.headers['x-api-key'], '');
+  const role = userRequest('role', { name: 'bob', role: 'admin' }, 'tc-k');
+  assert.equal(role.url, '/teamclaude/users/role');
+  assert.deepEqual(JSON.parse(role.init.body), { name: 'bob', role: 'admin' });
+});
+
+test('userOutcome names what changed, or why it did not', () => {
+  assert.deepEqual(userOutcome('add', { ok: true, name: 'dave', role: 'tenant', key: 'tc-x' }), { kind: 'ok', text: 'added user dave' });
+  assert.deepEqual(userOutcome('remove', { ok: true, name: 'bob', removed: 1 }), { kind: 'ok', text: 'removed user bob' });
+  assert.deepEqual(userOutcome('role', { ok: true, name: 'bob', role: 'readonly' }), { kind: 'ok', text: 'bob is now read-only' });
+  assert.deepEqual(userOutcome('role', { ok: true, name: 'bob', role: 'tenant' }), { kind: 'ok', text: 'bob is now a user' });
+  assert.deepEqual(userOutcome('remove', { ok: false, error: 'There is no user named "zed".' }),
+    { kind: 'error', text: 'removing the user failed: There is no user named "zed".' });
+  assert.equal(userOutcome('add', null).kind, 'error');
+  assert.ok(!userOutcome('add', { ok: true, name: 'dave', key: 'tc-secret' }).text.includes('tc-secret'), 'the note never carries the key');
+});
+
+test('viewerCan keeps users to the operator', () => {
+  assert.equal(viewerCan({ role: 'operator' }, 'users'), true);
+  assert.equal(viewerCan({ role: 'tenant' }, 'users'), false);
+  assert.equal(viewerCan({ role: 'readonly' }, 'users'), false);
+});
+
+const USERS_STATUS = viewer => ({
+  ...ROLE_STATUS(viewer),
+  users: [
+    { name: 'alice', role: 'admin' },
+    { name: 'bob', role: 'tenant' },
+    { name: 'carol', role: 'readonly' },
+  ],
+});
+
+test('the Users card lists every user for an operator, and is hidden from everyone else', async () => {
+  const op = bootPage();
+  await op.answer(200, USERS_STATUS({ client: null, role: 'operator' }));
+  assert.equal(op.byId('userAdminSec').style.display, '');
+  assert.ok(op.byId('addUser').listens('click'), 'Add user sits in the card and is wired');
+  for (const n of ['alice', 'bob', 'carol']) assert.equal(op.titled(`Remove ${n}`), 1, n);
+  assert.equal(op.labelled('3 users'), 1);
+
+  for (const role of ['tenant', 'readonly']) {
+    const page = bootPage();
+    // A server never sends `users` to these; the card must not rely on that.
+    await page.answer(200, USERS_STATUS({ client: 'bob', role }));
+    assert.equal(page.byId('userAdminSec').style.display, 'none', role);
+    assert.equal(page.titled('Remove carol'), 0, role);
+  }
+});
+
+test('an admin is not offered removing or demoting their own key', async () => {
+  const page = bootPage();
+  await page.answer(200, USERS_STATUS({ client: 'alice', role: 'operator' }));
+  assert.equal(page.titled('Remove alice'), 0);
+  assert.equal(page.titled('Make alice read-only'), 0);
+  assert.equal(page.titled('Remove bob'), 1);
+  assert.equal(page.titled('Make bob admin'), 1);
+});
+
+test('Add user: the key is shown once, and gone when the dialog closes', async () => {
+  const page = bootPage({ storedKey: 'tc-admin' });
+  await page.answer(200, USERS_STATUS({ client: null, role: 'operator' }));
+  page.byId('addUser').fire('click');
+  assert.equal(page.byId('userWrap').style.display, '', 'the dialog opens');
+  assert.equal(page.byId('userForm').style.display, '');
+  assert.equal(page.byId('userKeyWrap').style.display, 'none');
+
+  page.byId('userNameIn').value = ' dave ';
+  page.clickTitled('New user role: Read-only');
+  page.byId('userGo').fire('click');
+  const req = page.requests.at(-1);
+  assert.equal(req.url, '/teamclaude/users/add');
+  assert.equal(req.init.headers['x-api-key'], 'tc-admin');
+  assert.deepEqual(JSON.parse(req.init.body), { name: 'dave', role: 'readonly' });
+
+  await page.answer(200, { ok: true, name: 'dave', role: 'readonly', key: 'tc-dave-secret' });
+  assert.equal(page.byId('userForm').style.display, 'none');
+  assert.equal(page.byId('userKeyWrap').style.display, '', 'the key view replaces the form');
+  assert.equal(page.byId('userKey').value, 'tc-dave-secret');
+  assert.match(page.byId('userNote').textContent, /won.t be shown again/);
+  assert.match(page.byId('note').textContent, /added user dave/);
+  assert.ok(!page.byId('note').textContent.includes('tc-dave-secret'));
+
+  page.byId('userDone').fire('click');
+  assert.equal(page.byId('userWrap').style.display, 'none');
+  assert.equal(page.byId('userKey').value, '', 'the key does not stay in the page');
+});
+
+test('Add user: a refused name keeps the form open with the reason', async () => {
+  const page = bootPage();
+  await page.answer(200, USERS_STATUS({ client: null, role: 'operator' }));
+  page.byId('addUser').fire('click');
+  page.byId('userNameIn').value = 'bob';
+  page.byId('userGo').fire('click');
+  await page.answer(400, { ok: false, error: 'There is already a user named "bob".' });
+  assert.equal(page.byId('userWrap').style.display, '');
+  assert.equal(page.byId('userForm').style.display, '');
+  assert.equal(page.byId('userNote').className, 'error');
+  assert.match(page.byId('userNote').textContent, /already a user named "bob"/);
+
+  // An empty name never leaves the page.
+  const before = page.requests.length;
+  page.byId('userNameIn').value = '   ';
+  page.byId('userGo').fire('click');
+  assert.equal(page.requests.length, before);
+  assert.match(page.byId('userNote').textContent, /name/);
+});
+
+test('Remove asks once more before it sends', async () => {
+  const page = bootPage();
+  await page.answer(200, USERS_STATUS({ client: null, role: 'operator' }));
+  const before = page.requests.length;
+  page.clickTitled('Remove bob');
+  assert.equal(page.requests.length, before, 'the first click only asks');
+  assert.equal(page.labelled('Confirm'), 1);
+  page.clickTitled('Remove bob');
+  const req = page.requests.at(-1);
+  assert.equal(req.url, '/teamclaude/users/remove');
+  assert.deepEqual(JSON.parse(req.init.body), { name: 'bob' });
+  await page.answer(200, { ok: true, name: 'bob', removed: 1 });
+  assert.match(page.byId('note').textContent, /removed user bob/);
+  assert.equal(page.pending().at(-1).url, '/teamclaude/status', 'the list is refreshed from the server');
+});
+
+test('a role button sends the change, and a refusal is shown', async () => {
+  const page = bootPage();
+  await page.answer(200, USERS_STATUS({ client: null, role: 'operator' }));
+  page.clickTitled('Make bob admin');
+  const req = page.requests.at(-1);
+  assert.equal(req.url, '/teamclaude/users/role');
+  assert.deepEqual(JSON.parse(req.init.body), { name: 'bob', role: 'admin' });
+  await page.answer(400, { ok: false, error: 'There is no user named "bob".' });
+  assert.match(page.byId('note').textContent, /changing the role failed/);
 });
 
 test('the Most used chart stays hidden until a client key has been used', async () => {

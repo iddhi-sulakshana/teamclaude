@@ -408,7 +408,41 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // Adding an account puts a new credential into the config file.
   ['/teamclaude/login/start', 'a client key cannot change accounts'],
   ['/teamclaude/login/finish', 'a client key cannot change accounts'],
+  // A user is a credential: adding one mints a key, and a role is what it may do.
+  ['/teamclaude/users/add', 'a client key cannot change users'],
+  ['/teamclaude/users/remove', 'a client key cannot change users'],
+  ['/teamclaude/users/role', 'a client key cannot change users'],
 ]);
+
+// The user endpoints: the hook each calls, and its log line. The line is built
+// from named fields only, so the key an add returns cannot end up in it.
+/** @type {Map<string, { hook: string, said: (r: any) => string }>} */
+const USER_OPS = new Map([
+  ['/teamclaude/users/add', { hook: 'addUser', said: r => `Added user "${r.name}" (${r.role})` }],
+  ['/teamclaude/users/remove', { hook: 'removeUser', said: r => `Removed user "${r.name}"` }],
+  ['/teamclaude/users/role', { hook: 'setUserRole', said: r => `Set role of user "${r.name}" to ${r.role}` }],
+]);
+
+/**
+ * The configured users as the dashboard's Users card lists them: one row per
+ * name, with the role the gate gives it, and never a key. A name listed more
+ * than once shows the lowest role any of its entries has, which is what the
+ * admin-model gate (isAdminCaller) already does for such a name.
+ * @param {any} proxyConfig
+ * @returns {{ name: string, role: 'tenant'|'admin'|'readonly' }[]}
+ */
+function configuredUsers(proxyConfig) {
+  const rank = { readonly: 0, tenant: 1, admin: 2 };
+  /** @type {Map<string, 'tenant'|'admin'|'readonly'>} */
+  const byName = new Map();
+  for (const entry of Array.isArray(proxyConfig?.clientKeys) ? usableClientKeys(proxyConfig.clientKeys) : []) {
+    const name = entry.name.trim();
+    const role = clientKeyRole(entry) ?? 'tenant';
+    const seen = byName.get(name);
+    if (!seen || rank[role] < rank[seen]) byName.set(name, role);
+  }
+  return [...byName].map(([name, role]) => ({ name, role }));
+}
 
 /**
  * @param {any} accountManager
@@ -603,7 +637,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // dashboard can leave out the controls this caller would be refused
         // rather than offer buttons that only ever answer 403.
         const viewer = { client: req.tcClient || null, role: who };
-        res.end(JSON.stringify({ ...extra, ...status, viewer, upstreamPool: upstreamPoolStatus() }, null, 2));
+        // Who holds a key is the operator's to see: a tenant is not shown the
+        // other tenants, only the usage the status already books to them.
+        const users = who === 'operator' ? { users: configuredUsers(config.proxy) } : {};
+        res.end(JSON.stringify({ ...extra, ...status, ...users, viewer, upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -790,6 +827,66 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         console.log(`[TeamClaude] ${result.action === 'updated' ? 'Signed in again' : 'Added account'} "${result.name}" (dashboard${req.tcClient ? `, by ${req.tcClient}` : ''})`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, action: result.action, name: result.name }));
+        return;
+      }
+
+      // Users (proxy.clientKeys): add, remove, and change a role, from the
+      // dashboard's Users card. Operator only, like the account controls: a
+      // tenant key is refused by CLIENT_KEY_REFUSED_PATHS and a readonly one by
+      // the prefix rule before either reaches here. The caller's own name goes
+      // to the hook as `actor`, so an admin key cannot remove or demote itself.
+      // An added user's key is in the reply and nowhere else — not the log,
+      // not status — so the reply is the one chance to copy it.
+      const userOp = req.method === 'POST' ? USER_OPS.get(url) : undefined;
+      if (userOp) {
+        if (!hooks[userOp.hook] || !hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'changing users is not supported by this server' }));
+          return;
+        }
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}') ?? {};
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof body.name !== 'string' || !body.name.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "name"' }));
+          return;
+        }
+        const actor = req.tcClient || null;
+        let result;
+        try {
+          result = url === '/teamclaude/users/add'
+            ? await hooks.addUser({ name: body.name, role: body.role })
+            : url === '/teamclaude/users/remove'
+              ? await hooks.removeUser(body.name, { actor })
+              : await hooks.setUserRole(body.name, body.role, { actor });
+        } catch (err) {
+          const known = err instanceof ConfigOpError;
+          const message = /** @type {Error} */ (err).message;
+          if (!known) console.error('[TeamClaude] User change failed:', message);
+          res.writeHead(known ? 400 : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: known ? message : 'user change failed; see the proxy log' }));
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after a user change failed:', /** @type {Error} */ (err).message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' }));
+          return;
+        }
+        // Never silent, and never the key: a credential entering or leaving
+        // the config is what an operator reading the log afterwards looks for.
+        console.log(`[TeamClaude] ${userOp.said(result)} (dashboard${actor ? `, by ${actor}` : ''})`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ...result }));
         return;
       }
 
