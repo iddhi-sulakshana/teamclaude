@@ -244,18 +244,17 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   return badges;
 }
 
-// The account card's money line: what extra usage (paid overage) has cost this
-// month, against upstream's monthly limit and the operator's `maxSpend`, or
-// null when the account cannot bill and has billed nothing. The same rule and
-// the same figures as the `Spend` line of `teamclaude status` (spendLine), and
-// likewise a line of text rather than another quota bar: past the plan this is
-// money, not an allowance that runs out. `bad` once it has billed, `warn` while
-// it only can — or did, and has since been switched off.
+// Extra usage (paid overage) in words: what it has cost this month, against
+// upstream's monthly limit and the operator's `maxSpend`, and whether it can
+// still bill. Null when the account cannot bill and has billed nothing — the
+// same rule and the same figures as the `Spend` line of `teamclaude status`
+// (spendLine). The card's Extra bar carries this as its tooltip, since the
+// bar's own value column has room for the amount and nothing else.
 /**
  * @param {Record<string, any>|null|undefined} account
- * @returns {{ kind: string, text: string }|null}
+ * @returns {string|null}
  */
-export function extraUsageLine(account) {
+export function extraUsageText(account) {
   var a = account || {};
   var spend = (a.quota || {}).spend;
   if (!spend) return null;
@@ -266,16 +265,44 @@ export function extraUsageLine(account) {
   var cap = capMinor == null ? ''
     : ', cap ' + formatMoney({ currency: spend.currency, exponent: spend.exponent, usedMinor: capMinor, limitMinor: null });
   if (spend.enabled) {
-    if (spendCapReached(a.maxSpend, spend)) return { kind: 'bad', text: 'extra usage: spend cap reached — ' + amount + ' used this month' + cap };
-    if (spent) return { kind: 'bad', text: 'extra usage: billing — ' + amount + ' used this month' + cap };
-    return { kind: 'warn', text: 'extra usage: can bill past plan limits — ' + amount + ' used this month' + cap };
+    if (spendCapReached(a.maxSpend, spend)) return 'Extra usage: spend cap reached — ' + amount + ' used this month' + cap;
+    if (spent) return 'Extra usage: billing — ' + amount + ' used this month' + cap;
+    return 'Extra usage: can bill past plan limits — ' + amount + ' used this month' + cap;
   }
   // Off now, but money moved this month. Why it is off decides whether it can
   // come back: out of credits and the member switching it off differ.
   var why = spend.userDisabled ? 'now disabled by the account holder'
     : spend.disabledReason ? 'now off (' + String(spend.disabledReason).slice(0, 64) + ')'
     : 'now off';
-  return { kind: 'warn', text: 'extra usage: ' + amount + ' spent this month, ' + why };
+  return 'Extra usage: ' + amount + ' spent this month, ' + why;
+}
+
+// The card's Extra bar, drawn beside Session and Weekly: this month's extra
+// usage against the ceiling that binds first — the operator's `maxSpend` when
+// it is below upstream's monthly limit, else that limit. The value names which
+// ("of $20.00 cap"), so a bar filling toward the cap is not read as one filling
+// toward the limit. `ratio` is null with neither ceiling known (an empty bar
+// behind the bare amount), and unclamped: upstream can report a month past its
+// limit. `off` marks an account that billed this month and cannot now. Shown
+// for exactly the accounts extraUsageText has words for.
+/**
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {{ ratio: number|null, value: string, title: string, off: boolean }|null}
+ */
+export function extraUsageBar(account) {
+  var title = extraUsageText(account);
+  if (!title) return null;
+  var a = account || {};
+  var spend = a.quota.spend;
+  var used = spend.usedMinor || 0;
+  var limitMinor = spend.limitMinor == null ? null : spend.limitMinor;
+  var capMinor = resolveMaxSpendMinor(a.maxSpend, spend);
+  var capBinds = capMinor != null && (limitMinor == null || capMinor < limitMinor);
+  var ceiling = capBinds ? capMinor : limitMinor;
+  var ratio = ceiling == null ? null : ceiling > 0 ? used / ceiling : (used > 0 ? 1 : 0);
+  var value = formatMoney({ currency: spend.currency, exponent: spend.exponent, usedMinor: used, limitMinor: ceiling })
+    + (capBinds ? ' cap' : '') + (spend.enabled ? '' : ' · off');
+  return { ratio: ratio, value: value, title: title, off: !spend.enabled };
 }
 
 // One row per CONVERSATION, from `sessions.items` (proxy.sessionDetail). A
@@ -727,7 +754,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
-  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageLine,
+  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -812,6 +839,7 @@ const PAGE = `<!doctype html>
   .bar i { display: block; height: 100%; border-radius: 4px; background: var(--ok); }
   .bar i.warn { background: var(--warn); }
   .bar i.bad { background: var(--bad); }
+  .bar i.off { background: var(--dim); }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 6px 10px; font-variant-numeric: tabular-nums; }
   th { color: var(--dim); font-size: 12px; font-weight: 500; border-bottom: 1px solid var(--line); }
@@ -856,9 +884,6 @@ const PAGE = `<!doctype html>
   @media (max-width: 520px) { .crow { grid-template-columns: minmax(56px, 96px) 1fr 92px; gap: 8px; } }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
   .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
-  .spend { font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
-  .spend.warn { color: var(--warn); }
-  .spend.bad { color: var(--bad); }
   .act { font: inherit; font-size: 12px; padding: 1px 10px; border-radius: 999px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; margin-left: auto; }
   .act:hover { background: var(--accent); color: var(--bg); }
   .act:disabled { opacity: .5; cursor: default; }
@@ -1074,23 +1099,31 @@ ${SHARED_HELPERS}
     return time;
   }
 
-  function quotaRow(label, ratio, resetAt) {
+  // One labelled bar. A tone replaces the colour the fill would take from its
+  // ratio; the value is whatever the row states beside it.
+  function barRow(label, ratio, valueText, tone) {
     var row = el('div', 'quota');
     row.appendChild(el('span', 'lbl', label));
     var bar = el('div', 'bar');
     var fill = el('i');
     var pct = ratio == null ? null : Math.max(0, Math.min(1, Number(ratio)));
     fill.style.width = (pct == null ? 0 : pct * 100) + '%';
-    if (pct != null && pct >= 0.9) fill.className = 'bad';
+    if (tone) fill.className = tone;
+    else if (pct != null && pct >= 0.9) fill.className = 'bad';
     else if (pct != null && pct >= 0.7) fill.className = 'warn';
     bar.appendChild(fill);
     row.appendChild(bar);
+    row.appendChild(el('span', 'val', valueText));
+    return row;
+  }
+
+  function quotaRow(label, ratio, resetAt) {
+    var pct = ratio == null ? null : Math.max(0, Math.min(1, Number(ratio)));
     var resetTs = parseTs(resetAt);
     var reset = !isNaN(resetTs) && resetTs > Date.now()
       ? ' · ' + fmtIn((resetTs - Date.now()) / 1000) + ' · ' + fmtClock(resetTs)
       : '';
-    row.appendChild(el('span', 'val', (pct == null ? '?' : Math.round(pct * 100) + '%') + reset));
-    return row;
+    return barRow(label, ratio, (pct == null ? '?' : Math.round(pct * 100) + '%') + reset);
   }
 
   function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds, viewer) {
@@ -1145,8 +1178,14 @@ ${SHARED_HELPERS}
     } else {
       card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
     }
-    var xu = extraUsageLine(a);
-    if (xu) card.appendChild(el('div', 'spend ' + xu.kind, xu.text));
+    // Extra usage, the bar after the weekly ones. The value column holds the
+    // amount; the rest (billing now, switched off and why) is the tooltip.
+    var xu = extraUsageBar(a);
+    if (xu) {
+      var xuRow = barRow('Extra', xu.ratio, xu.value, xu.off ? 'off' : null);
+      xuRow.title = xu.title;
+      card.appendChild(xuRow);
+    }
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
     card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));

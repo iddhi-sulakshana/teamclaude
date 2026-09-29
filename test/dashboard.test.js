@@ -6,7 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens,
-  accountBadges, thresholdBadgeText, extraUsageLine,
+  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
@@ -575,63 +575,97 @@ const billable = (usedMinor, extra = {}) => normalizeSpend({
   },
 });
 
-test('extraUsageLine is silent for an account that cannot bill and has not', () => {
-  assert.equal(extraUsageLine(null), null);
-  assert.equal(extraUsageLine({ quota: {} }), null);
-  assert.equal(extraUsageLine({ quota: { spend: null } }), null);
-  assert.equal(extraUsageLine({ quota: { spend: normalizeSpend({
+test('extraUsageText is silent for an account that cannot bill and has not', () => {
+  assert.equal(extraUsageText(null), null);
+  assert.equal(extraUsageText({ quota: {} }), null);
+  assert.equal(extraUsageText({ quota: { spend: null } }), null);
+  assert.equal(extraUsageText({ quota: { spend: normalizeSpend({
     extra_usage: { is_enabled: false }, spend: { used: { amount_minor: 0, currency: 'USD', exponent: 2 } },
   }) } }), null);
+  assert.equal(extraUsageBar({ quota: { spend: null } }), null);
 });
 
-test('extraUsageLine states the month\'s amount against the limit, louder once it has billed', () => {
-  assert.deepEqual(extraUsageLine({ quota: { spend: billable(0) } }),
-    { kind: 'warn', text: 'extra usage: can bill past plan limits \u2014 $0.00 of $10,000.00 used this month' });
-  assert.deepEqual(extraUsageLine({ quota: { spend: billable(1435) } }),
-    { kind: 'bad', text: 'extra usage: billing \u2014 $14.35 of $10,000.00 used this month' });
-});
-
-test('extraUsageLine draws the maxSpend cap beside the figure, and leads with it once reached', () => {
-  assert.deepEqual(extraUsageLine({ maxSpend: 20, quota: { spend: billable(1435) } }),
-    { kind: 'bad', text: 'extra usage: billing \u2014 $14.35 of $10,000.00 used this month, cap $20.00' });
-  assert.deepEqual(extraUsageLine({ maxSpend: 20, quota: { spend: billable(2000) } }),
-    { kind: 'bad', text: 'extra usage: spend cap reached \u2014 $20.00 of $10,000.00 used this month, cap $20.00' });
+test('extraUsageText states the month\'s amount against the limit, and whether it is billing', () => {
+  assert.equal(extraUsageText({ quota: { spend: billable(0) } }),
+    'Extra usage: can bill past plan limits — $0.00 of $10,000.00 used this month');
+  assert.equal(extraUsageText({ quota: { spend: billable(1435) } }),
+    'Extra usage: billing — $14.35 of $10,000.00 used this month');
+  assert.equal(extraUsageText({ maxSpend: 20, quota: { spend: billable(1435) } }),
+    'Extra usage: billing — $14.35 of $10,000.00 used this month, cap $20.00');
+  assert.equal(extraUsageText({ maxSpend: 20, quota: { spend: billable(2000) } }),
+    'Extra usage: spend cap reached — $20.00 of $10,000.00 used this month, cap $20.00');
   // An invalid cap is no cap, as on the status screen and in the router.
-  assert.doesNotMatch(extraUsageLine({ maxSpend: -1, quota: { spend: billable(1435) } }).text, /cap/);
+  assert.doesNotMatch(extraUsageText({ maxSpend: -1, quota: { spend: billable(1435) } }), /cap/);
 });
 
-test('extraUsageLine keeps a month\'s spend on an account switched off since, with why', () => {
-  const off = (extra) => ({ quota: { spend: normalizeSpend({
-    extra_usage: { is_enabled: false, ...extra },
-    spend: {
-      used: { amount_minor: 1500, currency: 'EUR', exponent: 2 },
-      limit: { amount_minor: 2000, currency: 'EUR', exponent: 2 },
-    },
+const switchedOff = (extra) => ({ quota: { spend: normalizeSpend({
+  extra_usage: { is_enabled: false, ...extra },
+  spend: {
+    used: { amount_minor: 1500, currency: 'EUR', exponent: 2 },
+    limit: { amount_minor: 2000, currency: 'EUR', exponent: 2 },
+  },
+}) } });
+
+test('extraUsageText keeps a month\'s spend on an account switched off since, with why', () => {
+  assert.equal(extraUsageText(switchedOff({ disabled_reason: 'out_of_credits' })),
+    'Extra usage: €15.00 of €20.00 spent this month, now off (out_of_credits)');
+  assert.match(extraUsageText(switchedOff({ user_disabled: true })), /now disabled by the account holder$/);
+  assert.match(extraUsageText(switchedOff({})), /, now off$/);
+});
+
+test('extraUsageBar fills against upstream\'s monthly limit', () => {
+  const bar = extraUsageBar({ quota: { spend: billable(1435) } });
+  assert.equal(bar.ratio, 1435 / 1000000);
+  assert.equal(bar.value, '$14.35 of $10,000.00');
+  assert.equal(bar.off, false);
+  assert.equal(bar.title, extraUsageText({ quota: { spend: billable(1435) } }));
+  assert.deepEqual(extraUsageBar({ quota: { spend: billable(0) } }).ratio, 0);
+  // Past the limit, as upstream reports it: the ratio is not clamped, the bar is.
+  assert.ok(extraUsageBar({ quota: { spend: billable(1000100) } }).ratio > 1);
+});
+
+test('extraUsageBar fills against the maxSpend cap when it binds first, and says so', () => {
+  const capped = extraUsageBar({ maxSpend: 20, quota: { spend: billable(1435) } });
+  assert.equal(capped.ratio, 1435 / 2000);
+  assert.equal(capped.value, '$14.35 of $20.00 cap');
+  // A cap above the limit never binds: the limit is the ceiling shown.
+  assert.equal(extraUsageBar({ maxSpend: 50000, quota: { spend: billable(1435) } }).value, '$14.35 of $10,000.00');
+  // "Not one cent": nothing spent is an empty bar, anything spent a full one.
+  assert.equal(extraUsageBar({ maxSpend: 0, quota: { spend: billable(0) } }).ratio, 0);
+  assert.equal(extraUsageBar({ maxSpend: 0, quota: { spend: billable(5) } }).ratio, 1);
+});
+
+test('extraUsageBar marks an account switched off since, and draws no ratio with no ceiling', () => {
+  const off = extraUsageBar(switchedOff({ disabled_reason: 'out_of_credits' }));
+  assert.equal(off.off, true);
+  assert.equal(off.ratio, 0.75);
+  assert.equal(off.value, '€15.00 of €20.00 · off');
+  const noLimit = extraUsageBar({ quota: { spend: normalizeSpend({
+    extra_usage: { is_enabled: true }, spend: { used: { amount_minor: 4237, currency: 'USD', exponent: 2 } },
   }) } });
-  assert.deepEqual(extraUsageLine(off({ disabled_reason: 'out_of_credits' })),
-    { kind: 'warn', text: 'extra usage: \u20ac15.00 of \u20ac20.00 spent this month, now off (out_of_credits)' });
-  assert.match(extraUsageLine(off({ user_disabled: true })).text, /now disabled by the account holder$/);
-  assert.match(extraUsageLine(off({})).text, /, now off$/);
+  assert.equal(noLimit.ratio, null);
+  assert.equal(noLimit.value, '$42.37');
 });
 
-test('extraUsageLine runs inside the serialized bundle, money helpers included', () => {
-  // It calls formatMoney, resolveMaxSpendMinor and spendCapReached by name,
+test('the extra-usage helpers run inside the serialized bundle, money helpers included', () => {
+  // They call formatMoney, resolveMaxSpendMinor and spendCapReached by name,
   // and those are imported from oauth.js and model.js: the page has them only
   // because SHARED_HELPERS writes their source in.
   const script = inlineScripts(renderDashboardHtml()).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
-  const isolated = new Function(`${bundle}; return extraUsageLine;`)();
+  const isolated = new Function(`${bundle}; return { extraUsageText, extraUsageBar };`)();
   for (const a of [
     { quota: { spend: billable(0) } },
     { maxSpend: 20, quota: { spend: billable(1435) } },
     { maxSpend: 20, quota: { spend: billable(2000) } },
-    { quota: { spend: normalizeSpend({ extra_usage: { is_enabled: false, user_disabled: true }, spend: { used: { amount_minor: 5, currency: 'USD', exponent: 2 } } }) } },
+    switchedOff({ user_disabled: true }),
   ]) {
-    assert.deepEqual(isolated(a), extraUsageLine(a));
+    assert.deepEqual(isolated.extraUsageText(a), extraUsageText(a));
+    assert.deepEqual(isolated.extraUsageBar(a), extraUsageBar(a));
   }
 });
 
-test('the account card shows what extra usage has cost', async () => {
+test('the account card draws extra usage as a bar beside the weekly ones', async () => {
   const page = bootPage();
   await page.answer(200, {
     currentAccount: 'alice@example.com',
@@ -640,9 +674,10 @@ test('the account card shows what extra usage has cost', async () => {
       { name: 'bob@example.com', provider: 'anthropic', quota: { unified5h: 0.1, unified7d: 0.2 }, usage: {} },
     ],
   });
-  assert.equal(page.labelled('extra usage: billing \u2014 $14.35 of $10,000.00 used this month, cap $20.00'), 1);
+  assert.equal(page.labelled('Weekly'), 2);
   // Only the account that can bill carries one.
-  assert.equal(page.labelledMatching(/^extra usage:/), 1);
+  assert.equal(page.labelled('Extra'), 1);
+  assert.equal(page.labelled('$14.35 of $20.00 cap'), 1);
 });
 
 test('the serialized helpers run in the page\'s own scope, not just parse', () => {
@@ -753,7 +788,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageLine, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -830,8 +865,7 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     el.fire('click');
   };
   const labelled = label => built.slice(mark).filter(e => e.textContent === label).length;
-  const labelledMatching = re => built.slice(mark).filter(e => re.test(e.textContent)).length;
-  return { byId, store, requests, answer, rootAttrs, click, labelled, labelledMatching };
+  return { byId, store, requests, answer, rootAttrs, click, labelled };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
