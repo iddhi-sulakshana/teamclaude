@@ -366,19 +366,22 @@ export function clientGroups(ranking) {
 
 // Usage over time, from GET /teamclaude/usage/series: one point per hour of
 // the window shown — the last five for `5h`, the day for `24h` and for `total`,
-// which has no series of its own (the tracker keeps a day, not a lifetime) —
-// for one client against everyone else. The one is `focus`, the client the
-// page is signed in as, when it spent anything in the span, and otherwise the
-// busiest; `main` is null only when nobody spent anything. `peakAt` is the
-// point the chart marks: the main client's busiest hour, or everyone else's
-// when the main line is flat. `last` is the newest hour's whole traffic.
+// which has no series of its own (the tracker keeps a day, not a lifetime).
+// Each point carries every client's traffic in that hour (`total`), which the
+// overview's chart draws as one line. `lines` are Usage by user's: one per
+// client in `names`, in that order — drawn flat when it spent nothing, since a
+// name in the legend with no line would read as missing — and, beside them,
+// every other client folded into one "others" line when any of them spent
+// anything. With no names there are no lines, only the total.
+// `peakAt` is the busiest hour overall, `linePeak` the highest point of any
+// one line, and `last` the newest hour's whole traffic.
 /**
  * @param {any} series
  * @param {string} [view]
  * @param {string} [metric]
- * @param {string|null} [focus]
+ * @param {string[]|null} [names]
  */
-export function seriesLines(series, view, metric, focus) {
+export function seriesLines(series, view, metric, names) {
   var s = series || {};
   var n = Number.isInteger(s.buckets) && s.buckets > 0 ? s.buckets : 0;
   var bucketMs = s.bucketMs || 0;
@@ -386,43 +389,47 @@ export function seriesLines(series, view, metric, focus) {
   var from = n - shown;
   var clients = s.clients || {};
   var at = function (/** @type {any} */ c, /** @type {number} */ i) {
+    if (!c) return 0;
     if (metric === 'requests') return (c.requests || [])[i] || 0;
     return ((c.inputTokens || [])[i] || 0) + ((c.outputTokens || [])[i] || 0);
   };
-  var names = Object.keys(clients).sort();
-  /** @type {Object<string, number>} */
-  var sums = {};
-  names.forEach(function (name) {
-    var sum = 0;
-    for (var i = from; i < n; i++) sum += at(clients[name], i);
-    sums[name] = sum;
-  });
-  /** @type {string|null} */
-  var main = focus && sums[focus] > 0 ? focus : null;
-  if (!main) {
-    names.forEach(function (name) { if (sums[name] > 0 && (main === null || sums[name] > sums[main])) main = name; });
-  }
-  var hasOther = names.some(function (name) { return name !== main && sums[name] > 0; });
-  /** @type {Array<{ start: number, end: number, main: number, other: number }>} */
+  var all = Object.keys(clients).sort();
+  var picked = names || [];
+  /** @type {Array<{ name: string, members: string[], others: boolean, values: number[] }>} */
+  var lines = picked.map(function (name) { return { name: name, members: [name], others: false, values: [] }; });
+  var rest = all.filter(function (name) { return picked.indexOf(name) === -1; });
+  var restSpent = false;
+  rest.forEach(function (name) { for (var i = from; i < n; i++) if (at(clients[name], i) > 0) restSpent = true; });
+  if (picked.length && restSpent) lines.push({ name: 'others', members: rest, others: true, values: [] });
+  /** @type {Array<{ start: number, end: number, total: number }>} */
   var points = [];
-  var peak = 0, total = 0;
+  var peak = 0, linePeak = 0, total = 0;
   for (var i = from; i < n; i++) {
-    var m = main === null ? 0 : at(clients[main], i);
-    var o = 0;
-    names.forEach(function (name) { if (name !== main) o += at(clients[name], i); });
-    points.push({ start: s.end - (n - i) * bucketMs, end: s.end - (n - 1 - i) * bucketMs, main: m, other: o });
-    if (m > peak) peak = m;
-    if (o > peak) peak = o;
-    total += m + o;
+    var sum = 0;
+    all.forEach(function (name) { sum += at(clients[name], i); });
+    points.push({ start: s.end - (n - i) * bucketMs, end: s.end - (n - 1 - i) * bucketMs, total: sum });
+    if (sum > peak) peak = sum;
+    total += sum;
+    lines.forEach(function (line) {
+      var v = 0;
+      line.members.forEach(function (name) { v += at(clients[name], i); });
+      line.values.push(v);
+      if (v > linePeak) linePeak = v;
+    });
   }
-  /** @type {'main'|'other'} */
-  var key = points.some(function (p) { return p.main > 0; }) ? 'main' : 'other';
   var peakAt = -1;
-  points.forEach(function (p, idx) {
-    if (p[key] > 0 && (peakAt === -1 || p[key] > points[peakAt][key])) peakAt = idx;
-  });
+  points.forEach(function (p, idx) { if (p.total > 0 && (peakAt === -1 || p.total > points[peakAt].total)) peakAt = idx; });
   var tail = points[points.length - 1];
-  return { points: points, main: main, hasOther: hasOther, peak: peak, total: total, peakAt: peakAt, last: tail ? tail.main + tail.other : 0, spanMs: shown * bucketMs };
+  return { points: points, lines: lines, peak: peak, linePeak: linePeak, peakAt: peakAt, total: total, last: tail ? tail.total : 0, spanMs: shown * bucketMs };
+}
+
+// The clients Usage by user draws a line each, in the section's ranking: every
+// one of four or fewer, else the top three, the rest sharing an "others" line —
+// the palette has four colours, and a fold of one would only hide a name.
+/** @param {Array<{ name: string }>|null|undefined} ranking */
+export function userLineNames(ranking) {
+  var rows = ranking || [];
+  return (rows.length <= 4 ? rows : rows.slice(0, 3)).map(function (r) { return r.name; });
 }
 
 // A smooth line through the points, as SVG path data: each span a cubic whose
@@ -973,7 +980,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
-  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, smoothPath, heatGrid, seriesTicks,
+  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1009,7 +1016,8 @@ const DARK_TOKENS = `
     --amber: #FFD66B; --amber-soft: rgba(255,214,107,0.1);
     --tick-off: #2C2C2E; --tick-dim: #636366; --seg-off: #3A3A3C; --bar-dark: #2E2350;
     --heat-0: #241C38; --heat-1: #2A2045; --heat-2: #4A33A0; --heat-3: #7B4CF5; --heat-4: #A98BFF;
-    --area: #D6FF4F; --line-other: #8E8E93; --dot-other: #AEAEB2; --logo-a: #F5F5F7; --bg-pill: #2C2C2E;
+    --area: #D6FF4F; --logo-a: #F5F5F7; --bg-pill: #2C2C2E; --grid-dash: rgba(255,255,255,0.1);
+    --user-0: #D6FF4F; --user-1: #A98BFF; --user-2: #7B4CF5; --user-3: #8E8E93;
     --av0: #D6FF4F; --av1: #A98BFF; --av2: #FFB38A; --av3: #F5F5F7; --av4: #8FE3C8; --av5: #FFD66B; --av6: #C9B6FF; --av7: #FF9A88;
     --scrim: rgba(0,0,0,0.7); --shadow: 0 30px 80px rgba(0,0,0,0.7);`;
 
@@ -1025,7 +1033,8 @@ const LIGHT_TOKENS = `
     --amber: #B07D00; --amber-soft: rgba(217,154,0,0.12);
     --tick-off: #E8E8ED; --tick-dim: #AEAEB2; --seg-off: #E3E3E8; --bar-dark: #DCD2FF;
     --heat-0: #F3F0FB; --heat-1: #E4DBFF; --heat-2: #BCA6FF; --heat-3: #8D63FF; --heat-4: #6A3BE8;
-    --area: #9CCB00; --line-other: #AEAEB2; --dot-other: #8E8E93; --logo-a: #1C1C1E; --bg-pill: #FFFFFF;
+    --area: #9CCB00; --logo-a: #1C1C1E; --bg-pill: #FFFFFF; --grid-dash: rgba(0,0,0,0.1);
+    --user-0: #9CCB00; --user-1: #A98BFF; --user-2: #7B4CF5; --user-3: #8E8E93;
     --av0: #D6FF4F; --av1: #C9B6FF; --av2: #FFC9A8; --av3: #E5E5EA; --av4: #A8EBD5; --av5: #FFE08F; --av6: #DCD0FF; --av7: #FFB3A6;
     --scrim: rgba(28,28,30,0.3); --shadow: 0 30px 80px rgba(0,0,0,0.18);`;
 
@@ -1048,6 +1057,7 @@ const ICONS = {
   status: icon('<circle cx="12" cy="12" r="9.5"></circle><path d="M12 8v4M12 15.5v.5"></path>'),
   routing: icon('<circle cx="6" cy="6" r="2.5"></circle><circle cx="18" cy="18" r="2.5"></circle><path d="M8.5 6H14a4 4 0 0 1 0 8H10a4 4 0 0 0 0 8"></path>'),
   clients: icon('<circle cx="12" cy="12" r="9.5"></circle><path d="M8 10l2-2 2 2M10 8v8M16 14l-2 2-2-2M14 16V8"></path>'),
+  users: icon('<circle cx="9" cy="8" r="3.5"></circle><path d="M2.5 20c.6-3.4 3.2-5.5 6.5-5.5s5.9 2.1 6.5 5.5M16 4.8a3.5 3.5 0 0 1 0 6.4M18.5 14.8c1.7.8 2.7 2.6 3 5.2"></path>'),
   table: icon('<rect x="3.5" y="4.5" width="17" height="15" rx="3"></rect><path d="M3.5 10h17M9.5 10v9.5"></path>'),
 };
 
@@ -1214,7 +1224,9 @@ const PAGE = `<!doctype html>
   .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); flex-wrap: wrap; align-items: center; min-height: 18px; }
   .legend span { display: flex; align-items: center; gap: 7px; min-width: 0; }
   .sw { width: 11px; height: 11px; border-radius: 3px; flex: none; display: inline-block; }
-  .sw.main { background: var(--area); } .sw.other { background: var(--line-other); }
+  .sw.main { background: var(--area); }
+  .sw.u0, .dot.u0, .sp-track i.u0 { background: var(--user-0); } .sw.u1, .dot.u1, .sp-track i.u1 { background: var(--user-1); }
+  .sw.u2, .dot.u2, .sp-track i.u2 { background: var(--user-2); } .sw.u3, .dot.u3, .sp-track i.u3 { background: var(--user-3); }
   .sw.ok { background: var(--violet); } .sw.warn { background: var(--lime); } .sw.bad { background: var(--coral); }
   .legend.sm { gap: 14px; }
   .legend.sm .sw { width: 10px; height: 10px; }
@@ -1224,7 +1236,6 @@ const PAGE = `<!doctype html>
   .plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
   .plot path { transition: d .6s cubic-bezier(.2,.8,.2,1); }
   .ga { stop-color: var(--area); stop-opacity: .22; } .gb { stop-color: var(--area); stop-opacity: 0; }
-  #seriesOther { fill: none; stroke: var(--line-other); stroke-width: 1.6; stroke-dasharray: 5 5; }
   #seriesMain { fill: none; stroke: var(--area); stroke-width: 2; }
   .hover-cols { position: absolute; inset: 0; display: flex; }
   .hover-cols div { flex: 1; border-radius: 6px; }
@@ -1234,9 +1245,33 @@ const PAGE = `<!doctype html>
   .peak-tags.flip { transform: translateX(calc(-100% - 8px)); align-items: flex-end; }
   .tag { height: 24px; padding: 0 9px; border-radius: 999px; background: var(--raised); color: var(--text); font-size: 11px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
   .tag i { width: 3px; height: 12px; border-radius: 2px; background: var(--area); flex: none; }
-  .tag i.o { background: var(--dot-other); }
   .plot-empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; font-size: 12px; color: var(--dim); text-align: center; padding: 0 12px; }
   .ticks { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+
+  /* Usage by user */
+  #usersSec { gap: 14px; }
+  .sub-title { font-size: 20px; font-weight: 500; letter-spacing: -0.02em; }
+  .seg-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .seg.on-bg { background: var(--bg-pill); }
+  .cards.fit { grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); }
+  #spendCard { gap: 4px; }
+  #spendCard .card-head { padding-bottom: 10px; }
+  .sp-row { display: grid; grid-template-columns: minmax(90px,160px) minmax(0,1fr) auto; gap: 16px; align-items: center; padding: 12px 10px; margin: 0 -10px; border-radius: 14px; font-size: 13px; transition: background .2s ease; }
+  .sp-row:hover { background: var(--row-hover); }
+  .sp-name { display: flex; align-items: center; gap: 8px; font-weight: 500; min-width: 0; }
+  .sp-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sp-track { height: 6px; border-radius: 999px; background: var(--raised); overflow: hidden; }
+  .sp-track i { display: block; height: 100%; border-radius: 999px; transition: width .6s cubic-bezier(.2,.8,.2,1); }
+  .sp-val { text-align: right; white-space: nowrap; min-width: 110px; }
+  .sp-val b { font-weight: 500; }
+  .sp-val span { color: var(--dim); }
+  .ug { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--grid-dash); pointer-events: none; }
+  .ug.top { top: 0; } .ug.mid { top: 50%; } .ug.base { bottom: 0; border-top-style: solid; }
+  .umax { position: absolute; top: 4px; left: 0; font-size: 11px; color: var(--dim); pointer-events: none; }
+  #userPlot path { fill: none; stroke-width: 2; }
+  #userPlot path.dash { stroke-width: 1.6; stroke-dasharray: 4 4; }
+  #userPlot path.u0 { stroke: var(--user-0); } #userPlot path.u1 { stroke: var(--user-1); }
+  #userPlot path.u2 { stroke: var(--user-2); } #userPlot path.u3 { stroke: var(--user-3); }
 
   /* By time */
   .heat { display: grid; gap: 5px; align-items: center; }
@@ -1501,18 +1536,16 @@ const PAGE = `<!doctype html>
           <h2 class="card-title">${ICONS.usage}Usage over time</h2>
           <div class="card-cap" id="seriesCaption"></div>
         </div>
-        <div class="legend" id="seriesLegend"></div>
+        <div class="legend"><span><i class="sw main"></i>All users</span></div>
         <div class="plot">
           <svg viewBox="0 0 400 170" preserveAspectRatio="none" aria-hidden="true">
             <defs><linearGradient id="tcArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="ga"></stop><stop offset="1" class="gb"></stop></linearGradient></defs>
             <path id="seriesArea" fill="url(#tcArea)" d=""></path>
-            <path id="seriesOther" vector-effect="non-scaling-stroke" d=""></path>
             <path id="seriesMain" vector-effect="non-scaling-stroke" d=""></path>
           </svg>
           <div class="peak" id="peakLine" style="display:none"></div>
           <div class="peak-tags" id="peakTags" style="display:none">
             <div class="tag"><i></i><span id="peakMain"></span></div>
-            <div class="tag" id="peakOtherTag"><i class="o"></i><span id="peakOther"></span></div>
           </div>
           <div class="hover-cols" id="seriesHover"></div>
           <div class="plot-empty" id="seriesEmpty"></div>
@@ -1572,6 +1605,42 @@ const PAGE = `<!doctype html>
         <div id="clients"></div>
       </section>
     </div>
+
+    <section class="sec rise" id="usersSec" style="display:none;animation-delay:.42s">
+      <div class="sec-head">
+        <h2 class="sub-title">Usage by user</h2>
+        <div class="seg-row">
+          <span class="seg on-bg" id="userViewSeg" role="group" aria-label="Usage by user: window"></span>
+          <span class="seg on-bg" id="userMetricSeg" role="group" aria-label="Usage by user: measure"></span>
+        </div>
+      </div>
+      <div class="cards fit">
+        <section class="card" id="spendCard">
+          <div class="card-head"><h3 class="card-title">${ICONS.users}Spend by user</h3></div>
+          <div id="spendRows"></div>
+        </section>
+        <section class="card" id="userChartCard">
+          <div class="card-head">
+            <h3 class="card-title">${ICONS.usage}Usage over time</h3>
+            <div class="card-cap" id="userCaption"></div>
+          </div>
+          <div class="legend" id="userLegend"></div>
+          <div class="plot" id="userPlot">
+            <div class="ug top"></div><div class="ug mid"></div><div class="ug base"></div>
+            <div class="umax" id="userMax"></div>
+            <svg viewBox="0 0 400 170" preserveAspectRatio="none" aria-hidden="true">
+              <path id="userLine3" vector-effect="non-scaling-stroke" d=""></path>
+              <path id="userLine2" vector-effect="non-scaling-stroke" d=""></path>
+              <path id="userLine1" vector-effect="non-scaling-stroke" d=""></path>
+              <path id="userLine0" vector-effect="non-scaling-stroke" d=""></path>
+            </svg>
+            <div class="hover-cols" id="userHover"></div>
+            <div class="plot-empty" id="userEmpty"></div>
+          </div>
+          <div class="ticks" id="userTicks"></div>
+        </section>
+      </div>
+    </section>
 
     <div id="dimensionsWrap" class="duo" style="display:none"></div>
 
@@ -1641,6 +1710,13 @@ const PAGE = `<!doctype html>
   var CHART_METRICS = [{ key: 'tokens', label: 'Tokens' }, { key: 'requests', label: 'Requests' }];
   var chartMetric = 'tokens';
   var chartButtons = [];
+  // Usage by user has a window and measure of its own, as the design gives it
+  // its own controls. They sit in its heading row, so what the section shows
+  // is named beside it rather than inherited from the top of the page.
+  var userView = 'total';
+  var userMetric = 'tokens';
+  var userViewButtons = [];
+  var userMetricButtons = [];
   // The usage series behind the two charts, fetched on its own (GET
   // /teamclaude/usage/series) after each status poll that shows a client. One
   // fetch at a time: a slow answer is not stacked behind by the next poll's.
@@ -1746,8 +1822,19 @@ ${SHARED_HELPERS}
     return new Date(ts).toLocaleTimeString([], { hour: 'numeric' }).toLowerCase();
   }
 
-  function metricText(v) {
-    return fmtNum(v) + (chartMetric === 'requests' ? ' req' : ' tok');
+  function metricText(v, metric) {
+    return fmtNum(v) + ((metric || chartMetric) === 'requests' ? ' req' : ' tok');
+  }
+
+  // A chart's scale label: a tenth is worth showing below ten, not above.
+  function scaleText(v, metric) {
+    return (v < 10 ? v.toFixed(1) : fmtNum(Math.round(v))) + ((metric || chartMetric) === 'requests' ? ' req' : ' tok');
+  }
+
+  // How many hours a chart spans, for its caption: what the series held, or the
+  // window's length before it has landed.
+  function spanHours(spanMs, view) {
+    return (spanMs ? Math.round(spanMs / 3600000) : view === '5h' ? 5 : 24) + 'h';
   }
 
   // A share too small to round to 1% still says it is there.
@@ -2081,6 +2168,30 @@ ${SHARED_HELPERS}
       chartButtons.push({ key: m.key, btn: btn });
     });
     markSelected(chartButtons, chartMetric);
+    USAGE_VIEWS.forEach(function (v) {
+      var btn = el('button', '', v.label);
+      btn.type = 'button';
+      btn.addEventListener('click', function () {
+        userView = v.key;
+        markSelected(userViewButtons, userView);
+        renderUsers();
+      });
+      byId('userViewSeg').appendChild(btn);
+      userViewButtons.push({ key: v.key, btn: btn });
+    });
+    markSelected(userViewButtons, userView);
+    CHART_METRICS.forEach(function (m) {
+      var btn = el('button', '', m.label);
+      btn.type = 'button';
+      btn.addEventListener('click', function () {
+        userMetric = m.key;
+        markSelected(userMetricButtons, userMetric);
+        renderUsers();
+      });
+      byId('userMetricSeg').appendChild(btn);
+      userMetricButtons.push({ key: m.key, btn: btn });
+    });
+    markSelected(userMetricButtons, userMetric);
     // The first column one solid block, the second a run of strokes shading
     // darker, the third fainter strokes: the columns tell clients apart by
     // their pattern as well as their place.
@@ -2267,39 +2378,32 @@ ${SHARED_HELPERS}
     return (usageView === '5h' ? 5 : 24) + 'h';
   }
 
-  // Usage over time, drawn from the last series fetched: the signed-in client
-  // (or the busiest) against everyone else, an hour a point. Total has no
-  // series of its own — the tracker keeps a day of history, not a lifetime —
-  // so it shows the day, and the caption says which span is on screen.
+  // Why a chart has nothing to draw: its history has not landed, could not be
+  // fetched, or holds nothing for the span.
+  function historyEmptyText(hours) {
+    if (!lastSeries) return seriesError ? 'Usage history unavailable: ' + seriesError : 'Loading usage history…';
+    return 'No client-key traffic in the last ' + hours;
+  }
+
+  // Usage over time, drawn from the last series fetched: every client key's
+  // traffic as one line, an hour a point, its busiest hour marked. Total has
+  // no series of its own — the tracker keeps a day of history, not a lifetime
+  // — so it shows the day, and the caption says which span is on screen.
   function renderSeries() {
     var wrap = byId('seriesWrap');
-    var s = lastStatus;
-    if (!hasClients(s)) { wrap.style.display = 'none'; return; }
+    if (!hasClients(lastStatus)) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
-    var focus = (s.viewer && s.viewer.client) || null;
-    var L = seriesLines(lastSeries, usageView, chartMetric, focus);
-    var hours = L.spanMs ? Math.round(L.spanMs / 3600000) + 'h' : seriesHours();
+    var L = seriesLines(lastSeries, usageView, chartMetric, null);
+    var hours = spanHours(L.spanMs, usageView);
     byId('seriesCaption').textContent = (chartMetric === 'requests' ? 'Requests' : 'Tokens') + ' / hour · last ' + hours;
-    var legend = byId('seriesLegend');
-    legend.textContent = '';
-    var item = function (cls, name) {
-      var span = el('span');
-      span.appendChild(el('i', 'sw ' + cls));
-      span.appendChild(el('span', '', name));
-      legend.appendChild(span);
-    };
-    if (L.main) item('main', L.main);
-    if (L.hasOther) item('other', 'everyone else');
     var hover = byId('seriesHover');
     hover.textContent = '';
     var empty = byId('seriesEmpty');
-    var drawn = !!lastSeries && L.total > 0;
-    if (!drawn) {
-      empty.textContent = !lastSeries
-        ? (seriesError ? 'Usage history unavailable: ' + seriesError : 'Loading usage history…')
-        : 'No client-key traffic in the last ' + hours;
+    if (!lastSeries || !L.total) {
+      empty.textContent = historyEmptyText(hours);
       empty.style.display = 'flex';
-      ['seriesMain', 'seriesArea', 'seriesOther'].forEach(function (id) { byId(id).setAttribute('d', ''); });
+      byId('seriesMain').setAttribute('d', '');
+      byId('seriesArea').setAttribute('d', '');
       byId('peakLine').style.display = 'none';
       byId('peakTags').style.display = 'none';
     } else {
@@ -2308,32 +2412,102 @@ ${SHARED_HELPERS}
       var top = L.peak * 1.15;
       var X = function (i) { return n > 1 ? i / (n - 1) * 400 : 200; };
       var Y = function (v) { return 165 - v / top * 150; };
-      var mainD = smoothPath(L.points.map(function (p, i) { return [X(i), Y(p.main)]; }), 165);
-      byId('seriesMain').setAttribute('d', mainD);
-      byId('seriesArea').setAttribute('d', mainD + ' L400,170 L0,170 Z');
-      byId('seriesOther').setAttribute('d', L.hasOther ? smoothPath(L.points.map(function (p, i) { return [X(i), Y(p.other)]; }), 165) : '');
-      var pk = L.points[L.peakAt];
+      var d = smoothPath(L.points.map(function (p, i) { return [X(i), Y(p.total)]; }), 165);
+      byId('seriesMain').setAttribute('d', d);
+      byId('seriesArea').setAttribute('d', d + ' L400,170 L0,170 Z');
       var left = X(L.peakAt) / 4;
       var peak = byId('peakLine'), tags = byId('peakTags');
       peak.style.left = left + '%';
       peak.style.display = '';
       tags.style.left = left + '%';
-      // Past the middle the tags sit left of the line, so they stay on the chart.
+      // Past the middle the tag sits left of the line, so it stays on the chart.
       tags.className = 'peak-tags' + (left > 62 ? ' flip' : '');
       tags.style.display = '';
-      byId('peakMain').textContent = metricText(pk.main);
-      byId('peakOther').textContent = metricText(pk.other);
-      byId('peakOtherTag').style.display = L.hasOther ? '' : 'none';
+      byId('peakMain').textContent = 'Peak ' + metricText(L.points[L.peakAt].total);
       L.points.forEach(function (p) {
         var col = el('div');
-        col.title = fmtHM(p.start) + '–' + fmtHM(p.end) + ' · ' + L.main + ' ' + metricText(p.main)
-          + (L.hasOther ? ' · everyone else ' + metricText(p.other) : '');
+        col.title = fmtHM(p.start) + '–' + fmtHM(p.end) + ' · ' + metricText(p.total);
         hover.appendChild(col);
       });
     }
     var ticks = byId('seriesTicks');
     ticks.textContent = '';
     seriesTicks(L.spanMs || (usageView === '5h' ? 5 : 24) * 3600000).forEach(function (t) { ticks.appendChild(el('span', '', t)); });
+  }
+
+  // Usage by user, on the section's own window and measure: every client's
+  // share as a bar, and a line per client over the span the history covers.
+  // A client keeps one colour in both — its place in the ranking, the fourth
+  // colour going to everyone past the third when they share a line.
+  function renderUsers() {
+    var sec = byId('usersSec');
+    var s = lastStatus;
+    if (!hasClients(s)) { sec.style.display = 'none'; return; }
+    sec.style.display = '';
+    var ranking = clientRanking(s.clients, userView, userMetric);
+    var rows = byId('spendRows');
+    rows.textContent = '';
+    ranking.forEach(function (r, i) {
+      var tone = 'u' + Math.min(i, 3);
+      var row = el('div', 'sp-row');
+      row.title = r.name + ' · ' + metricText(r.value, userMetric) + ' · ' + fmtShare(r.share);
+      var name = el('span', 'sp-name');
+      name.appendChild(el('i', 'dot ' + tone));
+      name.appendChild(el('span', '', r.name));
+      row.appendChild(name);
+      var track = el('div', 'sp-track');
+      var fill = el('i', tone);
+      fill.style.width = (r.share * 100).toFixed(1) + '%';
+      track.appendChild(fill);
+      row.appendChild(track);
+      var val = el('span', 'sp-val');
+      val.appendChild(el('b', '', metricText(r.value, userMetric)));
+      val.appendChild(el('span', '', ' · ' + fmtShare(r.share)));
+      row.appendChild(val);
+      rows.appendChild(row);
+    });
+
+    var L = seriesLines(lastSeries, userView, userMetric, userLineNames(ranking));
+    var lines = L.lines.slice(0, 4);
+    var hours = spanHours(L.spanMs, userView);
+    byId('userCaption').textContent = (userMetric === 'requests' ? 'Requests' : 'Tokens') + ' / hour · last ' + hours;
+    var label = function (line) { return line.others ? line.members.length + ' others' : line.name; };
+    var legend = byId('userLegend');
+    legend.textContent = '';
+    lines.forEach(function (line, i) {
+      var item = el('span');
+      item.appendChild(el('i', 'sw u' + i));
+      item.appendChild(el('span', '', label(line)));
+      legend.appendChild(item);
+    });
+    var hover = byId('userHover');
+    hover.textContent = '';
+    var empty = byId('userEmpty');
+    var drawn = !!lastSeries && L.linePeak > 0;
+    empty.style.display = drawn ? 'none' : 'flex';
+    if (!drawn) empty.textContent = historyEmptyText(hours);
+    var n = L.points.length;
+    var top = L.linePeak * 1.15;
+    byId('userMax').textContent = drawn ? scaleText(top, userMetric) : '';
+    var X = function (i) { return n > 1 ? i / (n - 1) * 400 : 200; };
+    for (var k = 0; k < 4; k++) {
+      var path = byId('userLine' + k);
+      var line = lines[k];
+      path.setAttribute('class', 'u' + k + (k < 2 ? '' : ' dash'));
+      path.setAttribute('d', drawn && line ? smoothPath(line.values.map(function (v, i) { return [X(i), 170 - v / top * 170]; }), 170) : '');
+    }
+    if (drawn) {
+      L.points.forEach(function (p, i) {
+        var col = el('div');
+        col.title = fmtHM(p.start) + '–' + fmtHM(p.end) + ' · ' + lines.map(function (line) {
+          return label(line) + ' ' + metricText(line.values[i], userMetric);
+        }).join(' · ');
+        hover.appendChild(col);
+      });
+    }
+    var ticks = byId('userTicks');
+    ticks.textContent = '';
+    seriesTicks(L.spanMs || (userView === '5h' ? 5 : 24) * 3600000).forEach(function (t) { ticks.appendChild(el('span', '', t)); });
   }
 
   // Traffic by time: a row per client, a column per stretch of the span, each
@@ -2382,6 +2556,7 @@ ${SHARED_HELPERS}
     renderSeries();
     renderHeat();
     renderDelta();
+    renderUsers();
   }
 
   function pollSeries() {
