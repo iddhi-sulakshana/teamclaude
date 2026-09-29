@@ -439,6 +439,9 @@ async function serverCommand() {
       // reload adds or drops one without a restart.
       config.proxy.usageDimensions = diskConfig.proxy.usageDimensions;
       config.proxy.sessionDetail = diskConfig.proxy.sessionDetail;
+      // Read per request as well, so which models are kept to admin keys (and
+      // what everyone else is served instead) changes on reload.
+      config.proxy.adminOnlyModels = diskConfig.proxy.adminOnlyModels;
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;

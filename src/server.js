@@ -1547,13 +1547,29 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           if (found && !hideActivity) hooks.onRequestModel?.(reqId, { model: found });
         }
       }
-      const body = Buffer.concat(bodyChunks);
+      /** @type {Buffer} */
+      let body = Buffer.concat(bodyChunks);
 
-      const model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
+      let model = modelFinder.done ? modelFinder.value : parseRequestModel(body);
       // An advisor request (Claude Code's advisor tool) carries a SECOND model
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
-      const advisorModel = parseAdvisorModel(body);
+      let advisorModel = parseAdvisorModel(body);
+
+      // Admin-only models (proxy.adminOnlyModels): a caller that is not an
+      // admin asking for one is served the configured replacement instead. The
+      // swap happens here, before anything below reads the model, so the
+      // request is routed, pinned, metered and blocklist-checked as the model
+      // actually sent. Read live, so a reload applies to the next request.
+      const proxyConfig = /** @type {any} */ (config)?.proxy;
+      const adminOnly = proxyConfig?.adminOnlyModels;
+      if ((adminOnlyReplacement(adminOnly, model) || adminOnlyReplacement(adminOnly, advisorModel))
+          && !isAdminCaller(req, forcedClient, proxyConfig)) {
+        body = downgradeAdminOnlyModels(body, adminOnly);
+        model = parseRequestModel(body);
+        advisorModel = parseAdvisorModel(body);
+        if (model && !hideActivity) /** @type {any} */ (hooks).onRequestModel?.(reqId, { model });
+      }
 
       // What session-aware routing pins on. The session id names the CLIENT
       // session, which is one id for a Claude Code session AND every subagent it
@@ -3162,8 +3178,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
-  // truncate or stall.
-  if (sendBody !== body) headers['content-length'] = String(sendBody.length);
+  // truncate or stall. `body` itself can already differ from what the client
+  // framed — the admin-only model swap happens at dispatch, before this — so a
+  // declared length that no longer matches is refreshed too.
+  if (sendBody !== body || (headers['content-length'] != null && String(headers['content-length']) !== String(sendBody.length))) {
+    headers['content-length'] = String(sendBody.length);
+  }
 
   // Streaming request log, opened lazily on the first terminal outcome (a
   // pure-429-then-retry attempt writes no file, matching prior behavior). The
@@ -4334,6 +4354,73 @@ export function rewriteModel(body, modelMap) {
     }
   } catch { /* not JSON — pass through unchanged */ }
   return body;
+}
+
+/**
+ * The model a caller who is not an admin is served instead of `model`, per
+ * `proxy.adminOnlyModels` — a map of model glob to replacement id, e.g.
+ * `{ "*fable*": "claude-opus-5-5" }` — or null when `model` is not admin-only.
+ * The first matching glob wins. A setting that is not a plain object, and an
+ * entry whose replacement is not a non-empty string, match nothing.
+ * @param {unknown} adminOnlyModels
+ * @param {unknown} model
+ * @returns {string|null}
+ */
+export function adminOnlyReplacement(adminOnlyModels, model) {
+  if (typeof model !== 'string' || !adminOnlyModels || typeof adminOnlyModels !== 'object' || Array.isArray(adminOnlyModels)) return null;
+  for (const [glob, replacement] of Object.entries(adminOnlyModels)) {
+    if (typeof replacement === 'string' && replacement && modelGlobMatches(glob, model)) return replacement;
+  }
+  return null;
+}
+
+/**
+ * `body` with every admin-only model it names swapped for its replacement: the
+ * top-level `model`, and the advisor tool's `model` in `tools[]`, since the
+ * advisor sub-inference runs that second model on the same request. Returns the
+ * original buffer when nothing matched or the body is not JSON. Exported for tests.
+ * @param {Buffer} body
+ * @param {unknown} adminOnlyModels
+ * @returns {Buffer}
+ */
+export function downgradeAdminOnlyModels(body, adminOnlyModels) {
+  try {
+    const obj = JSON.parse(body.toString('utf8'));
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return body;
+    let changed = false;
+    const top = adminOnlyReplacement(adminOnlyModels, obj.model);
+    if (top) { obj.model = top; changed = true; }
+    if (Array.isArray(obj.tools)) {
+      for (const tool of obj.tools) {
+        if (!tool || typeof tool !== 'object' || typeof tool.type !== 'string' || !/^advisor/i.test(tool.type)) continue;
+        const advisor = adminOnlyReplacement(adminOnlyModels, tool.model);
+        if (advisor) { tool.model = advisor; changed = true; }
+      }
+    }
+    if (changed) return Buffer.from(JSON.stringify(obj), 'utf8');
+  } catch { /* not JSON — pass through unchanged */ }
+  return body;
+}
+
+/**
+ * Whether a proxied request may use admin-only models: the operator (the shared
+ * key, or a key-exempt local caller) or a client key whose entry says role
+ * "admin". The base listener stamps the role from the key that authenticated.
+ * Inside a MITM tunnel only the client's name rides along (`forcedClient`), so
+ * its role is looked up in the live clientKeys; a name that is listed more than
+ * once counts as admin only when every entry for it says so, and a name no
+ * longer listed does not.
+ * @param {any} req
+ * @param {string|null} forcedClient
+ * @param {any} proxyConfig
+ * @returns {boolean}
+ */
+function isAdminCaller(req, forcedClient, proxyConfig) {
+  if (req.tcClient !== undefined) return controlRole(req.tcClient, req.tcRole) === 'operator';
+  if (!forcedClient) return true;
+  const entries = (Array.isArray(proxyConfig?.clientKeys) ? proxyConfig.clientKeys : [])
+    .filter(/** @param {any} e */ e => typeof e?.name === 'string' && e.name.trim() === forcedClient);
+  return entries.length > 0 && entries.every(/** @param {any} e */ e => clientKeyRole(e) === 'admin');
 }
 
 /**
