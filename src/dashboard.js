@@ -17,6 +17,8 @@
 import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
+import { formatMoney } from './oauth.js';
+import { resolveMaxSpendMinor, spendCapReached } from './model.js';
 
 export function renderDashboardHtml() {
   return PAGE;
@@ -240,6 +242,40 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // path, which is the default and earns no badge.
   if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
   return badges;
+}
+
+// The account card's money line: what extra usage (paid overage) has cost this
+// month, against upstream's monthly limit and the operator's `maxSpend`, or
+// null when the account cannot bill and has billed nothing. The same rule and
+// the same figures as the `Spend` line of `teamclaude status` (spendLine), and
+// likewise a line of text rather than another quota bar: past the plan this is
+// money, not an allowance that runs out. `bad` once it has billed, `warn` while
+// it only can — or did, and has since been switched off.
+/**
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {{ kind: string, text: string }|null}
+ */
+export function extraUsageLine(account) {
+  var a = account || {};
+  var spend = (a.quota || {}).spend;
+  if (!spend) return null;
+  var spent = (spend.usedMinor || 0) > 0;
+  if (!spend.enabled && !spent) return null;
+  var amount = formatMoney(spend);
+  var capMinor = resolveMaxSpendMinor(a.maxSpend, spend);
+  var cap = capMinor == null ? ''
+    : ', cap ' + formatMoney({ currency: spend.currency, exponent: spend.exponent, usedMinor: capMinor, limitMinor: null });
+  if (spend.enabled) {
+    if (spendCapReached(a.maxSpend, spend)) return { kind: 'bad', text: 'extra usage: spend cap reached — ' + amount + ' used this month' + cap };
+    if (spent) return { kind: 'bad', text: 'extra usage: billing — ' + amount + ' used this month' + cap };
+    return { kind: 'warn', text: 'extra usage: can bill past plan limits — ' + amount + ' used this month' + cap };
+  }
+  // Off now, but money moved this month. Why it is off decides whether it can
+  // come back: out of credits and the member switching it off differ.
+  var why = spend.userDisabled ? 'now disabled by the account holder'
+    : spend.disabledReason ? 'now off (' + String(spend.disabledReason).slice(0, 64) + ')'
+    : 'now off';
+  return { kind: 'warn', text: 'extra usage: ' + amount + ' spent this month, ' + why };
 }
 
 // One row per CONVERSATION, from `sessions.items` (proxy.sessionDetail). A
@@ -683,10 +719,15 @@ export function viewerCan(viewer, action) {
   return action === 'switch' || action === 'reload' || action === 'probe';
 }
 
+// The money helpers come from oauth.js and model.js rather than being written
+// again here: they close over nothing, so their source text runs in the page
+// as it is, and the card cannot format or judge a cap differently from
+// `teamclaude status` and the router.
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
+  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageLine,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -815,6 +856,9 @@ const PAGE = `<!doctype html>
   @media (max-width: 520px) { .crow { grid-template-columns: minmax(56px, 96px) 1fr 92px; gap: 8px; } }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
   .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
+  .spend { font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .spend.warn { color: var(--warn); }
+  .spend.bad { color: var(--bad); }
   .act { font: inherit; font-size: 12px; padding: 1px 10px; border-radius: 999px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; margin-left: auto; }
   .act:hover { background: var(--accent); color: var(--bg); }
   .act:disabled { opacity: .5; cursor: default; }
@@ -1101,6 +1145,8 @@ ${SHARED_HELPERS}
     } else {
       card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
     }
+    var xu = extraUsageLine(a);
+    if (xu) card.appendChild(el('div', 'spend ' + xu.kind, xu.text));
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
     card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
