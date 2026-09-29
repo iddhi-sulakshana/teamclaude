@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
 import { matchAccounts } from './identity.js';
 import { THRESHOLD_BUCKET_KEYS, WEEKLY_BUCKET_KEYS } from './model.js';
@@ -396,4 +397,129 @@ export function setAccountDisabled(config, query, disabled, spec = {}) {
   if (disabled) account.disabled = true;
   else delete account.disabled;
   return { name: account.name, disabled: !!account.disabled };
+}
+
+// ── users (proxy.clientKeys) ─────────────────────────────────────────────────
+//
+// What the dashboard's Users card changes. A user is every clientKeys entry
+// that carries one name: the auth gate books them all to that name, so remove
+// and role act on all of them rather than refusing a name listed twice. The
+// role is written the way the server reads it (clientKeyRole): absent for a
+// tenant, "admin" or "readonly" otherwise.
+
+export const USER_ROLES = ['tenant', 'admin', 'readonly'];
+
+const MAX_USER_NAME = 64;
+
+/**
+ * @param {unknown} role
+ * @returns {'tenant'|'admin'|'readonly'}
+ */
+function userRole(role) {
+  if (role == null) return 'tenant';
+  if (typeof role !== 'string' || !USER_ROLES.includes(role)) {
+    throw new ConfigOpError('A user role is tenant, admin or readonly.');
+  }
+  return /** @type {'tenant'|'admin'|'readonly'} */ (role);
+}
+
+/**
+ * @param {Config} config
+ * @returns {any[]}
+ */
+function clientKeyList(config) {
+  return Array.isArray(config.proxy?.clientKeys) ? config.proxy.clientKeys : [];
+}
+
+/**
+ * @param {any} entry
+ * @param {string} name
+ */
+const namedAs = (entry, name) => typeof entry?.name === 'string' && entry.name.trim() === name;
+
+/**
+ * @param {unknown} name
+ * @returns {string}
+ */
+function userName(name) {
+  if (typeof name !== 'string' || !name.trim()) throw new ConfigOpError('name a user');
+  return name.trim();
+}
+
+/**
+ * Add a user with a newly generated key. The key is returned here and nowhere
+ * else: status never carries keys, so this is the caller's one chance to hand
+ * it over.
+ *
+ * Refused on a proxy with no `proxy.apiKey`: with neither a shared key nor a
+ * client key the gate lets every caller through, and the first client key
+ * would quietly start refusing every remote caller that has none.
+ *
+ * @param {Config} config
+ * @param {{ name?: unknown, role?: unknown }} spec
+ * @returns {{ name: string, role: 'tenant'|'admin'|'readonly', key: string }}
+ */
+export function addClientKey(config, spec) {
+  if (typeof spec.name !== 'string' || !spec.name.trim()) throw new ConfigOpError('A user needs a name.');
+  refuseControlCharacters(spec.name, 'A user name');
+  const name = spec.name.trim();
+  if (name.length > MAX_USER_NAME) throw new ConfigOpError(`A user name is at most ${MAX_USER_NAME} characters.`);
+  const role = userRole(spec.role);
+  if (!config.proxy?.apiKey) {
+    throw new ConfigOpError('This proxy has no key, so every caller is let in; set proxy.apiKey first, or the first user would lock out every remote caller without one.');
+  }
+  const list = clientKeyList(config);
+  if (list.some(e => namedAs(e, name))) throw new ConfigOpError(`There is already a user named "${name}".`);
+
+  const key = 'tc-' + randomBytes(24).toString('base64url');
+  /** @type {Record<string, string>} */
+  const entry = { name, key };
+  if (role !== 'tenant') entry.role = role;
+  config.proxy.clientKeys = [...list, entry];
+  return { name, role, key };
+}
+
+/**
+ * Remove a user: every clientKeys entry with the name.
+ * @param {Config} config
+ * @param {unknown} query
+ * @param {{ actor?: string|null }} [spec] the user making the change, who may
+ *   not remove the key they are signed in with
+ * @returns {{ name: string, removed: number }}
+ */
+export function removeClientKey(config, query, spec = {}) {
+  const name = userName(query);
+  const list = clientKeyList(config);
+  const kept = list.filter(e => !namedAs(e, name));
+  if (kept.length === list.length) throw new ConfigOpError(`There is no user named "${name}".`);
+  if (spec.actor === name) throw new ConfigOpError('You cannot remove the key you are signed in with.');
+  if (!config.proxy?.apiKey && kept.length === 0) {
+    throw new ConfigOpError('This is the last user and there is no proxy.apiKey, so removing it would let every caller in; set proxy.apiKey first.');
+  }
+  config.proxy.clientKeys = kept;
+  return { name, removed: list.length - kept.length };
+}
+
+/**
+ * Set a user's role on every entry with the name.
+ * @param {Config} config
+ * @param {unknown} query
+ * @param {unknown} role tenant, admin or readonly
+ * @param {{ actor?: string|null }} [spec] the user making the change, who may
+ *   not take admin from themselves
+ * @returns {{ name: string, role: 'tenant'|'admin'|'readonly' }}
+ */
+export function setClientKeyRole(config, query, role, spec = {}) {
+  const name = userName(query);
+  const next = userRole(role);
+  const entries = clientKeyList(config).filter(e => namedAs(e, name));
+  if (!entries.length) throw new ConfigOpError(`There is no user named "${name}".`);
+  if (spec.actor === name && next !== 'admin') {
+    throw new ConfigOpError('You cannot take admin from the key you are signed in with.');
+  }
+  for (const entry of entries) {
+    if (next === 'tenant') delete entry.role;
+    else entry.role = next;
+  }
+  return { name, role: next };
 }

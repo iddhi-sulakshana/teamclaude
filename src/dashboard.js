@@ -979,10 +979,40 @@ export function loginOutcome(res) {
   return { kind: 'ok', text: (res.action === 'updated' ? 'signed in again as ' : 'added account ') + res.name };
 }
 
+// The three requests the Users card sends. Each carries only the fields its
+// endpoint reads, so a remove never ships a role it would ignore. The name is
+// trimmed here because it is typed.
+/** @param {'add'|'remove'|'role'} op @param {{ name: string, role?: string }} spec @param {string|null} key */
+export function userRequest(op, spec, key) {
+  /** @type {Record<string, unknown>} */
+  var body = { name: String(spec.name || '').trim() };
+  if (op !== 'remove') body.role = spec.role;
+  return {
+    url: '/teamclaude/users/' + op,
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+// The note after a user change. Built from the name and role only: an add's
+// reply carries the key, and the note must never repeat it.
+/** @param {'add'|'remove'|'role'} op @param {any} res */
+export function userOutcome(op, res) {
+  var failed = { add: 'adding the user failed', remove: 'removing the user failed', role: 'changing the role failed' };
+  if (!res || !res.ok) return { kind: 'error', text: failed[op] + (res && res.error ? ': ' + res.error : '') };
+  if (op === 'add') return { kind: 'ok', text: 'added user ' + res.name };
+  if (op === 'remove') return { kind: 'ok', text: 'removed user ' + res.name };
+  /** @type {Record<string, string>} */
+  var as = { tenant: 'a user', admin: 'an admin', readonly: 'read-only' };
+  return { kind: 'ok', text: res.name + ' is now ' + (as[res.role] || res.role) };
+}
+
 // Whether the caller the status payload names may use one of the page's
 // controls, mirroring the server's gates (controlRole in server.js) so a button
 // is offered only where it would be honoured. `action` is 'switch', 'reload',
-// 'probe', 'accounts' (enable/disable and priority) or 'threshold'. A server
+// 'probe', 'accounts' (enable/disable and priority), 'threshold' or 'users'. A server
 // older than `viewer` sends none, and every control shows as it always did —
 // the server's 403 still has the final word either way.
 /** @param {{ role?: string }|null|undefined} viewer @param {string} action */
@@ -1000,7 +1030,7 @@ export function viewerCan(viewer, action) {
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
+  clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome,
   formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -1397,6 +1427,14 @@ const PAGE = `<!doctype html>
   .cl-val { text-align: right; white-space: nowrap; }
   .cl-val b { font-weight: 500; }
   .cl-val span { color: var(--dim); }
+  /* Users (proxy.clientKeys) */
+  .us-row { display: grid; grid-template-columns: minmax(0,1fr) auto auto; gap: 12px; align-items: center; padding: 8px 10px; margin: 0 -10px; border-radius: 14px; font-size: 13px; }
+  .us-row:hover { background: var(--row-hover); }
+  .us-row .you { color: var(--dim); font-weight: 400; margin-left: 6px; }
+  #userRoleSeg { align-self: flex-start; }
+  #userNote { font-size: 12px; color: var(--dim); line-height: 1.5; }
+  #userNote.ok { color: var(--lime-text); } #userNote.error { color: var(--coral-text); }
+  @media (max-width: 560px) { .us-row { grid-template-columns: minmax(0,1fr) auto; } .us-row .seg { grid-column: 1 / -1; justify-self: start; } }
 
   /* Tables */
   .tbl-wrap { overflow-x: auto; }
@@ -1667,6 +1705,17 @@ const PAGE = `<!doctype html>
       </section>
     </section>
 
+    <section class="card rise" id="userAdminSec" style="display:none">
+      <div class="card-head">
+        <h2 class="card-title">${ICONS.users}Users</h2>
+        <div class="seg-row">
+          <span class="card-cap" id="userCount"></span>
+          <button id="addUser" class="pill-btn sm" type="button">Add user <span class="glyph" aria-hidden="true">+</span></button>
+        </div>
+      </div>
+      <div id="userRows"></div>
+    </section>
+
     <div id="dimensionsWrap" class="duo" style="display:none"></div>
 
     <section class="card flush" id="sessionsWrap" style="display:none">
@@ -1707,6 +1756,32 @@ const PAGE = `<!doctype html>
         </div>
       </div>
       <div id="loginNote"></div>
+    </section>
+  </div>
+
+  <div id="userWrap" class="scrim" style="display:none">
+    <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="userTitle">
+      <div class="dlg-head">
+        <div class="dlg-title" id="userTitle">Add a user</div>
+        <button id="userClose" class="icon-btn sm" type="button" title="Close" aria-label="Close">×</button>
+      </div>
+      <div id="userForm" class="step-body">
+        <div class="step-text">Each user gets a key of their own; what they spend is booked to their name.</div>
+        <div class="code-row">
+          <input id="userNameIn" type="text" placeholder="Name, e.g. alice or ci-nightly" autocomplete="off" spellcheck="false" maxlength="64">
+        </div>
+        <span class="seg on-bg" id="userRoleSeg" role="group" aria-label="New user role"></span>
+        <div class="row-btns"><button id="userGo" class="pill-btn md violet" type="button">Add user</button></div>
+      </div>
+      <div id="userKeyWrap" class="step-body" style="display:none">
+        <div class="step-text">Give this key to <b id="userKeyFor"></b>. They use it as the proxy key (<code>x-api-key</code>).</div>
+        <div class="code-row">
+          <input id="userKey" type="text" readonly autocomplete="off" spellcheck="false">
+          <button id="userKeyCopy" class="pill-btn md quiet" type="button">Copy</button>
+        </div>
+        <div class="row-btns"><button id="userDone" class="pill-btn md" type="button">Done</button></div>
+      </div>
+      <div id="userNote"></div>
     </section>
   </div>
 
@@ -1753,6 +1828,19 @@ const PAGE = `<!doctype html>
   // Add account: the state naming the sign-in link now open, or null. The
   // server holds everything else about that login; the link is only opened.
   var loginState = null;
+  // The Users card: the roles in the order its buttons show them, and how each
+  // is named in a "Make bob ..." title. A tenant is shown as a plain user, the
+  // way the header already names a tenant viewer.
+  var USER_ROLE_OPTIONS = [['tenant', 'User', 'a user'], ['admin', 'Admin', 'admin'], ['readonly', 'Read-only', 'read-only']];
+  // The user whose Remove has been pressed once and now asks to be confirmed,
+  // and what the rows were last built from: a poll that changes nothing leaves
+  // them alone, so a pending Confirm is not rebuilt out from under the pointer.
+  var userConfirm = null;
+  var userRowsFrom = '';
+  // Add user's dialog: whether it is open, and the role picked for the new user.
+  var userDialogOpen = false;
+  var newUserRole = 'tenant';
+  var newUserRoleButtons = [];
   // The account whose settings dialog is open, by name, and what its rows were
   // last built from: the poll rebuilds the dialog only when that changes, so a
   // focused control is not pulled out from under the keyboard every 5s.
@@ -2165,6 +2253,170 @@ ${SHARED_HELPERS}
       n.style.display = 'block';
     }
     d.appendChild(n);
+  }
+
+  // ── Users ────────────────────────────────────────────────────────────────
+
+  // The configured users, for an operator: the server sends the list to no one
+  // else, and the card checks the viewer as well rather than rely on that.
+  // Your own row offers neither Remove nor a role below admin, which the
+  // server would refuse: that key is the one this page is signed in with.
+  function renderUserAdmin(s) {
+    var viewer = s.viewer || null;
+    var users = viewerCan(viewer, 'users') && Array.isArray(s.users) ? s.users : null;
+    byId('userAdminSec').style.display = users ? '' : 'none';
+    if (!users) {
+      if (userDialogOpen) closeAddUser();
+      userRowsFrom = '';
+      return;
+    }
+    var me = viewer && viewer.client;
+    var from = JSON.stringify([users, me, userConfirm]);
+    if (from === userRowsFrom) return;
+    userRowsFrom = from;
+    byId('userCount').textContent = users.length === 1 ? '1 user' : users.length + ' users';
+    var box = byId('userRows');
+    box.textContent = '';
+    if (!users.length) {
+      box.appendChild(el('div', 'hint', 'No users yet: everyone shares the proxy key, and usage is not booked by name.'));
+      return;
+    }
+    users.forEach(function (u) {
+      var row = el('div', 'us-row');
+      var nm = el('span', 'cl-name', u.name);
+      nm.title = u.name;
+      if (u.name === me) nm.appendChild(el('span', 'you', 'you'));
+      row.appendChild(nm);
+      var seg = el('span', 'seg on-bg');
+      seg.setAttribute('role', 'group');
+      seg.setAttribute('aria-label', 'Role of ' + u.name);
+      USER_ROLE_OPTIONS.forEach(function (o) {
+        if (u.name === me && o[0] !== 'admin') return;
+        var on = u.role === o[0];
+        var b = el('button', on ? 'sel' : '', o[1]);
+        b.type = 'button';
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+        b.title = on ? u.name + ' is ' + o[2] : 'Make ' + u.name + ' ' + o[2];
+        if (!on) b.addEventListener('click', function () { doUserChange('role', { name: u.name, role: o[0] }, b); });
+        seg.appendChild(b);
+      });
+      row.appendChild(seg);
+      if (u.name === me) {
+        row.appendChild(el('span'));
+      } else {
+        var confirming = userConfirm === u.name;
+        var rm = el('button', 'pill-btn xs ' + (confirming ? 'violet' : 'quiet'), confirming ? 'Confirm' : 'Remove');
+        rm.type = 'button';
+        rm.title = 'Remove ' + u.name;
+        rm.addEventListener('click', function () {
+          // The first press only asks: a removed key stops working at once,
+          // and whoever holds it has to be given a new one.
+          if (userConfirm !== u.name) { userConfirm = u.name; if (lastStatus) renderUserAdmin(lastStatus); return; }
+          userConfirm = null;
+          doUserChange('remove', { name: u.name }, rm);
+        });
+        row.appendChild(rm);
+      }
+      box.appendChild(row);
+    });
+  }
+
+  function buildUserRoleButtons() {
+    var seg = byId('userRoleSeg');
+    USER_ROLE_OPTIONS.forEach(function (o) {
+      var b = el('button', '', o[1]);
+      b.type = 'button';
+      b.title = 'New user role: ' + o[1];
+      b.addEventListener('click', function () {
+        newUserRole = o[0];
+        markSelected(newUserRoleButtons, newUserRole);
+      });
+      seg.appendChild(b);
+      newUserRoleButtons.push({ key: o[0], btn: b });
+    });
+  }
+
+  function userNote(kind, text) {
+    var n = byId('userNote');
+    n.className = kind || '';
+    n.textContent = text;
+  }
+
+  function openAddUser() {
+    newUserRole = 'tenant';
+    markSelected(newUserRoleButtons, newUserRole);
+    byId('userNameIn').value = '';
+    byId('userKey').value = '';
+    byId('userForm').style.display = '';
+    byId('userKeyWrap').style.display = 'none';
+    userNote('', '');
+    userDialogOpen = true;
+    byId('userWrap').style.display = '';
+    byId('userNameIn').focus();
+  }
+
+  // The key leaves the page with the dialog: it was shown once, and a later
+  // look at the DOM should not find it.
+  function closeAddUser() {
+    userDialogOpen = false;
+    byId('userWrap').style.display = 'none';
+    byId('userKey').value = '';
+    byId('userKeyFor').textContent = '';
+    byId('userNameIn').value = '';
+  }
+
+  // Whether the dialog is showing a key, which a stray Escape or a click on
+  // the backdrop must not throw away: only Done or the close button do then.
+  function showingUserKey() {
+    return userDialogOpen && byId('userKeyWrap').style.display !== 'none';
+  }
+
+  function doAddUser(btn) {
+    var name = byId('userNameIn').value.trim();
+    if (!name) { userNote('error', 'give the user a name'); return; }
+    btn.disabled = true;
+    userNote('', 'adding…');
+    var r = userRequest('add', { name: name, role: newUserRole }, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = userOutcome('add', json);
+        if (out.kind !== 'ok') { userNote('error', out.text); return; }
+        byId('userForm').style.display = 'none';
+        byId('userKeyFor').textContent = json.name;
+        byId('userKey').value = json.key;
+        byId('userKeyWrap').style.display = '';
+        userNote('ok', 'Copy it now: it won’t be shown again. If it is lost, remove the user and add them again.');
+        note('ok', out.text);
+        poll();
+      })
+      .catch(function (e) { userNote('error', userOutcome('add', { ok: false, error: e.message }).text); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  function doUserChange(op, spec, btn) {
+    btn.disabled = true;
+    var r = userRequest(op, spec, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = userOutcome(op, json);
+        note(out.kind, out.text);
+        if (out.kind === 'ok') poll();
+        else btn.disabled = false;
+      })
+      .catch(function (e) {
+        note('error', userOutcome(op, { ok: false, error: e.message }).text);
+        btn.disabled = false;
+      });
   }
 
   // ── Overview ─────────────────────────────────────────────────────────────
@@ -2993,6 +3245,7 @@ ${SHARED_HELPERS}
     // a fleet with neither has nothing for it to change.
     byId('usageViewWrap').style.display = hasClients(s) || hasDims ? '' : 'none';
     renderSessions(s.sessions);
+    renderUserAdmin(s);
     if (settingsFor) renderSettings();
     byId('foot').textContent = 'Refreshes every ' + (POLL_MS / 1000) + 's · last update ' + new Date().toLocaleTimeString();
     syncMsgs();
@@ -3338,6 +3591,25 @@ ${SHARED_HELPERS}
   // first status does.
   if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === 'function') document.fonts.ready.then(movePill);
   byId('addAcct').addEventListener('click', function () { doLoginStart(this); });
+  buildUserRoleButtons();
+  byId('addUser').addEventListener('click', openAddUser);
+  byId('userGo').addEventListener('click', function () { doAddUser(this); });
+  byId('userNameIn').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') byId('userGo').click();
+  });
+  byId('userClose').addEventListener('click', closeAddUser);
+  byId('userDone').addEventListener('click', closeAddUser);
+  byId('userKeyCopy').addEventListener('click', function () {
+    var btn = this;
+    var failed = function () { userNote('error', 'could not copy; select the key and copy it by hand'); };
+    try {
+      navigator.clipboard.writeText(byId('userKey').value).then(function () {
+        btn.textContent = 'Copied ✓';
+        setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+      }, failed);
+    } catch (e) { failed(); }
+  });
+  byId('userWrap').addEventListener('click', function (e) { if (e && e.target === this && !showingUserKey()) closeAddUser(); });
   byId('loginGo').addEventListener('click', function () { doLoginFinish(this); });
   byId('loginCode').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') byId('loginGo').click();
@@ -3361,6 +3633,7 @@ ${SHARED_HELPERS}
     if (e.key !== 'Escape') return;
     if (settingsFor) closeSettings();
     else if (loginState) closeLogin();
+    else if (userDialogOpen && !showingUserKey()) closeAddUser();
   });
 
   ['fProject', 'fClient'].forEach(function (id) {

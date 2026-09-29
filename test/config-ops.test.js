@@ -2,14 +2,17 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  addClientKey,
   ConfigOpError,
   MAX_PROBE_SECONDS,
+  removeClientKey,
   resolveConfiguredAccount,
   setAccountDisabled,
   setAccountPriority,
   removeRoute,
   setBlockedModels,
   setBucketThresholds,
+  setClientKeyRole,
   setDefaultClientMode,
   setDistribution,
   setProbeSeconds,
@@ -275,4 +278,102 @@ test('setAccountDisabled deletes the key when enabling, as the CLI always has', 
   // A throwing op must not have half-applied.
   assert.throws(() => setAccountDisabled(config, 'solo@x.com', 'yes'), ConfigOpError);
   assert.ok(!('disabled' in config.accounts[2]));
+});
+
+// ── users (proxy.clientKeys) ─────────────────────────────────────────────────
+
+const userConfig = () => ({
+  proxy: {
+    apiKey: 'tc-shared',
+    clientKeys: [
+      { name: 'alice', key: 'tc-alice', role: 'admin' },
+      { name: 'bob', key: 'tc-bob' },
+      // A name listed twice shares one usage counter; the ops treat it as one user.
+      { name: 'ci', key: 'tc-ci-1', role: 'readonly' },
+      { name: 'ci', key: 'tc-ci-2', role: 'readonly' },
+    ],
+  },
+});
+
+test('addClientKey generates the key, stores the role, and leaves a tenant without one', () => {
+  const config = userConfig();
+  const carol = addClientKey(config, { name: '  carol ', role: 'readonly' });
+  assert.equal(carol.name, 'carol', 'the name is trimmed');
+  assert.equal(carol.role, 'readonly');
+  assert.match(carol.key, /^tc-[A-Za-z0-9_-]{32}$/, 'the same shape as the generated proxy.apiKey');
+  assert.deepEqual(config.proxy.clientKeys.at(-1), { name: 'carol', key: carol.key, role: 'readonly' });
+
+  const dave = addClientKey(config, { name: 'dave', role: 'tenant' });
+  assert.equal(dave.role, 'tenant');
+  assert.deepEqual(config.proxy.clientKeys.at(-1), { name: 'dave', key: dave.key }, 'a tenant is the entry with no role');
+  assert.notEqual(dave.key, carol.key);
+
+  // No role at all is a tenant too.
+  assert.equal(addClientKey(config, { name: 'erin' }).role, 'tenant');
+});
+
+test('addClientKey refuses a missing, taken or malformed name, and an unknown role', () => {
+  const config = userConfig();
+  const before = JSON.stringify(config);
+  refused(() => addClientKey(config, { name: '' }), /needs a name/);
+  refused(() => addClientKey(config, { name: '   ' }), /needs a name/);
+  refused(() => addClientKey(config, { name: 42 }), /needs a name/);
+  refused(() => addClientKey(config, { name: ' bob ' }), /already a user named "bob"/);
+  refused(() => addClientKey(config, { name: 'b\nob' }), /control characters/);
+  refused(() => addClientKey(config, { name: 'x'.repeat(65) }), /64 characters/);
+  refused(() => addClientKey(config, { name: 'zed', role: 'root' }), /tenant, admin or readonly/);
+  assert.equal(JSON.stringify(config), before, 'a refused add must not have half-applied');
+});
+
+// With no proxy.apiKey and no client keys the proxy has no auth at all; the
+// first client key turns it on for every remote caller, who has no key.
+test('addClientKey refuses on a proxy with no shared key, which the first user would lock out', () => {
+  const config = { proxy: {} };
+  refused(() => addClientKey(config, { name: 'bob' }), /set proxy\.apiKey first/);
+  assert.deepEqual(config, { proxy: {} });
+  refused(() => addClientKey({}, { name: 'bob' }), /set proxy\.apiKey first/);
+});
+
+test('removeClientKey removes every entry of the name, and refuses an unknown one', () => {
+  const config = userConfig();
+  assert.deepEqual(removeClientKey(config, 'ci'), { name: 'ci', removed: 2 });
+  assert.deepEqual(config.proxy.clientKeys.map(e => e.name), ['alice', 'bob']);
+  assert.deepEqual(removeClientKey(config, ' bob '), { name: 'bob', removed: 1 });
+  refused(() => removeClientKey(config, 'zed'), /no user named "zed"/);
+  refused(() => removeClientKey(config, ''), /name a user/);
+});
+
+test('removeClientKey refuses the caller removing themselves', () => {
+  const config = userConfig();
+  refused(() => removeClientKey(config, 'alice', { actor: 'alice' }), /cannot remove the key you are signed in with/);
+  assert.equal(config.proxy.clientKeys.length, 4);
+  assert.deepEqual(removeClientKey(config, 'bob', { actor: 'alice' }), { name: 'bob', removed: 1 });
+});
+
+test('removeClientKey refuses the last user on a proxy with no shared key, which would open it', () => {
+  const config = { proxy: { clientKeys: [{ name: 'bob', key: 'tc-bob' }, { name: 'eve', key: 'tc-eve' }] } };
+  removeClientKey(config, 'eve');
+  refused(() => removeClientKey(config, 'bob'), /no proxy\.apiKey/);
+  assert.equal(config.proxy.clientKeys.length, 1);
+});
+
+test('setClientKeyRole sets the role on every entry of the name, and tenant clears it', () => {
+  const config = userConfig();
+  assert.deepEqual(setClientKeyRole(config, 'bob', 'admin'), { name: 'bob', role: 'admin' });
+  assert.equal(config.proxy.clientKeys[1].role, 'admin');
+  assert.deepEqual(setClientKeyRole(config, 'ci', 'tenant'), { name: 'ci', role: 'tenant' });
+  assert.ok(config.proxy.clientKeys.slice(2).every(e => !('role' in e)), 'a tenant is the entry with no role');
+  assert.equal(config.proxy.clientKeys[2].key, 'tc-ci-1', 'the key is untouched');
+
+  refused(() => setClientKeyRole(config, 'zed', 'admin'), /no user named "zed"/);
+  refused(() => setClientKeyRole(config, 'bob', 'owner'), /tenant, admin or readonly/);
+  assert.equal(config.proxy.clientKeys[1].role, 'admin');
+});
+
+test('setClientKeyRole refuses the caller demoting themselves, but not re-affirming admin', () => {
+  const config = userConfig();
+  refused(() => setClientKeyRole(config, 'alice', 'readonly', { actor: 'alice' }), /cannot take admin from the key you are signed in with/);
+  refused(() => setClientKeyRole(config, 'alice', 'tenant', { actor: 'alice' }), /cannot take admin/);
+  assert.equal(config.proxy.clientKeys[0].role, 'admin');
+  assert.deepEqual(setClientKeyRole(config, 'alice', 'admin', { actor: 'alice' }), { name: 'alice', role: 'admin' });
 });
