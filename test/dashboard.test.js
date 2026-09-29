@@ -6,8 +6,8 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens,
-  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks,
-  sessionRows, filterSessionRows, sortRows, uniqSorted,
+  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks,
+  sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
@@ -237,6 +237,19 @@ test('sorting handles both text and number columns, and does not mutate', () => 
   assert.deepEqual(sortRows(rows, 'client', 'desc').map(r => r.session), ['s-old', 's-new']);
   assert.deepEqual(rows.map(r => r.session), before, 'the caller\'s array is untouched');
   assert.deepEqual(sortRows(null, 'total', 'desc'), []);
+});
+
+test('blocked and disabled accounts sort after the serving ones, each group in fleet order', () => {
+  const accounts = [
+    { name: 'a', unavailable: 'throttled' },
+    { name: 'b' },
+    { name: 'c', disabled: true, unavailable: 'disabled' },
+    { name: 'd' },
+    { name: 'e', unavailable: 'quota' },
+  ];
+  assert.deepEqual(accountDisplayOrder(accounts), [1, 3, 0, 2, 4]);
+  assert.deepEqual(accountDisplayOrder([{ name: 'x' }, { name: 'y' }]), [0, 1]);
+  assert.deepEqual(accountDisplayOrder(null), []);
 });
 
 test('filter options are unique, sorted, and drop the unlabelled', () => {
@@ -943,6 +956,25 @@ test('a first poll that fails shows its error instead of a blank page', async ()
   assert.equal(page.byId('app').style.display, '');
 });
 
+test('every id on the page is unique', () => {
+  // Two elements sharing an id would have one of them drawn into the other's
+  // place, the way getElementById answers only the first.
+  const ids = [...renderDashboardHtml().matchAll(/ id="([^"]+)"/g)].map(m => m[1]);
+  assert.deepEqual(ids.filter((id, i) => ids.indexOf(id) !== i), []);
+});
+
+test('Proxy status counts the accounts a request could go to, and names the blocked ones', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [
+    { name: 'a' },
+    { name: 'b', unavailable: 'throttled' },
+    { name: 'c', disabled: true, unavailable: 'disabled' },
+  ] });
+  assert.equal(page.labelled('1 of 3'), 1);
+  assert.equal(page.byId('acctCount').textContent, '1 of 3 active', 'and the Accounts heading agrees');
+  assert.equal(page.byId('statServing').title, 'Blocked: b (upstream 429 hold), c (disabled by operator)');
+});
+
 test('the overview draws a column per client and switches measure without polling', async () => {
   const page = bootPage();
   await page.answer(200, { accounts: [], clients: {
@@ -1505,12 +1537,18 @@ test('seriesLines tolerates nothing to draw', () => {
   assert.equal(quiet.peakAt, -1, 'and marks none of them');
 });
 
-test('userLineNames gives four clients a line each, and more the top three', () => {
+test('userLineNames gives up to eight clients a line each, and more the busiest eight', () => {
   const rank = n => Array.from({ length: n }, (_, i) => ({ name: 'c' + i }));
-  assert.deepEqual(userLineNames(rank(4)), ['c0', 'c1', 'c2', 'c3']);
-  assert.deepEqual(userLineNames(rank(5)), ['c0', 'c1', 'c2']);
-  assert.deepEqual(userLineNames(rank(1)), ['c0']);
+  assert.deepEqual(userLineNames(rank(6)), ['c0', 'c1', 'c2', 'c3', 'c4', 'c5']);
+  assert.deepEqual(userLineNames(rank(8)).length, 8);
+  assert.deepEqual(userLineNames(rank(11)), ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7']);
   assert.deepEqual(userLineNames(null), []);
+});
+
+test('userSlots colours a client by its name, not its rank', () => {
+  assert.deepEqual(userSlots(['carol', 'alice', 'bob']), { alice: 0, bob: 1, carol: 2 });
+  assert.deepEqual(userSlots(['bob', 'carol', 'alice']), userSlots(['carol', 'alice', 'bob']), 'a reordered ranking keeps the colours');
+  assert.deepEqual(userSlots(null), {});
 });
 
 test('smoothPath passes through every point and never dips below the floor', () => {
@@ -1575,24 +1613,25 @@ test('heatGrid lays clients against four-hour stretches of the day', () => {
   assert.equal(g.rows[3].cells[5].level, 1, 'dave\'s 3 tokens are faint, not empty');
 });
 
-test('heatGrid gives five hours a column each, and folds a seventh client into others', () => {
+test('heatGrid gives five hours a column each, and every active client a row of its own', () => {
   const five = heatGrid(SERIES, '5h', 'requests');
   assert.equal(five.columns.length, 5);
   assert.deepEqual(five.columns[4], { start: END - HOUR, end: END });
   assert.deepEqual(five.rows.map(r => r.name), ['bob', 'alice', 'carol', 'dave']);
   const clients = {};
-  for (let i = 0; i < 7; i++) clients['c' + i] = { requests: hourly([[23, 10 - i]]), inputTokens: hourly([]), outputTokens: hourly([]) };
+  for (let i = 0; i < 9; i++) clients['c' + i] = { requests: hourly([[23, 10 - i]]), inputTokens: hourly([]), outputTokens: hourly([]) };
+  clients.idle = { requests: hourly([]), inputTokens: hourly([]), outputTokens: hourly([]) };
   const many = heatGrid({ ...SERIES, clients }, '24h', 'requests');
-  assert.deepEqual(many.rows.map(r => r.name), ['c0', 'c1', 'c2', 'c3', 'c4', 'others']);
-  assert.deepEqual(many.rows[5].members, ['c5', 'c6']);
-  assert.equal(many.rows[5].cells[5].value, 5 + 4);
+  assert.deepEqual(many.rows.map(r => r.name), ['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8'], 'nine rows, and none for the idle one');
+  assert.ok(many.rows.every(r => !r.others));
+  assert.equal(many.rows[8].cells[5].value, 2);
   assert.deepEqual(heatGrid(null, '24h', 'tokens').rows, []);
 });
 
-test('seriesTicks label the axis the way the design does', () => {
-  assert.deepEqual(seriesTicks(24 * HOUR), ['-24h', '-18h', '-12h', '-6h', 'now']);
-  assert.deepEqual(seriesTicks(5 * HOUR), ['-5h', '-4h', '-3h', '-2h', '-1h', 'now']);
-  assert.deepEqual(seriesTicks(0), []);
+test('seriesTicks are the instants the axis labels with the clock, ending at the series end', () => {
+  assert.deepEqual(seriesTicks(24 * HOUR, END), [END - 24 * HOUR, END - 18 * HOUR, END - 12 * HOUR, END - 6 * HOUR, END]);
+  assert.deepEqual(seriesTicks(5 * HOUR, END), [5, 4, 3, 2, 1, 0].map(h => END - h * HOUR));
+  assert.deepEqual(seriesTicks(0, END), []);
 });
 
 test('meterTone bands a meter on the legend\'s thresholds', () => {
@@ -1608,13 +1647,14 @@ test('meterTone bands a meter on the legend\'s thresholds', () => {
 test('the chart helpers run inside the serialized bundle', () => {
   const script = inlineScripts(renderDashboardHtml()).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
-  const isolated = new Function(`${bundle}; return { clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, meterTone };`)();
+  const isolated = new Function(`${bundle}; return { clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, meterTone };`)();
   assert.deepEqual(isolated.seriesLines(SERIES, '5h', 'requests', ['alice']), seriesLines(SERIES, '5h', 'requests', ['alice']));
   assert.deepEqual(isolated.userLineNames([{ name: 'a' }]), ['a']);
   assert.deepEqual(isolated.heatGrid(SERIES, '24h', 'tokens'), heatGrid(SERIES, '24h', 'tokens'));
   assert.deepEqual(isolated.clientGroups([{ name: 'a', value: 2 }]), clientGroups([{ name: 'a', value: 2 }]));
   assert.equal(isolated.smoothPath([[0, 1], [2, 3]], 5), smoothPath([[0, 1], [2, 3]], 5));
-  assert.deepEqual(isolated.seriesTicks(24 * HOUR), seriesTicks(24 * HOUR));
+  assert.deepEqual(isolated.seriesTicks(24 * HOUR, END), seriesTicks(24 * HOUR, END));
+  assert.deepEqual(isolated.userSlots(['b', 'a']), { a: 0, b: 1 });
   assert.equal(isolated.meterTone(0.7), 'warn');
 });
 
@@ -1636,9 +1676,11 @@ test('a status with a client fetches the usage series and draws it', async () =>
   assert.equal(page.byId('heatTitle').textContent, 'Tokens by time');
   page.click('Last 5h');
   assert.equal(page.byId('seriesCaption').textContent, 'Tokens / hour · last 5h', 'the window control redraws it');
-  assert.equal(page.labelled('-5h'), 1);
+  assert.equal(page.labelled('-5h'), 0, 'the axis reads the clock, not hours ago');
   page.click('Requests');
   assert.equal(page.byId('peakMain').textContent, 'Peak 8 req');
+  assert.equal(page.byId('heatTitle').textContent, 'Tokens by time', 'the grid follows Usage by user, not the overview');
+  page.clickNth('Requests', 1);
   assert.equal(page.byId('heatTitle').textContent, 'Requests by time');
   assert.equal(page.pending().length, 0, 'redrawn from the fetched series, not re-fetched');
 });
@@ -1660,6 +1702,9 @@ test('Usage by user ranks every client and draws their lines in the same colours
   // Two clients ranked, two lines, and the rest of the series (carol, dave)
   // folded into a third the legend names by count.
   assert.equal(page.labelled('2 others'), 1);
+  // The axis ends on the series' own end, by the clock.
+  const clock = new Date(END).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  assert.ok(page.labelled(clock) >= 1, 'the last tick is the end of the series');
   // The scale tops out a little over the highest line: alice's 120, times 1.15.
   assert.equal(page.byId('userMax').textContent, '138 tok');
 });

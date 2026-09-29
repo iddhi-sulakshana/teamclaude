@@ -424,12 +424,22 @@ export function seriesLines(series, view, metric, names) {
 }
 
 // The clients Usage by user draws a line each, in the section's ranking: every
-// one of four or fewer, else the top three, the rest sharing an "others" line —
-// the palette has four colours, and a fold of one would only hide a name.
+// one of them up to the palette's eight colours, and past that the busiest
+// eight, the rest sharing a grey "others" line.
 /** @param {Array<{ name: string }>|null|undefined} ranking */
 export function userLineNames(ranking) {
-  var rows = ranking || [];
-  return (rows.length <= 4 ? rows : rows.slice(0, 3)).map(function (r) { return r.name; });
+  return (ranking || []).slice(0, 8).map(function (r) { return r.name; });
+}
+
+// The colour each drawn client wears, as a palette slot: its place among the
+// drawn names in alphabetical order rather than in the ranking, so a client
+// keeps its colour when the window or the measure reorders the ranking.
+/** @param {string[]|null|undefined} names */
+export function userSlots(names) {
+  /** @type {Record<string, number>} */
+  var slots = {};
+  (names || []).slice().sort().forEach(function (name, i) { slots[name] = i; });
+  return slots;
 }
 
 // A smooth line through the points, as SVG path data: each span a cubic whose
@@ -456,8 +466,8 @@ export function smoothPath(pts, floor) {
   return d;
 }
 
-// Traffic by time, for the heatmap: a row per client — the busiest six on the
-// span shown, or the busiest five and one "others" row when there are more —
+// Traffic by time, for the heatmap: a row per client that spent anything on
+// the span shown, busiest first —
 // and a column per stretch of that span: four hours each across the day, one
 // each across five hours. `level` is a cell's shade, 0 for nothing and 1–4 by
 // quarters of the square root of its share of the busiest cell. Usage is
@@ -494,12 +504,8 @@ export function heatGrid(series, view, metric) {
     return { name: name, sum: sum };
   }).filter(function (r) { return r.sum > 0; });
   ranked.sort(function (x, y) { return (y.sum - x.sum) || (x.name < y.name ? -1 : x.name > y.name ? 1 : 0); });
-  var named = ranked.length > 6 ? ranked.slice(0, 5) : ranked;
   /** @type {Array<{ name: string, others: boolean, members: string[], cells: Array<{ value: number, level: number }> }>} */
-  var rows = named.map(function (r) { return { name: r.name, others: false, members: [r.name], cells: [] }; });
-  if (ranked.length > 6) {
-    rows.push({ name: 'others', others: true, members: ranked.slice(5).map(function (r) { return r.name; }), cells: [] });
-  }
+  var rows = ranked.map(function (r) { return { name: r.name, others: false, members: [r.name], cells: [] }; });
   var max = 0;
   rows.forEach(function (row) {
     row.cells = cols.map(function (col) {
@@ -518,16 +524,20 @@ export function heatGrid(series, view, metric) {
   };
 }
 
-// The chart's axis labels, oldest first and ending at "now": every hour for a
-// span of six hours or less, every quarter of the span beyond that.
-/** @param {number} spanMs */
-export function seriesTicks(spanMs) {
+// The chart's axis ticks, as the instants the page labels with the clock,
+// oldest first and ending at `end`: every hour for a span of six hours or
+// less, every quarter of the span beyond that.
+/**
+ * @param {number} spanMs
+ * @param {number} end
+ */
+export function seriesTicks(spanMs, end) {
   var hours = Math.round((spanMs || 0) / 3600000);
   if (hours <= 0) return [];
   var step = hours <= 6 ? 1 : Math.max(1, Math.round(hours / 4));
   var out = [];
-  for (var h = hours; h > 0; h -= step) out.push('-' + h + 'h');
-  out.push('now');
+  for (var h = hours; h >= 0; h -= step) out.push(end - h * 3600000);
+  if (out[out.length - 1] !== end) out.push(end);
   return out;
 }
 
@@ -598,6 +608,17 @@ export function sortRows(rows, key, dir) {
     }
     return sign * ((x || 0) - (y || 0));
   });
+}
+
+// The order the account grid draws in, as indices into `accounts`: the ones
+// serving first, then the blocked ones (disabled, or out of rotation for any
+// other reason), each group keeping the fleet's own order. Indices rather than
+// the accounts themselves so a card keeps the avatar colour its place in the
+// fleet gives it, the same one its settings dialog shows.
+export function accountDisplayOrder(accounts) {
+  var serving = [], blocked = [];
+  (accounts || []).forEach(function (a, i) { (a.disabled || a.unavailable ? blocked : serving).push(i); });
+  return serving.concat(blocked);
 }
 
 export function uniqSorted(values) {
@@ -977,10 +998,10 @@ export function viewerCan(viewer, action) {
 // as it is, and the card cannot format or judge a cap differently from
 // `teamclaude status` and the router.
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome,
-  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks,
+  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1017,7 +1038,8 @@ const DARK_TOKENS = `
     --tick-off: #2C2C2E; --tick-dim: #636366; --seg-off: #3A3A3C; --bar-dark: #2E2350;
     --heat-0: #241C38; --heat-1: #2A2045; --heat-2: #4A33A0; --heat-3: #7B4CF5; --heat-4: #A98BFF;
     --area: #D6FF4F; --logo-a: #F5F5F7; --bg-pill: #2C2C2E; --grid-dash: rgba(255,255,255,0.1);
-    --user-0: #D6FF4F; --user-1: #A98BFF; --user-2: #7B4CF5; --user-3: #8E8E93;
+    --user-0: #3987E5; --user-1: #D95926; --user-2: #199E70; --user-3: #C98500;
+    --user-4: #D55181; --user-5: #008300; --user-6: #9085E9; --user-7: #E66767; --user-o: #8E8E93;
     --av0: #D6FF4F; --av1: #A98BFF; --av2: #FFB38A; --av3: #F5F5F7; --av4: #8FE3C8; --av5: #FFD66B; --av6: #C9B6FF; --av7: #FF9A88;
     --scrim: rgba(0,0,0,0.7); --shadow: 0 30px 80px rgba(0,0,0,0.7);`;
 
@@ -1034,7 +1056,8 @@ const LIGHT_TOKENS = `
     --tick-off: #E8E8ED; --tick-dim: #AEAEB2; --seg-off: #E3E3E8; --bar-dark: #DCD2FF;
     --heat-0: #F3F0FB; --heat-1: #E4DBFF; --heat-2: #BCA6FF; --heat-3: #8D63FF; --heat-4: #6A3BE8;
     --area: #9CCB00; --logo-a: #1C1C1E; --bg-pill: #FFFFFF; --grid-dash: rgba(0,0,0,0.1);
-    --user-0: #9CCB00; --user-1: #A98BFF; --user-2: #7B4CF5; --user-3: #8E8E93;
+    --user-0: #2A78D6; --user-1: #EB6834; --user-2: #1BAF7A; --user-3: #EDA100;
+    --user-4: #E87BA4; --user-5: #008300; --user-6: #4A3AA7; --user-7: #E34948; --user-o: #8E8E93;
     --av0: #D6FF4F; --av1: #C9B6FF; --av2: #FFC9A8; --av3: #E5E5EA; --av4: #A8EBD5; --av5: #FFE08F; --av6: #DCD0FF; --av7: #FFB3A6;
     --scrim: rgba(28,28,30,0.3); --shadow: 0 30px 80px rgba(0,0,0,0.18);`;
 
@@ -1227,6 +1250,9 @@ const PAGE = `<!doctype html>
   .sw.main { background: var(--area); }
   .sw.u0, .dot.u0, .sp-track i.u0 { background: var(--user-0); } .sw.u1, .dot.u1, .sp-track i.u1 { background: var(--user-1); }
   .sw.u2, .dot.u2, .sp-track i.u2 { background: var(--user-2); } .sw.u3, .dot.u3, .sp-track i.u3 { background: var(--user-3); }
+  .sw.u4, .dot.u4, .sp-track i.u4 { background: var(--user-4); } .sw.u5, .dot.u5, .sp-track i.u5 { background: var(--user-5); }
+  .sw.u6, .dot.u6, .sp-track i.u6 { background: var(--user-6); } .sw.u7, .dot.u7, .sp-track i.u7 { background: var(--user-7); }
+  .sw.uo, .dot.uo, .sp-track i.uo { background: var(--user-o); }
   .sw.ok { background: var(--violet); } .sw.warn { background: var(--lime); } .sw.bad { background: var(--coral); }
   .legend.sm { gap: 14px; }
   .legend.sm .sw { width: 10px; height: 10px; }
@@ -1269,9 +1295,11 @@ const PAGE = `<!doctype html>
   .ug.top { top: 0; } .ug.mid { top: 50%; } .ug.base { bottom: 0; border-top-style: solid; }
   .umax { position: absolute; top: 4px; left: 0; font-size: 11px; color: var(--dim); pointer-events: none; }
   #userPlot path { fill: none; stroke-width: 2; }
-  #userPlot path.dash { stroke-width: 1.6; stroke-dasharray: 4 4; }
   #userPlot path.u0 { stroke: var(--user-0); } #userPlot path.u1 { stroke: var(--user-1); }
   #userPlot path.u2 { stroke: var(--user-2); } #userPlot path.u3 { stroke: var(--user-3); }
+  #userPlot path.u4 { stroke: var(--user-4); } #userPlot path.u5 { stroke: var(--user-5); }
+  #userPlot path.u6 { stroke: var(--user-6); } #userPlot path.u7 { stroke: var(--user-7); }
+  #userPlot path.uo { stroke: var(--user-o); }
 
   /* By time */
   .heat { display: grid; gap: 5px; align-items: center; }
@@ -1293,6 +1321,7 @@ const PAGE = `<!doctype html>
   .kv.tail { border-bottom: none; padding: 10px 0; }
   .kv .k { color: var(--muted); flex: none; }
   .kv .v { font-weight: 500; text-align: right; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .kv .v.kv-segs { display: flex; align-items: center; gap: 10px; }
   .thr-row { display: flex; gap: 6px; align-items: center; }
   .field { display: flex; align-items: center; height: 32px; border-radius: 999px; background: var(--raised); padding: 0 12px; gap: 2px; }
   .field input { width: 38px; background: transparent; border: none; outline: none; color: var(--text); font: inherit; font-size: 13px; text-align: right; -moz-appearance: textfield; appearance: textfield; }
@@ -1310,6 +1339,8 @@ const PAGE = `<!doctype html>
   .acct:hover { transform: translateY(-3px); background: var(--card-lift); }
   .acct.current { box-shadow: inset 0 0 0 1.5px var(--violet); }
   .acct.off { opacity: .45; }
+  .acct.off > :not(.blocked) { filter: grayscale(1); }
+  .acct.off:hover { opacity: .8; }
   .acct-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
   .acct-id { display: flex; align-items: center; gap: 12px; min-width: 0; }
   .avatar { width: 40px; height: 40px; flex: none; border-radius: 50%; background: var(--av0); color: #000000; font-size: 15px; font-weight: 600; display: flex; align-items: center; justify-content: center; }
@@ -1530,7 +1561,7 @@ const PAGE = `<!doctype html>
       </div>
     </section>
 
-    <div class="cards" id="cardsRow">
+    <div class="cards fit" id="cardsRow">
       <section class="card rise" id="seriesWrap" style="display:none;animation-delay:.1s">
         <div class="card-head">
           <h2 class="card-title">${ICONS.usage}Usage over time</h2>
@@ -1553,13 +1584,6 @@ const PAGE = `<!doctype html>
         <div class="ticks" id="seriesTicks"></div>
       </section>
 
-      <section class="card rise" id="heatWrap" style="display:none;animation-delay:.18s">
-        <div class="card-head"><h2 class="card-title">${ICONS.time}<span id="heatTitle">Tokens by time</span></h2></div>
-        <div class="heat" id="heat"></div>
-        <div class="heat-empty" id="heatEmpty"></div>
-        <div class="heat-legend" id="heatLegend"><span style="margin-right:3px">Less</span><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i><span style="margin-left:3px">More</span></div>
-      </section>
-
       <section class="card rise" id="statusCard" style="animation-delay:.26s">
         <div class="card-head">
           <h2 class="card-title">${ICONS.status}Proxy status</h2>
@@ -1567,7 +1591,7 @@ const PAGE = `<!doctype html>
         </div>
         <div class="kv"><span class="k">Conversations</span><span class="v" id="statConv">—</span></div>
         <div class="kv"><span class="k">Uptime</span><span class="v" id="statUp">—</span></div>
-        <div class="kv"><span class="k">Accounts enabled</span><span class="v" id="statEnabled">—</span></div>
+        <div class="kv"><span class="k">Accounts active</span><span class="v kv-segs" id="statServing">—</span></div>
         <div class="kv tail" id="thrWrap">
           <label class="k" for="thrVal">Auto-switch at</label>
           <div class="thr-row">
@@ -1619,27 +1643,28 @@ const PAGE = `<!doctype html>
           <div class="card-head"><h3 class="card-title">${ICONS.users}Spend by user</h3></div>
           <div id="spendRows"></div>
         </section>
-        <section class="card" id="userChartCard">
-          <div class="card-head">
-            <h3 class="card-title">${ICONS.usage}Usage over time</h3>
-            <div class="card-cap" id="userCaption"></div>
-          </div>
-          <div class="legend" id="userLegend"></div>
-          <div class="plot" id="userPlot">
-            <div class="ug top"></div><div class="ug mid"></div><div class="ug base"></div>
-            <div class="umax" id="userMax"></div>
-            <svg viewBox="0 0 400 170" preserveAspectRatio="none" aria-hidden="true">
-              <path id="userLine3" vector-effect="non-scaling-stroke" d=""></path>
-              <path id="userLine2" vector-effect="non-scaling-stroke" d=""></path>
-              <path id="userLine1" vector-effect="non-scaling-stroke" d=""></path>
-              <path id="userLine0" vector-effect="non-scaling-stroke" d=""></path>
-            </svg>
-            <div class="hover-cols" id="userHover"></div>
-            <div class="plot-empty" id="userEmpty"></div>
-          </div>
-          <div class="ticks" id="userTicks"></div>
+        <section class="card" id="heatWrap" style="display:none">
+          <div class="card-head"><h3 class="card-title">${ICONS.time}<span id="heatTitle">Tokens by time</span></h3></div>
+          <div class="heat" id="heat"></div>
+          <div class="heat-empty" id="heatEmpty"></div>
+          <div class="heat-legend" id="heatLegend"><span style="margin-right:3px">Less</span><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i><span style="margin-left:3px">More</span></div>
         </section>
       </div>
+      <section class="card" id="userChartCard">
+        <div class="card-head">
+          <h3 class="card-title">${ICONS.usage}Usage over time</h3>
+          <div class="card-cap" id="userCaption"></div>
+        </div>
+        <div class="legend" id="userLegend"></div>
+        <div class="plot" id="userPlot">
+          <div class="ug top"></div><div class="ug mid"></div><div class="ug base"></div>
+          <div class="umax" id="userMax"></div>
+          <svg id="userLines" viewBox="0 0 400 170" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <div class="hover-cols" id="userHover"></div>
+          <div class="plot-empty" id="userEmpty"></div>
+        </div>
+        <div class="ticks" id="userTicks"></div>
+      </section>
     </section>
 
     <div id="dimensionsWrap" class="duo" style="display:none"></div>
@@ -1817,6 +1842,12 @@ ${SHARED_HELPERS}
     return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
+  // Where the charts' time axis ends: the history's own end once it has
+  // loaded, and the clock until then.
+  function seriesEnd() {
+    return lastSeries && lastSeries.end ? lastSeries.end : Date.now();
+  }
+
   // "3 pm", the way the heatmap heads its columns.
   function fmtHour(ts) {
     return new Date(ts).toLocaleTimeString([], { hour: 'numeric' }).toLowerCase();
@@ -1950,11 +1981,12 @@ ${SHARED_HELPERS}
     return meter(label, ratio, pct == null ? '?' : Math.round(pct * 100) + '%', reset);
   }
 
-  function renderAccount(a, index, s) {
+  function renderAccount(a, index, pos, s) {
     var viewer = s.viewer || null;
     var isCur = isCurrentAccount(a, s);
-    var card = el('div', 'acct rise' + (isCur ? ' current' : '') + (a.disabled ? ' off' : ''));
-    card.style.animationDelay = (0.35 + Math.min(index, 10) * 0.05).toFixed(2) + 's';
+    // Blocked or disabled, it is greyed out (and sorted last by the caller).
+    var card = el('div', 'acct rise' + (isCur ? ' current' : '') + (a.disabled || a.unavailable ? ' off' : ''));
+    card.style.animationDelay = (0.35 + Math.min(pos, 10) * 0.05).toFixed(2) + 's';
     var head = el('div', 'acct-head');
     var id = el('div', 'acct-id');
     id.appendChild(avatar(a.name, index, ''));
@@ -2175,6 +2207,7 @@ ${SHARED_HELPERS}
         userView = v.key;
         markSelected(userViewButtons, userView);
         renderUsers();
+        renderHeat();
       });
       byId('userViewSeg').appendChild(btn);
       userViewButtons.push({ key: v.key, btn: btn });
@@ -2187,6 +2220,7 @@ ${SHARED_HELPERS}
         userMetric = m.key;
         markSelected(userMetricButtons, userMetric);
         renderUsers();
+        renderHeat();
       });
       byId('userMetricSeg').appendChild(btn);
       userMetricButtons.push({ key: m.key, btn: btn });
@@ -2374,10 +2408,6 @@ ${SHARED_HELPERS}
 
   // ── Charts ───────────────────────────────────────────────────────────────
 
-  function seriesHours() {
-    return (usageView === '5h' ? 5 : 24) + 'h';
-  }
-
   // Why a chart has nothing to draw: its history has not landed, could not be
   // fetched, or holds nothing for the span.
   function historyEmptyText(hours) {
@@ -2432,23 +2462,26 @@ ${SHARED_HELPERS}
     }
     var ticks = byId('seriesTicks');
     ticks.textContent = '';
-    seriesTicks(L.spanMs || (usageView === '5h' ? 5 : 24) * 3600000).forEach(function (t) { ticks.appendChild(el('span', '', t)); });
+    seriesTicks(L.spanMs || (usageView === '5h' ? 5 : 24) * 3600000, seriesEnd()).forEach(function (t) { ticks.appendChild(el('span', '', fmtHM(t))); });
   }
 
   // Usage by user, on the section's own window and measure: every client's
   // share as a bar, and a line per client over the span the history covers.
-  // A client keeps one colour in both — its place in the ranking, the fourth
-  // colour going to everyone past the third when they share a line.
+  // A client keeps one colour in both (userSlots), grey for everyone past the
+  // eighth when they share a line.
   function renderUsers() {
     var sec = byId('usersSec');
     var s = lastStatus;
     if (!hasClients(s)) { sec.style.display = 'none'; return; }
     sec.style.display = '';
     var ranking = clientRanking(s.clients, userView, userMetric);
+    var names = userLineNames(ranking);
+    var slots = userSlots(names);
+    var toneOf = function (line) { return line.others || !(line.name in slots) ? 'uo' : 'u' + slots[line.name]; };
     var rows = byId('spendRows');
     rows.textContent = '';
-    ranking.forEach(function (r, i) {
-      var tone = 'u' + Math.min(i, 3);
+    ranking.forEach(function (r) {
+      var tone = toneOf({ name: r.name, others: false });
       var row = el('div', 'sp-row');
       row.title = r.name + ' · ' + metricText(r.value, userMetric) + ' · ' + fmtShare(r.share);
       var name = el('span', 'sp-name');
@@ -2467,16 +2500,16 @@ ${SHARED_HELPERS}
       rows.appendChild(row);
     });
 
-    var L = seriesLines(lastSeries, userView, userMetric, userLineNames(ranking));
-    var lines = L.lines.slice(0, 4);
+    var L = seriesLines(lastSeries, userView, userMetric, names);
+    var lines = L.lines;
     var hours = spanHours(L.spanMs, userView);
     byId('userCaption').textContent = (userMetric === 'requests' ? 'Requests' : 'Tokens') + ' / hour · last ' + hours;
     var label = function (line) { return line.others ? line.members.length + ' others' : line.name; };
     var legend = byId('userLegend');
     legend.textContent = '';
-    lines.forEach(function (line, i) {
+    lines.forEach(function (line) {
       var item = el('span');
-      item.appendChild(el('i', 'sw u' + i));
+      item.appendChild(el('i', 'sw ' + toneOf(line)));
       item.appendChild(el('span', '', label(line)));
       legend.appendChild(item);
     });
@@ -2490,11 +2523,17 @@ ${SHARED_HELPERS}
     var top = L.linePeak * 1.15;
     byId('userMax').textContent = drawn ? scaleText(top, userMetric) : '';
     var X = function (i) { return n > 1 ? i / (n - 1) * 400 : 200; };
-    for (var k = 0; k < 4; k++) {
-      var path = byId('userLine' + k);
-      var line = lines[k];
-      path.setAttribute('class', 'u' + k + (k < 2 ? '' : ' dash'));
-      path.setAttribute('d', drawn && line ? smoothPath(line.values.map(function (v, i) { return [X(i), 170 - v / top * 170]; }), 170) : '');
+    // Drawn last to first, so the busiest client's line sits on top.
+    var svg = byId('userLines');
+    svg.textContent = '';
+    if (drawn) {
+      lines.slice().reverse().forEach(function (line) {
+        var path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('vector-effect', 'non-scaling-stroke');
+        path.setAttribute('class', toneOf(line));
+        path.setAttribute('d', smoothPath(line.values.map(function (v, i) { return [X(i), 170 - v / top * 170]; }), 170));
+        svg.appendChild(path);
+      });
     }
     if (drawn) {
       L.points.forEach(function (p, i) {
@@ -2507,23 +2546,24 @@ ${SHARED_HELPERS}
     }
     var ticks = byId('userTicks');
     ticks.textContent = '';
-    seriesTicks(L.spanMs || (userView === '5h' ? 5 : 24) * 3600000).forEach(function (t) { ticks.appendChild(el('span', '', t)); });
+    seriesTicks(L.spanMs || (userView === '5h' ? 5 : 24) * 3600000, seriesEnd()).forEach(function (t) { ticks.appendChild(el('span', '', fmtHM(t))); });
   }
 
-  // Traffic by time: a row per client, a column per stretch of the span, each
+  // Traffic by time, beside Spend by user and on that section's window and
+  // measure: a row per active client, a column per stretch of the span, each
   // cell shaded by its share of the busiest.
   function renderHeat() {
     var wrap = byId('heatWrap');
     if (!hasClients(lastStatus)) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
-    byId('heatTitle').textContent = (chartMetric === 'requests' ? 'Requests' : 'Tokens') + ' by time';
+    byId('heatTitle').textContent = (userMetric === 'requests' ? 'Requests' : 'Tokens') + ' by time';
     var grid = byId('heat');
     grid.textContent = '';
-    var G = heatGrid(lastSeries, usageView, chartMetric);
+    var G = heatGrid(lastSeries, userView, userMetric);
     var empty = byId('heatEmpty');
     if (!lastSeries || !G.rows.length) {
-      // Short on purpose: the chart beside it carries the whole reason.
-      empty.textContent = !lastSeries ? (seriesError ? 'History unavailable' : 'Loading…') : 'Nothing in the last ' + seriesHours();
+      // Short on purpose: the chart below it carries the whole reason.
+      empty.textContent = !lastSeries ? (seriesError ? 'History unavailable' : 'Loading…') : 'Nothing in the last ' + (userView === '5h' ? 5 : 24) + 'h';
       empty.style.display = 'flex';
       grid.style.display = 'none';
       byId('heatLegend').style.display = 'none';
@@ -2546,7 +2586,7 @@ ${SHARED_HELPERS}
       grid.appendChild(label);
       row.cells.forEach(function (cell, c) {
         var d = el('div', 'cell' + (cell.level ? ' l' + cell.level : ''));
-        d.title = name + ' · ' + fmtHM(G.columns[c].start) + '–' + fmtHM(G.columns[c].end) + ' · ' + metricText(cell.value);
+        d.title = name + ' · ' + fmtHM(G.columns[c].start) + '–' + fmtHM(G.columns[c].end) + ' · ' + metricText(cell.value, userMetric);
         grid.appendChild(d);
       });
     });
@@ -2770,6 +2810,15 @@ ${SHARED_HELPERS}
     return any;
   }
 
+  // A segment per account, the first on of them lit: how many of the fleet
+  // can do something, drawn the same in Routing and Proxy status.
+  function segBar(on, total) {
+    var segs = el('div', 'segs' + (total > 12 ? ' dense' : ''));
+    segs.setAttribute('aria-hidden', 'true');
+    for (var i = 0; i < total; i++) segs.appendChild(el('i', i < on ? 'on' : ''));
+    return segs;
+  }
+
   // Where each metered family goes right now, and how many accounts could
   // take it. The last rows are the per-provider defaults: everything without a
   // route of its own lands on the current account. The accounts that cannot
@@ -2812,10 +2861,7 @@ ${SHARED_HELPERS}
       if (r.kind === 'default') can.appendChild(el('span', 'rt-none', 'No route of its own'));
       else if (r.blocked || !total) can.appendChild(el('span', 'rt-none', '—'));
       else {
-        var segs = el('div', 'segs' + (total > 12 ? ' dense' : ''));
-        segs.setAttribute('aria-hidden', 'true');
-        for (var i = 0; i < total; i++) segs.appendChild(el('i', i < r.eligible.length ? 'on' : ''));
-        can.appendChild(segs);
+        can.appendChild(segBar(r.eligible.length, total));
         can.appendChild(el('span', 'rt-count', r.eligible.length + ' of ' + total + ' can serve'));
         if (r.ineligible.length) {
           var un = el('div', '', 'Unavailable for ' + r.label + ': ' + r.ineligible.map(shortName).join(', '));
@@ -2893,9 +2939,22 @@ ${SHARED_HELPERS}
     var sess = s.sessions || {};
     byId('statConv').textContent = (sess.active || 0) + ' active · ' + (sess.known || 0) + ' known';
     byId('statUp').textContent = s.server && s.server.uptimeSeconds != null ? fmtIn(s.server.uptimeSeconds) : '—';
+    // Active is enabled and not blocked: an account a request could go to
+    // right now, which "enabled" alone overstates while one is on a hold.
     var accounts = s.accounts || [];
-    var enabled = accounts.filter(function (a) { return !a.disabled; }).length;
-    byId('statEnabled').textContent = enabled + ' of ' + accounts.length;
+    var blocked = accounts.filter(function (a) { return a.disabled || a.unavailable; });
+    var active = accounts.length - blocked.length;
+    var box = byId('statServing');
+    box.textContent = '';
+    if (!accounts.length) { box.textContent = '—'; box.title = ''; return; }
+    box.appendChild(segBar(active, accounts.length));
+    box.appendChild(el('span', '', active + ' of ' + accounts.length));
+    box.title = blocked.length
+      ? 'Blocked: ' + blocked.map(function (a) {
+        var why = a.unavailable || 'disabled';
+        return a.name + ' (' + (UNAVAILABLE_TEXT[why] || why) + ')';
+      }).join(', ')
+      : 'Every account can take a request';
   }
 
   function setLive(ok) {
@@ -2915,11 +2974,12 @@ ${SHARED_HELPERS}
     renderHero(s);
     renderStatusCard(s);
     var accounts = s.accounts || [];
-    var enabled = accounts.filter(function (a) { return !a.disabled; }).length;
-    byId('acctCount').textContent = accounts.length ? enabled + ' of ' + accounts.length + ' enabled' : '';
+    // Active as Proxy status counts it: enabled and not blocked.
+    var active = accounts.filter(function (a) { return !a.disabled && !a.unavailable; }).length;
+    byId('acctCount').textContent = accounts.length ? active + ' of ' + accounts.length + ' active' : '';
     var acc = byId('accounts');
     acc.textContent = '';
-    accounts.forEach(function (a, i) { acc.appendChild(renderAccount(a, i, s)); });
+    accountDisplayOrder(accounts).forEach(function (i, pos) { acc.appendChild(renderAccount(accounts[i], i, pos, s)); });
     renderProblems(s);
     renderGroups(s);
     renderHistory();
