@@ -1083,7 +1083,7 @@ const DARK_TOKENS = `
     --heat-0: #241C38; --heat-1: #2A2045; --heat-2: #4A33A0; --heat-3: #7B4CF5; --heat-4: #A98BFF;
     --area: #D6FF4F; --logo-a: #F5F5F7; --bg-pill: #2C2C2E; --grid-dash: rgba(255,255,255,0.1);
     --user-0: #3987E5; --user-1: #D95926; --user-2: #199E70; --user-3: #C98500;
-    --user-4: #D55181; --user-5: #008300; --user-6: #9085E9; --user-7: #E66767; --user-o: #8E8E93;
+    --user-4: #D55181; --user-5: #9A3FB4; --user-6: #9085E9; --user-7: #E66767; --user-o: #8E8E93;
     --av0: #D6FF4F; --av1: #A98BFF; --av2: #FFB38A; --av3: #F5F5F7; --av4: #8FE3C8; --av5: #FFD66B; --av6: #C9B6FF; --av7: #FF9A88;
     --scrim: rgba(0,0,0,0.7); --shadow: 0 30px 80px rgba(0,0,0,0.7);`;
 
@@ -1101,7 +1101,7 @@ const LIGHT_TOKENS = `
     --heat-0: #F3F0FB; --heat-1: #E4DBFF; --heat-2: #BCA6FF; --heat-3: #8D63FF; --heat-4: #6A3BE8;
     --area: #9CCB00; --logo-a: #1C1C1E; --bg-pill: #FFFFFF; --grid-dash: rgba(0,0,0,0.1);
     --user-0: #2A78D6; --user-1: #EB6834; --user-2: #1BAF7A; --user-3: #EDA100;
-    --user-4: #E87BA4; --user-5: #008300; --user-6: #4A3AA7; --user-7: #E34948; --user-o: #8E8E93;
+    --user-4: #E87BA4; --user-5: #9A3FB4; --user-6: #4A3AA7; --user-7: #E34948; --user-o: #8E8E93;
     --av0: #D6FF4F; --av1: #C9B6FF; --av2: #FFC9A8; --av3: #E5E5EA; --av4: #A8EBD5; --av5: #FFE08F; --av6: #DCD0FF; --av7: #FFB3A6;
     --scrim: rgba(28,28,30,0.3); --shadow: 0 30px 80px rgba(0,0,0,0.18);`;
 
