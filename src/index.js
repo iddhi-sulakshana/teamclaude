@@ -69,6 +69,7 @@ import {
   setAccountPriority,
   addClientKey,
   removeClientKey,
+  rotateClientKey,
   setClientKeyRole,
 } from './config-ops.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -714,6 +715,14 @@ async function serverCommand() {
     /** @type {{ name: string, role: string }|undefined} */
     let result;
     await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setClientKeyRole(diskConfig, name, role, spec); });
+    return result;
+  };
+  // A user rotating their own key (POST /teamclaude/me/rotate): the same lock
+  // and reload, so the old key stops working as soon as the call returns.
+  hooks.rotateOwnKey = async (/** @type {any} */ spec) => {
+    /** @type {{ name: string, key: string }|undefined} */
+    let result;
+    await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = rotateClientKey(diskConfig, spec); });
     return result;
   };
 

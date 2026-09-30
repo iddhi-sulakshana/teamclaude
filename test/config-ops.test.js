@@ -7,6 +7,7 @@ import {
   MAX_PROBE_SECONDS,
   removeClientKey,
   resolveConfiguredAccount,
+  rotateClientKey,
   setAccountDisabled,
   setAccountPriority,
   removeRoute,
@@ -376,4 +377,24 @@ test('setClientKeyRole refuses the caller demoting themselves, but not re-affirm
   refused(() => setClientKeyRole(config, 'alice', 'tenant', { actor: 'alice' }), /cannot take admin/);
   assert.equal(config.proxy.clientKeys[0].role, 'admin');
   assert.deepEqual(setClientKeyRole(config, 'alice', 'admin', { actor: 'alice' }), { name: 'alice', role: 'admin' });
+});
+
+test('rotateClientKey replaces only the entry holding the presented key', () => {
+  const config = userConfig();
+  const out = rotateClientKey(config, { name: 'ci', key: 'tc-ci-2' });
+  assert.equal(out.name, 'ci');
+  assert.match(out.key, /^tc-[A-Za-z0-9_-]{32}$/, 'the same shape as an added user\'s key');
+  assert.deepEqual(config.proxy.clientKeys.map(e => e.key), ['tc-alice', 'tc-bob', 'tc-ci-1', out.key],
+    'the name\'s other key keeps working, and the entry keeps its place');
+  assert.equal(config.proxy.clientKeys[3].role, 'readonly', 'the role stays');
+  assert.notEqual(rotateClientKey(config, { name: 'bob', key: 'tc-bob' }).key, out.key);
+});
+
+test('rotateClientKey refuses a key that is not the named user\'s', () => {
+  const config = userConfig();
+  refused(() => rotateClientKey(config, { name: 'bob', key: 'tc-alice' }), /no longer in the config/);
+  refused(() => rotateClientKey(config, { name: 'bob', key: 'tc-gone' }), /no longer in the config/);
+  refused(() => rotateClientKey(config, { name: 'bob' }), /no longer in the config/);
+  refused(() => rotateClientKey(config, { name: '', key: 'tc-bob' }), /name a user/);
+  assert.deepEqual(config.proxy.clientKeys.map(e => e.key), ['tc-alice', 'tc-bob', 'tc-ci-1', 'tc-ci-2']);
 });

@@ -412,7 +412,14 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/users/add', 'a client key cannot change users'],
   ['/teamclaude/users/remove', 'a client key cannot change users'],
   ['/teamclaude/users/role', 'a client key cannot change users'],
+  // A write in no file, but it answers other users' credentials.
+  ['/teamclaude/users/key', "a client key cannot see users' keys"],
 ]);
+
+// The one control-plane write every named client key may make, read-only
+// included: replacing the key it signed in with. It changes no one else's
+// access, and a key that leaked is its holder's to kill.
+const ROTATE_OWN_KEY_PATH = '/teamclaude/me/rotate';
 
 // The user endpoints: the hook each calls, and its log line. The line is built
 // from named fields only, so the key an add returns cannot end up in it.
@@ -567,10 +574,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // control-plane POST — the runtime nudges included, and any route added
       // later, since the test is the prefix rather than a list. The MCP
       // endpoint is left to serve it: its read tools are what "readonly" is
-      // for, and modeFor keeps its write tools from a non-admin key.
+      // for, and modeFor keeps its write tools from a non-admin key. So is
+      // rotating its own key (ROTATE_OWN_KEY_PATH).
       const who = controlRole(req.tcClient, req.tcRole);
       const url = req.url || '';
-      if (who === 'readonly' && req.method === 'POST' && url.startsWith('/teamclaude/') && !/^\/teamclaude\/mcp\/?(\?|$)/.test(url)) {
+      if (who === 'readonly' && req.method === 'POST' && url.startsWith('/teamclaude/') && !/^\/teamclaude\/mcp\/?(\?|$)/.test(url) && url !== ROTATE_OWN_KEY_PATH) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'a read-only client key cannot change anything' }));
         return;
@@ -887,6 +895,84 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         console.log(`[TeamClaude] ${userOp.said(result)} (dashboard${actor ? `, by ${actor}` : ''})`);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, ...result }));
+        return;
+      }
+
+      // A user's keys, for the Users card's Show key. Operator only, refused to
+      // a tenant by CLIENT_KEY_REFUSED_PATHS and to readonly by the prefix
+      // rule. A POST rather than a GET so the cross-origin gate covers it, and
+      // read from the live config: the keys the gate is checking right now.
+      // Status still carries no key; this answers one name, when asked.
+      if (req.method === 'POST' && url === '/teamclaude/users/key') {
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}') ?? {};
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof body.name !== 'string' || !body.name.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "name"' }));
+          return;
+        }
+        const name = body.name.trim();
+        const configured = Array.isArray(config.proxy?.clientKeys) ? usableClientKeys(config.proxy.clientKeys) : [];
+        const keys = configured
+          .filter((/** @type {any} */ e) => e.name.trim() === name)
+          .map((/** @type {any} */ e) => String(e.key));
+        if (!keys.length) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `There is no user named "${name}".` }));
+          return;
+        }
+        // Logged like a change: who read a credential is what an operator
+        // reading the log afterwards looks for. The key itself never is.
+        console.log(`[TeamClaude] Revealed the key of user "${name}" (dashboard${req.tcClient ? `, by ${req.tcClient}` : ''})`);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, name, keys }));
+        return;
+      }
+
+      // Rotate the key this request signed in with: any named client key, the
+      // readonly one included (see ROTATE_OWN_KEY_PATH). The shared key and a
+      // key-less loopback caller have no user to rotate. Like an added user's
+      // key, the new one is in the reply and nowhere else.
+      if (req.method === 'POST' && url === ROTATE_OWN_KEY_PATH) {
+        if (!req.tcClient) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: "only a user's own key can be rotated; this request used the shared proxy key or none" }));
+          return;
+        }
+        if (!hooks.rotateOwnKey || !hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'rotating a key is not supported by this server' }));
+          return;
+        }
+        let result;
+        try {
+          result = await hooks.rotateOwnKey({ name: req.tcClient, key: clientKey });
+        } catch (err) {
+          const known = err instanceof ConfigOpError;
+          const message = /** @type {Error} */ (err).message;
+          if (!known) console.error('[TeamClaude] Key rotation failed:', message);
+          res.writeHead(known ? 400 : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: known ? message : 'key rotation failed; see the proxy log' }));
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after a key rotation failed:', /** @type {Error} */ (err).message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' }));
+          return;
+        }
+        console.log(`[TeamClaude] Rotated the key of user "${result.name}" (dashboard, by ${req.tcClient})`);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, name: result.name, key: result.key }));
         return;
       }
 
