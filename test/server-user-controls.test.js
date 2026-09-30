@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { addClientKey, removeClientKey, setClientKeyRole } from '../src/config-ops.js';
+import { addClientKey, removeClientKey, rotateClientKey, setClientKeyRole } from '../src/config-ops.js';
 
 // POST /teamclaude/users/add, /users/remove and /users/role are what the
 // dashboard's Users card calls. Like the account controls, the write is the
@@ -35,11 +35,12 @@ const freshConfig = () => ({
 // on the live object, which stands in for the write to disk and the reload
 // that copies proxy.clientKeys back into the running server.
 function liveHooks(config) {
-  const calls = { add: [], remove: [], role: [], reload: 0 };
+  const calls = { add: [], remove: [], role: [], rotate: [], reload: 0 };
   const hooks = {
     addUser: async (spec) => { calls.add.push(spec); return addClientKey(config, spec); },
     removeUser: async (name, spec) => { calls.remove.push([name, spec]); return removeClientKey(config, name, spec); },
     setUserRole: async (name, role, spec) => { calls.role.push([name, role, spec]); return setClientKeyRole(config, name, role, spec); },
+    rotateOwnKey: async (spec) => { calls.rotate.push(spec); return rotateClientKey(config, spec); },
     reload: async () => { calls.reload++; return 0; },
   };
   return { hooks, calls };
@@ -256,5 +257,114 @@ test('a server without the user hooks or a reload answers 501 before any write',
     const res = await post(port, '/teamclaude/users/role', { name: 'bob', role: 'admin' });
     assert.equal(res.status, 501);
     assert.match((await res.json()).error, /not supported/);
+  });
+});
+
+test('rotating your own key answers the new key once, and the old key is refused at once', async () => {
+  const config = freshConfig();
+  const { hooks, calls } = liveHooks(config);
+  await withServer(config, hooks, async (port) => {
+    await capturingLogs(async (lines) => {
+      const res = await post(port, '/teamclaude/me/rotate', '', { 'x-api-key': TENANT_KEY });
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('cache-control'), 'no-store');
+      const body = await res.json();
+      assert.equal(body.ok, true);
+      assert.equal(body.name, 'bob');
+      assert.match(body.key, /^tc-/);
+      assert.notEqual(body.key, TENANT_KEY);
+      assert.deepEqual(calls.rotate, [{ name: 'bob', key: TENANT_KEY }], 'the hook is told whose key, and which one');
+      assert.equal(calls.reload, 1);
+
+      assert.ok(lines.some(l => /Rotated the key of user "bob" \(dashboard, by bob\)/.test(l)), 'the rotation is logged');
+      assert.ok(lines.every(l => !l.includes(body.key) && !l.includes(TENANT_KEY)), 'neither key reaches the log');
+
+      assert.equal((await statusAs(port, TENANT_KEY)).status, 401, 'the old key is refused');
+      const as = await statusAs(port, body.key);
+      assert.equal(as.status, 200, 'the new key authenticates right away');
+      assert.deepEqual((await as.json()).viewer, { client: 'bob', role: 'tenant' });
+    });
+  });
+});
+
+test('a read-only or admin key may rotate its own key', async () => {
+  const config = freshConfig();
+  const { hooks } = liveHooks(config);
+  await withServer(config, hooks, async (port) => {
+    for (const [key, name] of [[READONLY_KEY, 'carol'], [ADMIN_KEY, 'alice']]) {
+      const res = await post(port, '/teamclaude/me/rotate', '', { 'x-api-key': key });
+      assert.equal(res.status, 200, name);
+      assert.equal((await res.json()).name, name);
+      assert.equal((await statusAs(port, key)).status, 401, name);
+    }
+    // The read-only exception is this one path, not the prefix.
+    const other = await post(port, '/teamclaude/me/other', '', { 'x-api-key': config.proxy.clientKeys[2].key });
+    assert.equal(other.status, 403);
+  });
+});
+
+test('the shared key, or no key, has no key of its own to rotate', async () => {
+  const config = freshConfig();
+  const { hooks, calls } = liveHooks(config);
+  await withServer(config, hooks, async (port) => {
+    for (const headers of [{ 'x-api-key': PROXY_KEY }, {}]) {
+      const res = await post(port, '/teamclaude/me/rotate', '', headers);
+      assert.equal(res.status, 400);
+      assert.match((await res.json()).error, /only a user's own key can be rotated/);
+    }
+    assert.equal(calls.rotate.length + calls.reload, 0);
+  });
+});
+
+test('a server without the rotate hook answers 501 before any write', async () => {
+  const config = freshConfig();
+  const { hooks, calls } = liveHooks(config);
+  delete hooks.rotateOwnKey;
+  await withServer(config, hooks, async (port) => {
+    const res = await post(port, '/teamclaude/me/rotate', '', { 'x-api-key': TENANT_KEY });
+    assert.equal(res.status, 501);
+    assert.equal(calls.reload, 0);
+    assert.equal((await statusAs(port, TENANT_KEY)).status, 200);
+  });
+});
+
+test("an operator can see a user's keys, and the reveal is logged without them", async () => {
+  const config = freshConfig();
+  config.proxy.clientKeys.push({ name: 'bob', key: 'tc-bob-2' });
+  const { hooks, calls } = liveHooks(config);
+  await withServer(config, hooks, async (port) => {
+    await capturingLogs(async (lines) => {
+      const res = await post(port, '/teamclaude/users/key', { name: ' bob ' }, { 'x-api-key': ADMIN_KEY });
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('cache-control'), 'no-store');
+      assert.deepEqual(await res.json(), { ok: true, name: 'bob', keys: [TENANT_KEY, 'tc-bob-2'] }, 'every key of the name');
+      assert.ok(lines.some(l => /Revealed the key of user "bob" \(dashboard, by alice\)/.test(l)));
+      assert.ok(lines.every(l => !l.includes(TENANT_KEY) && !l.includes('tc-bob-2')));
+
+      const shared = await post(port, '/teamclaude/users/key', { name: 'carol' }, { 'x-api-key': PROXY_KEY });
+      assert.deepEqual(await shared.json(), { ok: true, name: 'carol', keys: [READONLY_KEY] });
+    });
+    assert.equal(calls.reload, 0, 'a reveal writes nothing');
+
+    const unknown = await post(port, '/teamclaude/users/key', { name: 'zed' });
+    assert.equal(unknown.status, 400);
+    assert.match((await unknown.json()).error, /no user named "zed"/);
+    for (const body of [{}, { name: '' }, { name: 42 }]) {
+      const res = await post(port, '/teamclaude/users/key', body);
+      assert.equal(res.status, 400);
+      assert.deepEqual(await res.json(), { ok: false, error: 'missing "name"' });
+    }
+  });
+});
+
+test("a tenant or read-only key cannot see anyone's key, its own included", async () => {
+  const config = freshConfig();
+  const { hooks } = liveHooks(config);
+  await withServer(config, hooks, async (port) => {
+    for (const [key, name] of [[TENANT_KEY, 'alice'], [TENANT_KEY, 'bob'], [READONLY_KEY, 'bob']]) {
+      const res = await post(port, '/teamclaude/users/key', { name }, { 'x-api-key': key });
+      assert.equal(res.status, 403);
+      assert.ok(!(await res.text()).includes('tc-'));
+    }
   });
 });

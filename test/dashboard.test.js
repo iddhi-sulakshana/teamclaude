@@ -10,7 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
-  usageFor, USAGE_VIEWS, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome,
+  usageFor, USAGE_VIEWS, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 import { normalizeSpend } from '../src/oauth.js';
@@ -813,7 +813,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -922,7 +922,9 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     el.fire('click');
   };
   const titled = title => built.slice(mark).filter(e => e.title === title).length;
-  return { byId, store, requests, pending, answer, answerSeries, rootAttrs, click, clickNth, clickTitled, titled, labelled, keydown };
+  // A field the page filled, such as a revealed key, found by its value.
+  const valued = value => built.slice(mark).filter(e => e.value === value).length;
+  return { byId, store, requests, pending, answer, answerSeries, rootAttrs, click, clickNth, clickTitled, titled, labelled, valued, keydown };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
@@ -1210,6 +1212,33 @@ test('userOutcome names what changed, or why it did not', () => {
   assert.ok(!userOutcome('add', { ok: true, name: 'dave', key: 'tc-secret' }).text.includes('tc-secret'), 'the note never carries the key');
 });
 
+test("userRequest asks for one user's keys; rotateKeyRequest sends only the key", () => {
+  const key = userRequest('key', { name: ' bob ', role: 'admin' }, 'tc-k');
+  assert.equal(key.url, '/teamclaude/users/key');
+  assert.deepEqual(JSON.parse(key.init.body), { name: 'bob' });
+  const rot = rotateKeyRequest('tc-bob');
+  assert.equal(rot.url, '/teamclaude/me/rotate');
+  assert.equal(rot.init.method, 'POST');
+  assert.equal(rot.init.headers['x-api-key'], 'tc-bob');
+  assert.equal(rot.init.body, undefined);
+  assert.equal(rotateKeyRequest(null).init.headers['x-api-key'], '');
+});
+
+test('userOutcome never repeats a revealed or rotated key', () => {
+  const shown = userOutcome('key', { ok: true, name: 'bob', keys: ['tc-bob-secret'] });
+  assert.equal(shown.kind, 'ok');
+  assert.ok(!shown.text.includes('tc-bob-secret'));
+  assert.deepEqual(userOutcome('rotate', { ok: true, name: 'bob', key: 'tc-new-secret' }), { kind: 'ok', text: 'rotated your key' });
+  assert.deepEqual(userOutcome('rotate', { ok: false, error: 'nope' }), { kind: 'error', text: 'rotating the key failed: nope' });
+  assert.equal(userOutcome('key', { ok: false }).text, 'showing the key failed');
+});
+
+test('viewerCan offers rotating to any named key, and to no one without a name', () => {
+  for (const role of ['operator', 'tenant', 'readonly']) assert.equal(viewerCan({ client: 'bob', role }, 'rotate'), true, role);
+  assert.equal(viewerCan({ client: null, role: 'operator' }, 'rotate'), false, 'the shared key has no key of its own');
+  assert.equal(viewerCan(null, 'rotate'), false);
+});
+
 test('viewerCan keeps users to the operator', () => {
   assert.equal(viewerCan({ role: 'operator' }, 'users'), true);
   assert.equal(viewerCan({ role: 'tenant' }, 'users'), false);
@@ -1325,6 +1354,91 @@ test('a role button sends the change, and a refusal is shown', async () => {
   assert.deepEqual(JSON.parse(req.init.body), { name: 'bob', role: 'admin' });
   await page.answer(400, { ok: false, error: 'There is no user named "bob".' });
   assert.match(page.byId('note').textContent, /changing the role failed/);
+});
+
+test("Show key reveals a user's keys on request, and Hide takes them off the page", async () => {
+  const page = bootPage({ storedKey: 'tc-alice' });
+  await page.answer(200, USERS_STATUS({ client: 'alice', role: 'operator' }));
+  for (const n of ['alice', 'bob', 'carol']) assert.equal(page.titled('Show key of ' + n), 1, n);
+  assert.equal(page.valued('tc-bob'), 0, 'no key is on the page before it is asked for');
+
+  page.clickTitled('Show key of bob');
+  const req = page.requests.at(-1);
+  assert.equal(req.url, '/teamclaude/users/key');
+  assert.equal(req.init.headers['x-api-key'], 'tc-alice');
+  assert.deepEqual(JSON.parse(req.init.body), { name: 'bob' });
+  await page.answer(200, { ok: true, name: 'bob', keys: ['tc-bob', 'tc-bob-2'] });
+  assert.equal(page.valued('tc-bob'), 1);
+  assert.equal(page.valued('tc-bob-2'), 1, 'every key of the name');
+  assert.ok(!page.byId('note').textContent.includes('tc-bob'), 'the note never carries a key');
+
+  page.clickTitled('Hide key of bob');
+  assert.equal(page.valued('tc-bob'), 0);
+  assert.equal(page.titled('Show key of bob'), 1);
+});
+
+test('a refused Show key says why and shows nothing', async () => {
+  const page = bootPage();
+  await page.answer(200, USERS_STATUS({ client: null, role: 'operator' }));
+  page.clickTitled('Show key of bob');
+  await page.answer(400, { ok: false, error: 'There is no user named "bob".' });
+  assert.match(page.byId('note').textContent, /showing the key failed: There is no user named "bob"/);
+  assert.equal(page.titled('Hide key of bob'), 0);
+});
+
+test('Rotate key: asks once more, then stores and shows the new key once', async () => {
+  const page = bootPage({ storedKey: 'tc-bob' });
+  await page.answer(200, ROLE_STATUS({ client: 'bob', role: 'tenant' }));
+  assert.equal(page.byId('me').disabled, false, 'the avatar opens your key');
+  page.byId('me').fire('click');
+  assert.equal(page.byId('keyWrap').style.display, '');
+  assert.equal(page.byId('keyForm').style.display, '');
+  assert.equal(page.byId('keyNewWrap').style.display, 'none');
+
+  const before = page.requests.length;
+  page.byId('keyRotate').fire('click');
+  assert.equal(page.requests.length, before, 'the first click only asks');
+  assert.equal(page.byId('keyRotate').textContent, 'Confirm rotate');
+  page.byId('keyRotate').fire('click');
+  const req = page.requests.at(-1);
+  assert.equal(req.url, '/teamclaude/me/rotate');
+  assert.equal(req.init.headers['x-api-key'], 'tc-bob');
+
+  await page.answer(200, { ok: true, name: 'bob', key: 'tc-bob-new' });
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-bob-new', 'the page stays signed in with the new key');
+  assert.equal(page.byId('keyForm').style.display, 'none');
+  assert.equal(page.byId('keyNewWrap').style.display, '');
+  assert.equal(page.byId('keyNew').value, 'tc-bob-new');
+  assert.match(page.byId('keyNote').textContent, /won.t be shown again/);
+  assert.ok(!page.byId('note').textContent.includes('tc-bob-new'));
+  assert.equal(page.pending().at(-1).init.headers['x-api-key'], 'tc-bob-new', 'the next poll uses the new key');
+
+  page.keydown('Escape');
+  assert.equal(page.byId('keyWrap').style.display, '', 'a stray Escape does not throw the new key away');
+  page.byId('keyDone').fire('click');
+  assert.equal(page.byId('keyWrap').style.display, 'none');
+  assert.equal(page.byId('keyNew').value, '', 'the key does not stay in the page');
+});
+
+test('a refused rotation keeps the stored key and says why', async () => {
+  const page = bootPage({ storedKey: 'tc-bob' });
+  await page.answer(200, ROLE_STATUS({ client: 'bob', role: 'readonly' }));
+  page.byId('me').fire('click');
+  page.byId('keyRotate').fire('click');
+  page.byId('keyRotate').fire('click');
+  await page.answer(400, { ok: false, error: 'That key is no longer in the config, so there is nothing to rotate.' });
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-bob');
+  assert.equal(page.byId('keyForm').style.display, '');
+  assert.equal(page.byId('keyNote').className, 'error');
+  assert.match(page.byId('keyNote').textContent, /no longer in the config/);
+});
+
+test('the shared key has no key of its own, so the avatar opens nothing', async () => {
+  const page = bootPage({ storedKey: 'tc-shared' });
+  await page.answer(200, ROLE_STATUS({ client: null, role: 'operator' }));
+  assert.equal(page.byId('me').disabled, true);
+  page.byId('me').fire('click');
+  assert.notEqual(page.byId('keyWrap').style.display, '');
 });
 
 test('the Most used chart stays hidden until a client key has been used', async () => {

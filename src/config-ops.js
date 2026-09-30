@@ -446,6 +446,8 @@ function userName(name) {
   return name.trim();
 }
 
+const newClientKey = () => 'tc-' + randomBytes(24).toString('base64url');
+
 /**
  * Add a user with a newly generated key. The key is returned here and nowhere
  * else: status never carries keys, so this is the caller's one chance to hand
@@ -471,7 +473,7 @@ export function addClientKey(config, spec) {
   const list = clientKeyList(config);
   if (list.some(e => namedAs(e, name))) throw new ConfigOpError(`There is already a user named "${name}".`);
 
-  const key = 'tc-' + randomBytes(24).toString('base64url');
+  const key = newClientKey();
   /** @type {Record<string, string>} */
   const entry = { name, key };
   if (role !== 'tenant') entry.role = role;
@@ -522,4 +524,22 @@ export function setClientKeyRole(config, query, role, spec = {}) {
     else entry.role = next;
   }
   return { name, role: next };
+}
+
+/**
+ * Give a user's key a newly generated one: the entry that has both the name and
+ * the key the caller signed in with, so a name listed twice keeps its other
+ * key. Like an added user's key, the new one is returned here and nowhere else.
+ * @param {Config} config
+ * @param {{ name?: unknown, key?: unknown }} spec the caller's name and key
+ * @returns {{ name: string, key: string }}
+ */
+export function rotateClientKey(config, spec) {
+  const name = userName(spec.name);
+  const entry = typeof spec.key === 'string' && spec.key
+    ? clientKeyList(config).find(e => namedAs(e, name) && e.key === spec.key)
+    : undefined;
+  if (!entry) throw new ConfigOpError('That key is no longer in the config, so there is nothing to rotate.');
+  entry.key = newClientKey();
+  return { name, key: entry.key };
 }

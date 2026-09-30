@@ -979,14 +979,14 @@ export function loginOutcome(res) {
   return { kind: 'ok', text: (res.action === 'updated' ? 'signed in again as ' : 'added account ') + res.name };
 }
 
-// The three requests the Users card sends. Each carries only the fields its
-// endpoint reads, so a remove never ships a role it would ignore. The name is
-// trimmed here because it is typed.
-/** @param {'add'|'remove'|'role'} op @param {{ name: string, role?: string }} spec @param {string|null} key */
+// The requests the Users card sends: add, remove, role, and key (Show key).
+// Each carries only the fields its endpoint reads, so a remove never ships a
+// role it would ignore. The name is trimmed here because it is typed.
+/** @param {'add'|'remove'|'role'|'key'} op @param {{ name: string, role?: string }} spec @param {string|null} key */
 export function userRequest(op, spec, key) {
   /** @type {Record<string, unknown>} */
   var body = { name: String(spec.name || '').trim() };
-  if (op !== 'remove') body.role = spec.role;
+  if (op === 'add' || op === 'role') body.role = spec.role;
   return {
     url: '/teamclaude/users/' + op,
     init: {
@@ -996,14 +996,25 @@ export function userRequest(op, spec, key) {
     },
   };
 }
-// The note after a user change. Built from the name and role only: an add's
-// reply carries the key, and the note must never repeat it.
-/** @param {'add'|'remove'|'role'} op @param {any} res */
+// Rotating the key this page is signed in with: the key is the whole request,
+// since the server rotates whichever key it was sent.
+/** @param {string|null} key */
+export function rotateKeyRequest(key) {
+  return { url: '/teamclaude/me/rotate', init: { method: 'POST', headers: { 'x-api-key': key || '' } } };
+}
+// The note after a user change. Built from the name and role only: the
+// replies to add, key and rotate carry keys, and the note must never repeat one.
+/** @param {'add'|'remove'|'role'|'key'|'rotate'} op @param {any} res */
 export function userOutcome(op, res) {
-  var failed = { add: 'adding the user failed', remove: 'removing the user failed', role: 'changing the role failed' };
+  var failed = {
+    add: 'adding the user failed', remove: 'removing the user failed', role: 'changing the role failed',
+    key: 'showing the key failed', rotate: 'rotating the key failed',
+  };
   if (!res || !res.ok) return { kind: 'error', text: failed[op] + (res && res.error ? ': ' + res.error : '') };
   if (op === 'add') return { kind: 'ok', text: 'added user ' + res.name };
   if (op === 'remove') return { kind: 'ok', text: 'removed user ' + res.name };
+  if (op === 'key') return { kind: 'ok', text: 'showing the key of ' + res.name };
+  if (op === 'rotate') return { kind: 'ok', text: 'rotated your key' };
   /** @type {Record<string, string>} */
   var as = { tenant: 'a user', admin: 'an admin', readonly: 'read-only' };
   return { kind: 'ok', text: res.name + ' is now ' + (as[res.role] || res.role) };
@@ -1012,11 +1023,14 @@ export function userOutcome(op, res) {
 // Whether the caller the status payload names may use one of the page's
 // controls, mirroring the server's gates (controlRole in server.js) so a button
 // is offered only where it would be honoured. `action` is 'switch', 'reload',
-// 'probe', 'accounts' (enable/disable and priority), 'threshold' or 'users'. A server
-// older than `viewer` sends none, and every control shows as it always did —
-// the server's 403 still has the final word either way.
-/** @param {{ role?: string }|null|undefined} viewer @param {string} action */
+// 'probe', 'accounts' (enable/disable and priority), 'threshold', 'users' or
+// 'rotate'. A server older than `viewer` sends none, and every control shows
+// as it always did — the server's 403 still has the final word either way.
+// Rotating is the exception: it is by name rather than role, since only a
+// named client key has a key of its own, whatever its role.
+/** @param {{ role?: string, client?: string|null }|null|undefined} viewer @param {string} action */
 export function viewerCan(viewer, action) {
+  if (action === 'rotate') return !!(viewer && viewer.client);
   var role = viewer && viewer.role;
   if (!role || role === 'operator') return true;
   if (role === 'readonly') return false;
@@ -1030,7 +1044,7 @@ export function viewerCan(viewer, action) {
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome,
+  clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
   formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -1434,7 +1448,14 @@ const PAGE = `<!doctype html>
   #userRoleSeg { align-self: flex-start; }
   #userNote { font-size: 12px; color: var(--dim); line-height: 1.5; }
   #userNote.ok { color: var(--lime-text); } #userNote.error { color: var(--coral-text); }
+  .us-acts { display: inline-flex; gap: 6px; justify-content: flex-end; }
+  .us-keys { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 6px; }
   @media (max-width: 560px) { .us-row { grid-template-columns: minmax(0,1fr) auto; } .us-row .seg { grid-column: 1 / -1; justify-self: start; } }
+  /* Your key (the header avatar) */
+  button.me { border: none; padding: 0; cursor: pointer; }
+  button.me:disabled { cursor: default; }
+  #keyNote { font-size: 12px; color: var(--dim); line-height: 1.5; }
+  #keyNote.ok { color: var(--lime-text); } #keyNote.error { color: var(--coral-text); }
 
   /* Tables */
   .tbl-wrap { overflow-x: auto; }
@@ -1557,7 +1578,7 @@ const PAGE = `<!doctype html>
       <div class="actions">
         <button id="reload" class="icon-btn" type="button" title="Reload config" aria-label="Reload config">${ICONS.reload}</button>
         <button id="theme" class="icon-btn" type="button">${ICONS.system}${ICONS.light}${ICONS.dark}</button>
-        <div id="me" class="me" style="display:none"></div>
+        <button id="me" class="me" type="button" style="display:none"></button>
       </div>
     </header>
 
@@ -1785,6 +1806,28 @@ const PAGE = `<!doctype html>
     </section>
   </div>
 
+  <div id="keyWrap" class="scrim" style="display:none">
+    <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="keyTitle">
+      <div class="dlg-head">
+        <div class="dlg-title" id="keyTitle">Your key</div>
+        <button id="keyClose" class="icon-btn sm" type="button" title="Close" aria-label="Close">×</button>
+      </div>
+      <div id="keyForm" class="step-body">
+        <div class="step-text">Rotating gives <b id="keyFor"></b> a new key and stops the old one at once. Every Claude Code client still using the old key will need the new one.</div>
+        <div class="row-btns"><button id="keyRotate" class="pill-btn md" type="button">Rotate key</button></div>
+      </div>
+      <div id="keyNewWrap" class="step-body" style="display:none">
+        <div class="step-text">Your new key. This page has switched to it; give it to your Claude Code clients as the proxy key (<code>x-api-key</code>).</div>
+        <div class="code-row">
+          <input id="keyNew" type="text" readonly autocomplete="off" spellcheck="false">
+          <button id="keyNewCopy" class="pill-btn md quiet" type="button">Copy</button>
+        </div>
+        <div class="row-btns"><button id="keyDone" class="pill-btn md" type="button">Done</button></div>
+      </div>
+      <div id="keyNote"></div>
+    </section>
+  </div>
+
   <div id="settingsWrap" class="scrim" style="display:none">
     <section class="dialog set" id="settingsDialog" role="dialog" aria-modal="true" aria-labelledby="setName"></section>
   </div>
@@ -1841,6 +1884,13 @@ const PAGE = `<!doctype html>
   var userDialogOpen = false;
   var newUserRole = 'tenant';
   var newUserRoleButtons = [];
+  // The keys Show key fetched, as { name, keys }, until Hide: kept out of
+  // userRowsFrom, which only needs to know whose they are.
+  var userShown = null;
+  // Your key's dialog: whether it is open, and whether Rotate has been pressed
+  // once and now asks to be confirmed.
+  var keyDialogOpen = false;
+  var keyConfirm = false;
   // The account whose settings dialog is open, by name, and what its rows were
   // last built from: the poll rebuilds the dialog only when that changes, so a
   // focused control is not pulled out from under the keyboard every 5s.
@@ -2268,10 +2318,12 @@ ${SHARED_HELPERS}
     if (!users) {
       if (userDialogOpen) closeAddUser();
       userRowsFrom = '';
+      userShown = null;
       return;
     }
+    if (userShown && !users.some(function (u) { return u.name === userShown.name; })) userShown = null;
     var me = viewer && viewer.client;
-    var from = JSON.stringify([users, me, userConfirm]);
+    var from = JSON.stringify([users, me, userConfirm, userShown ? userShown.name : '']);
     if (from === userRowsFrom) return;
     userRowsFrom = from;
     byId('userCount').textContent = users.length === 1 ? '1 user' : users.length + ' users';
@@ -2301,9 +2353,18 @@ ${SHARED_HELPERS}
         seg.appendChild(b);
       });
       row.appendChild(seg);
-      if (u.name === me) {
-        row.appendChild(el('span'));
-      } else {
+      var acts = el('span', 'us-acts');
+      var shown = userShown && userShown.name === u.name ? userShown : null;
+      var sk = el('button', 'pill-btn xs quiet', shown ? 'Hide key' : 'Show key');
+      sk.type = 'button';
+      sk.title = (shown ? 'Hide key of ' : 'Show key of ') + u.name;
+      sk.addEventListener('click', function () {
+        if (!shown) { doShowKey(u.name, sk); return; }
+        userShown = null;
+        if (lastStatus) renderUserAdmin(lastStatus);
+      });
+      acts.appendChild(sk);
+      if (u.name !== me) {
         var confirming = userConfirm === u.name;
         var rm = el('button', 'pill-btn xs ' + (confirming ? 'violet' : 'quiet'), confirming ? 'Confirm' : 'Remove');
         rm.type = 'button';
@@ -2315,7 +2376,28 @@ ${SHARED_HELPERS}
           userConfirm = null;
           doUserChange('remove', { name: u.name }, rm);
         });
-        row.appendChild(rm);
+        acts.appendChild(rm);
+      }
+      row.appendChild(acts);
+      if (shown) {
+        // A name listed twice has a key per entry, and each one works.
+        var keys = el('div', 'us-keys');
+        shown.keys.forEach(function (k) {
+          var line = el('div', 'code-row');
+          var input = el('input');
+          input.type = 'text';
+          input.readOnly = true;
+          input.value = k;
+          input.setAttribute('aria-label', 'Key of ' + u.name);
+          line.appendChild(input);
+          var cp = el('button', 'pill-btn md quiet', 'Copy');
+          cp.type = 'button';
+          cp.title = 'Copy key of ' + u.name;
+          cp.addEventListener('click', function () { copyKey(cp, k, function (t) { note('error', t); }); });
+          line.appendChild(cp);
+          keys.appendChild(line);
+        });
+        row.appendChild(keys);
       }
       box.appendChild(row);
     });
@@ -2416,6 +2498,124 @@ ${SHARED_HELPERS}
       .catch(function (e) {
         note('error', userOutcome(op, { ok: false, error: e.message }).text);
         btn.disabled = false;
+      });
+  }
+
+  // Show key: the keys go into userShown and the row, never into a note.
+  function doShowKey(name, btn) {
+    btn.disabled = true;
+    var r = userRequest('key', { name: name }, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = userOutcome('key', json);
+        if (out.kind !== 'ok') { note('error', out.text); btn.disabled = false; return; }
+        userShown = { name: json.name, keys: Array.isArray(json.keys) ? json.keys : [] };
+        if (lastStatus) renderUserAdmin(lastStatus);
+      })
+      .catch(function (e) {
+        note('error', userOutcome('key', { ok: false, error: e.message }).text);
+        btn.disabled = false;
+      });
+  }
+
+  // Copy a key, or say how to copy it by hand where the clipboard is refused.
+  function copyKey(btn, value, failed) {
+    var refused = function () { failed('could not copy; select the key and copy it by hand'); };
+    try {
+      navigator.clipboard.writeText(value).then(function () {
+        btn.textContent = 'Copied ✓';
+        setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+      }, refused);
+    } catch (e) { refused(); }
+  }
+
+  // ── Your key ─────────────────────────────────────────────────────────────
+
+  // The header avatar opens it, for a page signed in with a named client key:
+  // the shared key and a key-less loopback page have no key of their own.
+  function openKey() {
+    var viewer = lastStatus && lastStatus.viewer;
+    if (!viewerCan(viewer, 'rotate')) return;
+    keyConfirm = false;
+    var btn = byId('keyRotate');
+    btn.textContent = 'Rotate key';
+    btn.className = 'pill-btn md';
+    btn.disabled = false;
+    byId('keyFor').textContent = viewer.client;
+    byId('keyForm').style.display = '';
+    byId('keyNewWrap').style.display = 'none';
+    byId('keyNew').value = '';
+    keyNote('', '');
+    keyDialogOpen = true;
+    byId('keyWrap').style.display = '';
+  }
+
+  // The new key leaves the page with the dialog, as an added user's does. The
+  // page itself keeps signing in with it from localStorage.
+  function closeKey() {
+    keyDialogOpen = false;
+    keyConfirm = false;
+    byId('keyWrap').style.display = 'none';
+    byId('keyNew').value = '';
+  }
+
+  function showingNewKey() {
+    return keyDialogOpen && byId('keyNewWrap').style.display !== 'none';
+  }
+
+  function keyNote(kind, text) {
+    var n = byId('keyNote');
+    n.className = kind || '';
+    n.textContent = text;
+  }
+
+  function doRotateKey(btn) {
+    // The first press only asks: the old key stops working at once, for this
+    // page and for every client still using it.
+    if (!keyConfirm) {
+      keyConfirm = true;
+      btn.textContent = 'Confirm rotate';
+      btn.className = 'pill-btn md violet';
+      keyNote('', 'The old key stops working the moment you confirm.');
+      return;
+    }
+    keyConfirm = false;
+    btn.disabled = true;
+    keyNote('', 'rotating…');
+    var reset = function () {
+      btn.textContent = 'Rotate key';
+      btn.className = 'pill-btn md';
+      btn.disabled = false;
+    };
+    var r = rotateKeyRequest(localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = userOutcome('rotate', json);
+        if (out.kind !== 'ok' || !json.key) { keyNote('error', out.text); reset(); return; }
+        // Stored before anything else: the old key is already refused, and the
+        // next poll must not be the one that finds out.
+        localStorage.setItem(KEY, json.key);
+        byId('keyForm').style.display = 'none';
+        byId('keyNew').value = json.key;
+        byId('keyNewWrap').style.display = '';
+        keyNote('ok', 'Copy it now: it won’t be shown again. If it is lost, an admin can show it from the Users card.');
+        note('ok', out.text);
+        reset();
+        poll();
+      })
+      .catch(function (e) {
+        keyNote('error', userOutcome('rotate', { ok: false, error: e.message }).text);
+        reset();
       });
   }
 
@@ -3163,9 +3363,13 @@ ${SHARED_HELPERS}
     var roleText = viewer && viewer.role ? (VIEWER_ROLE_TEXT[viewer.role] || viewer.role) : '';
     if (roleText) h.appendChild(el('span', 'role', roleText));
     var me = byId('me');
+    // The avatar opens Your key, for a page signed in with a key of its own.
+    var canRotate = viewerCan(viewer, 'rotate');
+    me.disabled = !canRotate;
+    if (!canRotate && keyDialogOpen && !showingNewKey()) closeKey();
     if (viewer) {
       me.textContent = initialOf(viewer.client || roleText);
-      me.title = (viewer.client || 'Operator access') + (roleText ? ' · ' + roleText : '');
+      me.title = (viewer.client || 'Operator access') + (roleText ? ' · ' + roleText : '') + (canRotate ? ' · your key' : '');
       me.style.display = '';
     } else {
       me.style.display = 'none';
@@ -3600,16 +3804,17 @@ ${SHARED_HELPERS}
   byId('userClose').addEventListener('click', closeAddUser);
   byId('userDone').addEventListener('click', closeAddUser);
   byId('userKeyCopy').addEventListener('click', function () {
-    var btn = this;
-    var failed = function () { userNote('error', 'could not copy; select the key and copy it by hand'); };
-    try {
-      navigator.clipboard.writeText(byId('userKey').value).then(function () {
-        btn.textContent = 'Copied ✓';
-        setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
-      }, failed);
-    } catch (e) { failed(); }
+    copyKey(this, byId('userKey').value, function (t) { userNote('error', t); });
   });
   byId('userWrap').addEventListener('click', function (e) { if (e && e.target === this && !showingUserKey()) closeAddUser(); });
+  byId('me').addEventListener('click', openKey);
+  byId('keyRotate').addEventListener('click', function () { doRotateKey(this); });
+  byId('keyClose').addEventListener('click', closeKey);
+  byId('keyDone').addEventListener('click', closeKey);
+  byId('keyNewCopy').addEventListener('click', function () {
+    copyKey(this, byId('keyNew').value, function (t) { keyNote('error', t); });
+  });
+  byId('keyWrap').addEventListener('click', function (e) { if (e && e.target === this && !showingNewKey()) closeKey(); });
   byId('loginGo').addEventListener('click', function () { doLoginFinish(this); });
   byId('loginCode').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') byId('loginGo').click();
@@ -3634,6 +3839,7 @@ ${SHARED_HELPERS}
     if (settingsFor) closeSettings();
     else if (loginState) closeLogin();
     else if (userDialogOpen && !showingUserKey()) closeAddUser();
+    else if (keyDialogOpen && !showingNewKey()) closeKey();
   });
 
   ['fProject', 'fClient'].forEach(function (id) {
