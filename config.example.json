@@ -8,6 +8,7 @@
       { "name": "carol", "key": "tc-carol-own-secret", "role": "readonly" }
     ],
     "adminOnlyModels": { "*fable*": "claude-opus-5-5" },
+    "adminOnlyEfforts": { "xhigh": "medium", "max": "medium" },
     "usageDimensions": [
       { "name": "project", "header": "x-teamclaude-project" },
       { "name": "ref", "header": "x-teamclaude-ref" }

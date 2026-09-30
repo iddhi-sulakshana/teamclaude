@@ -1753,6 +1753,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         advisorModel = parseAdvisorModel(body);
         if (model && !hideActivity) /** @type {any} */ (hooks).onRequestModel?.(reqId, { model });
       }
+      // Admin-only effort levels (proxy.adminOnlyEfforts), the same way: a
+      // caller that is not an admin asking for, say, "max" is sent the
+      // configured replacement. The substring test keeps the parse off every
+      // request that names no effort at all.
+      const adminOnlyEfforts = proxyConfig?.adminOnlyEfforts;
+      if (adminOnlyEfforts && body.includes('"effort"') && !isAdminCaller(req, forcedClient, proxyConfig)) {
+        body = downgradeAdminOnlyEfforts(body, adminOnlyEfforts);
+      }
 
       // What session-aware routing pins on. The session id names the CLIENT
       // session, which is one id for a Claude Code session AND every subagent it
@@ -4580,6 +4588,53 @@ export function downgradeAdminOnlyModels(body, adminOnlyModels) {
         if (advisor) { tool.model = advisor; changed = true; }
       }
     }
+    if (changed) return Buffer.from(JSON.stringify(obj), 'utf8');
+  } catch { /* not JSON — pass through unchanged */ }
+  return body;
+}
+
+/**
+ * The effort a caller who is not an admin is sent instead of `effort`, per
+ * `proxy.adminOnlyEfforts` — a map of effort level to replacement, e.g.
+ * `{ "xhigh": "medium", "max": "medium" }` — or null when `effort` is not
+ * admin-only. Levels compare case-insensitively. A setting that is not a plain
+ * object, and an entry whose replacement is not a non-empty string, match nothing.
+ * @param {unknown} adminOnlyEfforts
+ * @param {unknown} effort
+ * @returns {string|null}
+ */
+export function adminOnlyEffortReplacement(adminOnlyEfforts, effort) {
+  if (typeof effort !== 'string' || !adminOnlyEfforts || typeof adminOnlyEfforts !== 'object' || Array.isArray(adminOnlyEfforts)) return null;
+  const level = effort.trim().toLowerCase();
+  for (const [key, replacement] of Object.entries(adminOnlyEfforts)) {
+    if (typeof replacement === 'string' && replacement && key.trim().toLowerCase() === level) return replacement;
+  }
+  return null;
+}
+
+/**
+ * `body` with every admin-only effort it names swapped for its replacement: the
+ * top-level `output_config.effort`, and the per-message effort a system message
+ * in `messages[]` carries in its own `output_config`. Returns the original
+ * buffer when nothing matched or the body is not JSON. Exported for tests.
+ * @param {Buffer} body
+ * @param {unknown} adminOnlyEfforts
+ * @returns {Buffer}
+ */
+export function downgradeAdminOnlyEfforts(body, adminOnlyEfforts) {
+  try {
+    const obj = JSON.parse(body.toString('utf8'));
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return body;
+    let changed = false;
+    /** @param {any} holder */
+    const swap = holder => {
+      const config = holder?.output_config;
+      if (!config || typeof config !== 'object') return;
+      const replacement = adminOnlyEffortReplacement(adminOnlyEfforts, config.effort);
+      if (replacement) { config.effort = replacement; changed = true; }
+    };
+    swap(obj);
+    if (Array.isArray(obj.messages)) for (const message of obj.messages) swap(message);
     if (changed) return Buffer.from(JSON.stringify(obj), 'utf8');
   } catch { /* not JSON — pass through unchanged */ }
   return body;
