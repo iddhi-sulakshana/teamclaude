@@ -63,8 +63,30 @@ export const USAGE_WINDOWS = { '5h': 5 * 60 * 60 * 1000, '24h': 24 * 60 * 60 * 1
 // a number an operator reads to decide whether they are near a limit.
 const RETAINED_SLOTS = Math.ceil(Math.max(...Object.values(USAGE_WINDOWS)) / USAGE_SLOT_MS) + 1;
 
+// The calendar month, on the server's clock: everything since the 1st, reset
+// when the month turns. It is not a rolling span, so it is not in
+// USAGE_WINDOWS and is not tallied in slots — a month of 15-minute slots is
+// 3,000 rows a key — but in a day tally of its own, one row per calendar day
+// with traffic, holding only the current month's days. Extra usage bills by
+// calendar month, which is why this is the month offered rather than a
+// rolling thirty days.
+export const USAGE_MONTH = 'month';
+
+// Every window a `windows` rollup carries, shortest first.
+export const USAGE_WINDOW_LABELS = [...Object.keys(USAGE_WINDOWS), USAGE_MONTH];
+
+const pad2 = (/** @type {number} */ n) => (n < 10 ? '0' : '') + n;
+
+/** The calendar day `ms` falls on, on the server's clock, as `YYYY-MM-DD`. @param {number} ms */
+export function usageDayKey(ms) {
+  const d = new Date(ms);
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+
+const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
 /** @typedef {{ requests: number, connections: number, inputTokens: number, outputTokens: number }} UsageCounters */
-/** @typedef {UsageCounters & { lastUsed: number | null, slots: Map<number, UsageCounters> }} ClientRecord */
+/** @typedef {UsageCounters & { lastUsed: number | null, slots: Map<number, UsageCounters>, days: Map<string, UsageCounters> }} ClientRecord */
 
 const RESERVED_CUSTOM_HEADER_NAMES = new Set([
   'authorization',
@@ -88,7 +110,8 @@ export class ClientUsageTracker {
   // callers and are therefore unbounded.
   constructor({ now = () => Date.now(), maxKeys = Infinity } = {}) {
     // name → { requests, connections, inputTokens, outputTokens, lastUsed(ms),
-    //          slots: Map<slotNumber, { requests, connections, inputTokens, outputTokens }> }
+    //          slots: Map<slotNumber, { requests, connections, inputTokens, outputTokens }>,
+    //          days: Map<'YYYY-MM-DD', { requests, connections, inputTokens, outputTokens }> }
     this.clients = new Map();
     this._now = now;
     this.maxKeys = maxKeys;
@@ -98,7 +121,7 @@ export class ClientUsageTracker {
     let c = this.clients.get(name);
     if (!c) {
       if (this.clients.size >= this.maxKeys && name !== OVERFLOW_KEY) return this._ensure(OVERFLOW_KEY);
-      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, lastUsed: null, slots: new Map() };
+      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, lastUsed: null, slots: new Map(), days: new Map() };
       this.clients.set(name, c);
     }
     return c;
@@ -120,10 +143,13 @@ export class ClientUsageTracker {
     const opening = !c.slots.has(slotNo);
     const slot = this._slotFor(c, slotNo);
     if (opening) this._evict(c, c.lastUsed);
-    slot.requests += requests;
-    slot.connections += connections;
-    slot.inputTokens += inputTokens;
-    slot.outputTokens += outputTokens;
+    const day = this._dayFor(c, usageDayKey(c.lastUsed));
+    for (const tally of [slot, day]) {
+      tally.requests += requests;
+      tally.connections += connections;
+      tally.inputTokens += inputTokens;
+      tally.outputTokens += outputTokens;
+    }
   }
 
   /**
@@ -146,6 +172,23 @@ export class ClientUsageTracker {
     // Deleting during iteration is defined for a Map: an entry removed before
     // it is reached is simply never visited.
     for (const slot of c.slots.keys()) if (slot <= cutoff) c.slots.delete(slot);
+    // A day from an earlier month is out of the month window for good. A day
+    // ahead of today is kept: it is a clock that stepped back, which restore
+    // refuses and a live run cannot produce, and it ages back in.
+    const month = usageDayKey(now).slice(0, 7);
+    for (const day of c.days.keys()) if (day.slice(0, 7) < month) c.days.delete(day);
+  }
+
+  /**
+   * The day tally for `key`, created on first use.
+   * @param {ClientRecord} c
+   * @param {string} key
+   * @returns {UsageCounters}
+   */
+  _dayFor(c, key) {
+    let tally = c.days.get(key);
+    if (!tally) c.days.set(key, tally = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+    return tally;
   }
 
   /**
@@ -192,6 +235,15 @@ export class ClientUsageTracker {
         sum.outputTokens += t.outputTokens;
       }
     }
+    const month = out[USAGE_MONTH] = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 };
+    const today = usageDayKey(now);
+    for (const [day, t] of c.days) {
+      if (day.slice(0, 7) !== today.slice(0, 7) || day > today) continue;
+      month.requests += t.requests;
+      month.connections += t.connections;
+      month.inputTokens += t.inputTokens;
+      month.outputTokens += t.outputTokens;
+    }
     return out;
   }
 
@@ -207,9 +259,10 @@ export class ClientUsageTracker {
     return this._snapshot(now, c => {
       const windows = this._windows(c, now);
       // Omitted entirely for a key with nothing in any window, rather than
-      // shipped as rows of zeros. The windows nest — the shortest is contained
-      // in the longest — so "empty" is unambiguous: no traffic in the longest
-      // one. On a dimension carrying a value per git ref, most keys are old
+      // shipped as rows of zeros. The rolling windows nest, but the month need
+      // not hold the last 24 hours (on the 1st it holds only today), so
+      // "empty" is checked across every window rather than the longest. On a
+      // dimension carrying a value per git ref, most keys are old
       // branches that are silent for good, and they were the bulk of the
       // payload. A reader that finds no `windows` reads zero for every window,
       // which is what the absence means.
@@ -269,6 +322,41 @@ export class ClientUsageTracker {
   }
 
   /**
+   * The current calendar month by day, for the dashboard's charts under This
+   * month: `days` lists the month's days from the 1st through today, as
+   * `YYYY-MM-DD` on the server's clock, and each client carries a `requests`,
+   * `inputTokens` and `outputTokens` array of that length. Days are named
+   * rather than measured from an `end`: a day is not always 24 hours across a
+   * clock change, and the page labels a day by its date, not by an instant.
+   * A client with nothing this month is left out, as series() leaves one out.
+   */
+  monthSeries() {
+    const now = this._now();
+    const today = new Date(now);
+    /** @type {string[]} */
+    const days = [];
+    for (let d = 1; d <= today.getDate(); d++) days.push(usageDayKey(new Date(today.getFullYear(), today.getMonth(), d, 12).getTime()));
+    const index = new Map(days.map((day, i) => [day, i]));
+    const zeros = () => new Array(days.length).fill(0);
+    const clients = Object.create(null);
+    for (const [name, c] of this.clients) {
+      this._evict(c, now);
+      /** @type {{ requests: number[], inputTokens: number[], outputTokens: number[] } | null} */
+      let row = null;
+      for (const [day, t] of c.days) {
+        const i = index.get(day);
+        if (i === undefined || !(t.requests || t.inputTokens || t.outputTokens)) continue;
+        if (!row) row = { requests: zeros(), inputTokens: zeros(), outputTokens: zeros() };
+        row.requests[i] += t.requests;
+        row.inputTokens[i] += t.inputTokens;
+        row.outputTokens[i] += t.outputTokens;
+      }
+      if (row) clients[name] = row;
+    }
+    return { span: USAGE_MONTH, days, buckets: days.length, clients: Object.fromEntries(Object.entries(clients)) };
+  }
+
+  /**
    * Snapshot for the state file. Carries the slots instead of the windows, so a
    * restart resumes the windows rather than restarting them — an upgrade is
    * exactly when someone looks at the dashboard, and a 24h figure that reads
@@ -277,7 +365,10 @@ export class ClientUsageTracker {
   exportState() {
     // An empty `slots` is left out for the same reason `export()` leaves out an
     // empty `windows`: at the key cap the stale rows are most of them.
-    return this._snapshot(this._now(), c => (c.slots.size ? { slots: Object.fromEntries(c.slots) } : {}));
+    return this._snapshot(this._now(), c => ({
+      ...(c.slots.size ? { slots: Object.fromEntries(c.slots) } : {}),
+      ...(c.days.size ? { days: Object.fromEntries(c.days) } : {}),
+    }));
   }
 
   // `now` is passed in rather than read here, so that a caller which also uses
@@ -323,7 +414,45 @@ export class ClientUsageTracker {
       c.outputTokens += Number(s.outputTokens) || 0;
       const t = s.lastUsed ? Date.parse(s.lastUsed) : NaN;
       if (!Number.isNaN(t) && (c.lastUsed == null || t > c.lastUsed)) c.lastUsed = t;
-      this._restoreSlots(c, s.slots);
+      const slots = this._restoreSlots(c, s.slots);
+      // A snapshot from a build without the day tally carries no `days` at
+      // all. Its slots still hold the last day, so the month starts from them
+      // rather than from zero — every slot restored is one the month window
+      // covers, if it fell in this month. A snapshot that has `days`, even
+      // empty, already holds those slots there too.
+      if (s.days === undefined) {
+        const month = usageDayKey(this._now()).slice(0, 7);
+        for (const [slot, t] of slots) {
+          const day = usageDayKey(slot * USAGE_SLOT_MS);
+          if (day.slice(0, 7) !== month) continue;
+          const tally = this._dayFor(c, day);
+          tally.requests += t.requests;
+          tally.connections += t.connections;
+          tally.inputTokens += t.inputTokens;
+          tally.outputTokens += t.outputTokens;
+        }
+      } else this._restoreDays(c, s.days);
+    }
+  }
+
+  /**
+   * Days from a saved snapshot, added onto whatever is already tallied for the
+   * same day. Only this month's days up to today are admitted: an earlier
+   * month is outside the window for good, and a day ahead of today is a clock
+   * that moved backwards, for the reason _restoreSlots() refuses a future slot.
+   * @param {ClientRecord} c
+   * @param {unknown} saved
+   */
+  _restoreDays(c, saved) {
+    if (!saved || typeof saved !== 'object') return;
+    const today = usageDayKey(this._now());
+    for (const [key, t] of Object.entries(saved)) {
+      if (!DAY_KEY_RE.test(key) || key.slice(0, 7) !== today.slice(0, 7) || key > today || !t || typeof t !== 'object') continue;
+      const tally = this._dayFor(c, key);
+      tally.requests += Number(t.requests) || 0;
+      tally.connections += Number(t.connections) || 0;
+      tally.inputTokens += Number(t.inputTokens) || 0;
+      tally.outputTokens += Number(t.outputTokens) || 0;
     }
   }
 
@@ -336,11 +465,16 @@ export class ClientUsageTracker {
    * and the windows then fill from live traffic. This is also the only place a
    * slot ahead of the clock is refused: a backwards clock step during a run is
    * not caught until the next restart.
+   * Returns each slot it admitted with the counters it added, so restore()
+   * can seed the day tally from a snapshot that has none.
    * @param {ClientRecord} c
    * @param {unknown} saved
+   * @returns {Array<[number, UsageCounters]>}
    */
   _restoreSlots(c, saved) {
-    if (!saved || typeof saved !== 'object') return;
+    /** @type {Array<[number, UsageCounters]>} */
+    const admitted = [];
+    if (!saved || typeof saved !== 'object') return admitted;
     const current = Math.floor(this._now() / USAGE_SLOT_MS);
     const oldest = current - RETAINED_SLOTS;
     for (const [key, t] of Object.entries(saved)) {
@@ -351,11 +485,19 @@ export class ClientUsageTracker {
       // window until the clock caught up with it.
       if (!Number.isInteger(slot) || slot <= oldest || slot > current || !t || typeof t !== 'object') continue;
       const tally = this._slotFor(c, slot);
-      tally.requests += Number(t.requests) || 0;
-      tally.connections += Number(t.connections) || 0;
-      tally.inputTokens += Number(t.inputTokens) || 0;
-      tally.outputTokens += Number(t.outputTokens) || 0;
+      const add = {
+        requests: Number(t.requests) || 0,
+        connections: Number(t.connections) || 0,
+        inputTokens: Number(t.inputTokens) || 0,
+        outputTokens: Number(t.outputTokens) || 0,
+      };
+      tally.requests += add.requests;
+      tally.connections += add.connections;
+      tally.inputTokens += add.inputTokens;
+      tally.outputTokens += add.outputTokens;
+      admitted.push([slot, add]);
     }
+    return admitted;
   }
 }
 

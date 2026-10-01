@@ -14,7 +14,9 @@ import {
   sanitizeUsageDimensionValue,
   createUsageRecorder,
   USAGE_SLOT_MS,
-  USAGE_WINDOWS,
+  USAGE_WINDOW_LABELS,
+  USAGE_MONTH,
+  usageDayKey,
 } from '../src/client-usage.js';
 
 function listen(server) {
@@ -26,7 +28,7 @@ function listen(server) {
 // Derived from the tracker's own window list, so adding a window does not
 // silently weaken these assertions into ones that skip the new key.
 function everyWindow(usage) {
-  return Object.fromEntries(Object.keys(USAGE_WINDOWS).map(label => [label, { ...usage }]));
+  return Object.fromEntries(USAGE_WINDOW_LABELS.map(label => [label, { ...usage }]));
 }
 
 const PROXY = { apiKey: 'shared-key', clientKeys: [{ name: 'alice', key: 'alice-key' }, { name: 'bob', key: 'bob-key' }] };
@@ -484,8 +486,9 @@ test('restore drops slots that aged out while the proxy was down', () => {
 
   const e = after.export().alice;
   assert.equal(e.inputTokens, 100, 'the lifetime counters restore in full');
-  assert.equal(e.windows, undefined, 'a two-day-old slot leaves nothing in any window');
+  assert.equal(e.windows['24h'].inputTokens, 0, 'a two-day-old slot leaves nothing in a rolling window');
   assert.equal(after.exportState().alice.slots, undefined, 'and is not carried into the next state file');
+  assert.equal(e.windows[USAGE_MONTH].inputTokens, 100, 'though the month, held by day, still has it');
 });
 
 test('a state file written before slots existed restores without inventing a window', () => {
@@ -531,7 +534,7 @@ test('a client with traffic in any window carries every window, zeros included',
   now += 6 * 3600_000;   // outside 5h, inside 24h
 
   const windows = t.export().alice.windows;
-  assert.deepEqual(Object.keys(windows).sort(), Object.keys(USAGE_WINDOWS).sort(), 'no window is dropped for being empty');
+  assert.deepEqual(Object.keys(windows).sort(), [...USAGE_WINDOW_LABELS].sort(), 'no window is dropped for being empty');
   assert.deepEqual(windows['5h'], { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
   assert.equal(windows['24h'].inputTokens, 5);
 });
@@ -540,10 +543,10 @@ test('a client with nothing in any window carries no windows at all', () => {
   let now = T0;
   const t = new ClientUsageTracker({ now: () => now });
   t.record('alice', { requests: 1 });
-  now += 30 * 3600_000;
-  // The windows nest, so an empty longest window means every window is empty
-  // and the key can be left out. On a dimension holding a value per git ref
-  // these are the majority, and they were the bulk of the status payload.
+  now += 40 * 24 * 3600_000;   // past every rolling window, and into another month
+  // Empty in every window, so the key can be left out. On a dimension holding
+  // a value per git ref these are the majority, and they were the bulk of the
+  // status payload.
   assert.equal(t.export().alice.windows, undefined);
   assert.equal(t.export().alice.requests, 1, 'the lifetime counters are still reported');
 });
@@ -725,6 +728,100 @@ test('GET /teamclaude/usage/series answers an empty series when no tracker is wi
     const res = await fetch(`http://127.0.0.1:${port}/teamclaude/usage/series`, { headers: { 'x-api-key': 'shared-key' } });
     assert.equal(res.status, 200);
     assert.deepEqual((await res.json()).clients, {});
+  } finally {
+    proxy.close();
+  }
+});
+
+// ── the calendar month ──────────────────────────────────────
+//
+// Built from local dates: the month is the server's calendar month, so the
+// test has to speak the same clock the tracker reads.
+const at = (y, m, d, h = 12) => new Date(y, m - 1, d, h).getTime();
+
+test('the month window holds everything since the 1st and resets when the month turns', () => {
+  let now = at(2026, 10, 31, 23);
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1, inputTokens: 100, outputTokens: 10 });
+  assert.equal(t.export().alice.windows[USAGE_MONTH].inputTokens, 100);
+
+  now = at(2026, 11, 1, 1);
+  t.record('alice', { requests: 1, inputTokens: 7, outputTokens: 3 });
+  const w = t.export().alice.windows;
+  assert.deepEqual(w[USAGE_MONTH], { requests: 1, connections: 0, inputTokens: 7, outputTokens: 3 }, 'October is not November');
+  assert.equal(w['24h'].inputTokens, 107, 'while the rolling day still spans the turn');
+  assert.deepEqual(Object.keys(t.exportState().alice.days), ['2026-11-01'], 'and the old month is dropped from the state');
+});
+
+test('monthSeries lays the month out by day, from the 1st through today', () => {
+  let now = at(2026, 10, 2, 8);
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1, inputTokens: 50, outputTokens: 5 });
+  now = at(2026, 10, 4, 20);
+  t.record('alice', { requests: 2, inputTokens: 20, outputTokens: 2 });
+  t.record('bob', { requests: 1, inputTokens: 1 });
+  t.record('idle', { connections: 1 });
+  const m = t.monthSeries();
+  assert.equal(m.span, USAGE_MONTH);
+  assert.deepEqual(m.days, ['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04']);
+  assert.equal(m.buckets, 4);
+  assert.deepEqual(m.clients.alice, { requests: [0, 1, 0, 2], inputTokens: [0, 50, 0, 20], outputTokens: [0, 5, 0, 2] });
+  assert.deepEqual(m.clients.bob.inputTokens, [0, 0, 0, 1]);
+  assert.equal(m.clients.idle, undefined, 'a connection alone draws nothing, as in series()');
+  assert.equal(usageDayKey(at(2026, 1, 9)), '2026-01-09');
+});
+
+test('a restart resumes the month, and refuses days it cannot hold', () => {
+  let now = at(2026, 10, 10);
+  const before = new ClientUsageTracker({ now: () => now });
+  before.record('alice', { requests: 1, inputTokens: 40 });
+  const saved = before.exportState();
+  saved.alice.days['2026-09-30'] = { requests: 1, inputTokens: 1000 };   // last month
+  saved.alice.days['2026-10-25'] = { requests: 1, inputTokens: 2000 };   // ahead of the clock
+  saved.alice.days['junk'] = { requests: 1, inputTokens: 3000 };
+
+  now = at(2026, 10, 12);   // two days later: out of every rolling window
+  const after = new ClientUsageTracker({ now: () => now });
+  after.restore(saved);
+  const w = after.export().alice.windows;
+  assert.equal(w[USAGE_MONTH].inputTokens, 40);
+  assert.equal(w['24h'].inputTokens, 0);
+  assert.deepEqual(Object.keys(after.exportState().alice.days), ['2026-10-10']);
+});
+
+test('a state file from before the day tally seeds the month from its slots', () => {
+  let now = at(2026, 10, 1, 10);
+  const before = new ClientUsageTracker({ now: () => now });
+  before.record('alice', { requests: 1, inputTokens: 5 });      // this month
+  const saved = before.exportState();
+  const lastMonth = Math.floor(at(2026, 9, 30, 22) / USAGE_SLOT_MS);
+  saved.alice.slots[lastMonth] = { requests: 1, inputTokens: 900 };
+  delete saved.alice.days;   // as an older build wrote it
+
+  const after = new ClientUsageTracker({ now: () => now });
+  after.restore(saved);
+  const w = after.export().alice.windows;
+  assert.equal(w['24h'].inputTokens, 905, 'both slots are in the rolling day');
+  assert.equal(w[USAGE_MONTH].inputTokens, 5, "only this month's slot seeds the month");
+  // Restoring a snapshot that already has days does not count its slots twice.
+  const again = new ClientUsageTracker({ now: () => now });
+  again.restore(after.exportState());
+  assert.equal(again.export().alice.windows[USAGE_MONTH].inputTokens, 5);
+});
+
+test('GET /teamclaude/usage/series?span=month serves the month by day', async () => {
+  const am = new AccountManager([{ name: 'acct', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  const tracker = new ClientUsageTracker();
+  tracker.record('alice', { requests: 1, inputTokens: 5, outputTokens: 6 });
+  const proxy = createProxyServer(am, { proxy: { ...PROXY, trustLoopback: false } }, {}, null, tracker);
+  const port = await listen(proxy);
+  try {
+    const url = `http://127.0.0.1:${port}/teamclaude/usage/series?span=month`;
+    assert.equal((await fetch(url)).status, 401, 'behind the same gate');
+    const body = await (await fetch(url, { headers: { 'x-api-key': 'bob-key' } })).json();
+    assert.equal(body.span, 'month');
+    assert.equal(body.days.at(-1), usageDayKey(Date.now()));
+    assert.equal(body.clients.alice.outputTokens.at(-1), 6);
   } finally {
     proxy.close();
   }
