@@ -85,7 +85,7 @@ export function usageDayKey(ms) {
 
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-/** @typedef {{ requests: number, connections: number, inputTokens: number, outputTokens: number }} UsageCounters */
+/** @typedef {{ requests: number, connections: number, inputTokens: number, outputTokens: number, cacheTokens: number }} UsageCounters */
 /** @typedef {UsageCounters & { lastUsed: number | null, slots: Map<number, UsageCounters>, days: Map<string, UsageCounters> }} ClientRecord */
 
 const RESERVED_CUSTOM_HEADER_NAMES = new Set([
@@ -109,9 +109,11 @@ export class ClientUsageTracker {
   // set only for the header-derived dimension trackers, whose values come from
   // callers and are therefore unbounded.
   constructor({ now = () => Date.now(), maxKeys = Infinity } = {}) {
-    // name → { requests, connections, inputTokens, outputTokens, lastUsed(ms),
-    //          slots: Map<slotNumber, { requests, connections, inputTokens, outputTokens }>,
-    //          days: Map<'YYYY-MM-DD', { requests, connections, inputTokens, outputTokens }> }
+    // name → { requests, connections, inputTokens, outputTokens, cacheTokens, lastUsed(ms),
+    //          slots: Map<slotNumber, { requests, connections, inputTokens, outputTokens, cacheTokens }>,
+    //          days: Map<'YYYY-MM-DD', { requests, connections, inputTokens, outputTokens, cacheTokens }> }
+    // `cacheTokens` is the part of `inputTokens` served from or written to the
+    // prompt cache: input counts it, so a total is still input plus output.
     this.clients = new Map();
     this._now = now;
     this.maxKeys = maxKeys;
@@ -121,20 +123,21 @@ export class ClientUsageTracker {
     let c = this.clients.get(name);
     if (!c) {
       if (this.clients.size >= this.maxKeys && name !== OVERFLOW_KEY) return this._ensure(OVERFLOW_KEY);
-      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, lastUsed: null, slots: new Map(), days: new Map() };
+      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0, lastUsed: null, slots: new Map(), days: new Map() };
       this.clients.set(name, c);
     }
     return c;
   }
 
   /** Book usage against a client name. A null/empty name is dropped (unattributed). */
-  record(name, { requests = 0, connections = 0, inputTokens = 0, outputTokens = 0 } = {}) {
+  record(name, { requests = 0, connections = 0, inputTokens = 0, outputTokens = 0, cacheTokens = 0 } = {}) {
     if (!name) return;
     const c = this._ensure(name);
     c.requests += requests;
     c.connections += connections;
     c.inputTokens += inputTokens;
     c.outputTokens += outputTokens;
+    c.cacheTokens += cacheTokens;
     c.lastUsed = this._now();
     // Eviction runs only when this write opens a new slot, and against the
     // same clock reading as lastUsed: a second read of the clock could land
@@ -149,6 +152,7 @@ export class ClientUsageTracker {
       tally.connections += connections;
       tally.inputTokens += inputTokens;
       tally.outputTokens += outputTokens;
+      tally.cacheTokens += cacheTokens;
     }
   }
 
@@ -187,7 +191,7 @@ export class ClientUsageTracker {
    */
   _dayFor(c, key) {
     let tally = c.days.get(key);
-    if (!tally) c.days.set(key, tally = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+    if (!tally) c.days.set(key, tally = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0 });
     return tally;
   }
 
@@ -202,7 +206,7 @@ export class ClientUsageTracker {
    */
   _slotFor(c, slot) {
     let tally = c.slots.get(slot);
-    if (!tally) c.slots.set(slot, tally = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+    if (!tally) c.slots.set(slot, tally = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0 });
     return tally;
   }
 
@@ -223,7 +227,7 @@ export class ClientUsageTracker {
     /** @type {Array<[number, UsageCounters]>} */
     const cutoffs = [];
     for (const [label, span] of Object.entries(USAGE_WINDOWS)) {
-      out[label] = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 };
+      out[label] = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0 };
       cutoffs.push([Math.floor((now - span) / USAGE_SLOT_MS), out[label]]);
     }
     for (const [slot, t] of c.slots) {
@@ -233,9 +237,10 @@ export class ClientUsageTracker {
         sum.connections += t.connections;
         sum.inputTokens += t.inputTokens;
         sum.outputTokens += t.outputTokens;
+        sum.cacheTokens += t.cacheTokens;
       }
     }
-    const month = out[USAGE_MONTH] = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 };
+    const month = out[USAGE_MONTH] = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0 };
     const today = usageDayKey(now);
     for (const [day, t] of c.days) {
       if (day.slice(0, 7) !== today.slice(0, 7) || day > today) continue;
@@ -243,6 +248,7 @@ export class ClientUsageTracker {
       month.connections += t.connections;
       month.inputTokens += t.inputTokens;
       month.outputTokens += t.outputTokens;
+      month.cacheTokens += t.cacheTokens;
     }
     return out;
   }
@@ -299,16 +305,17 @@ export class ClientUsageTracker {
     const clients = Object.create(null);
     for (const [name, c] of this.clients) {
       this._evict(c, now);
-      /** @type {{ requests: number[], inputTokens: number[], outputTokens: number[] } | null} */
+      /** @type {{ requests: number[], inputTokens: number[], outputTokens: number[], cacheTokens: number[] } | null} */
       let row = null;
       for (const [slot, t] of c.slots) {
         if (slot < first || slot > current) continue;
         if (!(t.requests || t.inputTokens || t.outputTokens)) continue;
-        if (!row) row = { requests: zeros(), inputTokens: zeros(), outputTokens: zeros() };
+        if (!row) row = { requests: zeros(), inputTokens: zeros(), outputTokens: zeros(), cacheTokens: zeros() };
         const i = Math.floor((slot - first) / per);
         row.requests[i] += t.requests;
         row.inputTokens[i] += t.inputTokens;
         row.outputTokens[i] += t.outputTokens;
+        row.cacheTokens[i] += t.cacheTokens;
       }
       if (row) clients[name] = row;
     }
@@ -325,7 +332,7 @@ export class ClientUsageTracker {
    * The current calendar month by day, for the dashboard's charts under This
    * month: `days` lists the month's days from the 1st through today, as
    * `YYYY-MM-DD` on the server's clock, and each client carries a `requests`,
-   * `inputTokens` and `outputTokens` array of that length. Days are named
+   * `inputTokens`, `outputTokens` and `cacheTokens` array of that length. Days are named
    * rather than measured from an `end`: a day is not always 24 hours across a
    * clock change, and the page labels a day by its date, not by an instant.
    * A client with nothing this month is left out, as series() leaves one out.
@@ -341,15 +348,16 @@ export class ClientUsageTracker {
     const clients = Object.create(null);
     for (const [name, c] of this.clients) {
       this._evict(c, now);
-      /** @type {{ requests: number[], inputTokens: number[], outputTokens: number[] } | null} */
+      /** @type {{ requests: number[], inputTokens: number[], outputTokens: number[], cacheTokens: number[] } | null} */
       let row = null;
       for (const [day, t] of c.days) {
         const i = index.get(day);
         if (i === undefined || !(t.requests || t.inputTokens || t.outputTokens)) continue;
-        if (!row) row = { requests: zeros(), inputTokens: zeros(), outputTokens: zeros() };
+        if (!row) row = { requests: zeros(), inputTokens: zeros(), outputTokens: zeros(), cacheTokens: zeros() };
         row.requests[i] += t.requests;
         row.inputTokens[i] += t.inputTokens;
         row.outputTokens[i] += t.outputTokens;
+        row.cacheTokens[i] += t.cacheTokens;
       }
       if (row) clients[name] = row;
     }
@@ -389,6 +397,7 @@ export class ClientUsageTracker {
         connections: c.connections,
         inputTokens: c.inputTokens,
         outputTokens: c.outputTokens,
+        cacheTokens: c.cacheTokens,
         lastUsed: c.lastUsed ? new Date(c.lastUsed).toISOString() : null,
         ...extra(c),
       };
@@ -412,6 +421,7 @@ export class ClientUsageTracker {
       c.connections += Number(s.connections) || 0;
       c.inputTokens += Number(s.inputTokens) || 0;
       c.outputTokens += Number(s.outputTokens) || 0;
+      c.cacheTokens += Number(s.cacheTokens) || 0;
       const t = s.lastUsed ? Date.parse(s.lastUsed) : NaN;
       if (!Number.isNaN(t) && (c.lastUsed == null || t > c.lastUsed)) c.lastUsed = t;
       const slots = this._restoreSlots(c, s.slots);
@@ -430,6 +440,7 @@ export class ClientUsageTracker {
           tally.connections += t.connections;
           tally.inputTokens += t.inputTokens;
           tally.outputTokens += t.outputTokens;
+          tally.cacheTokens += t.cacheTokens;
         }
       } else this._restoreDays(c, s.days);
     }
@@ -453,6 +464,7 @@ export class ClientUsageTracker {
       tally.connections += Number(t.connections) || 0;
       tally.inputTokens += Number(t.inputTokens) || 0;
       tally.outputTokens += Number(t.outputTokens) || 0;
+      tally.cacheTokens += Number(t.cacheTokens) || 0;
     }
   }
 
@@ -490,11 +502,13 @@ export class ClientUsageTracker {
         connections: Number(t.connections) || 0,
         inputTokens: Number(t.inputTokens) || 0,
         outputTokens: Number(t.outputTokens) || 0,
+        cacheTokens: Number(t.cacheTokens) || 0,
       };
       tally.requests += add.requests;
       tally.connections += add.connections;
       tally.inputTokens += add.inputTokens;
       tally.outputTokens += add.outputTokens;
+      tally.cacheTokens += add.cacheTokens;
       admitted.push([slot, add]);
     }
     return admitted;
@@ -621,10 +635,11 @@ export function createUsageRecorder({ client, clientUsage, dimensions, dimension
         else target.tracker.record(target.key, { requests: 1 });
       }
     },
-    onUsage(inputTokens, outputTokens) {
+    // `cacheTokens` is the cached part of `inputTokens`, not added to it.
+    onUsage(inputTokens, outputTokens, cacheTokens = 0) {
       for (const target of targets) {
-        if (target.dimension) target.tracker.record(target.dimension, target.key, { inputTokens, outputTokens });
-        else target.tracker.record(target.key, { inputTokens, outputTokens });
+        if (target.dimension) target.tracker.record(target.dimension, target.key, { inputTokens, outputTokens, cacheTokens });
+        else target.tracker.record(target.key, { inputTokens, outputTokens, cacheTokens });
       }
     },
   };

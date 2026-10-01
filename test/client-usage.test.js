@@ -43,9 +43,9 @@ test('tracker aggregates per name and drops unattributed records', () => {
   t.record('', { requests: 1 });                       // ditto
   assert.deepEqual(t.export(), {
     alice: {
-      requests: 1, connections: 0, inputTokens: 7, outputTokens: 3, lastUsed: new Date(1000).toISOString(),
+      requests: 1, connections: 0, inputTokens: 7, outputTokens: 3, cacheTokens: 0, lastUsed: new Date(1000).toISOString(),
       // Recorded at one instant, so every window holds all of it.
-      windows: everyWindow({ requests: 1, connections: 0, inputTokens: 7, outputTokens: 3 }),
+      windows: everyWindow({ requests: 1, connections: 0, inputTokens: 7, outputTokens: 3, cacheTokens: 0 }),
     },
   });
 });
@@ -64,7 +64,7 @@ test('restore is additive and survives malformed entries', () => {
   assert.equal(out.alice.inputTokens, 11);
   // live lastUsed (5000) is newer than the restored one (2000) and must win
   assert.equal(out.alice.lastUsed, new Date(5000).toISOString());
-  assert.deepEqual(out.bob, { requests: 1, connections: 0, inputTokens: 4, outputTokens: 2, lastUsed: null });
+  assert.deepEqual(out.bob, { requests: 1, connections: 0, inputTokens: 4, outputTokens: 2, cacheTokens: 0, lastUsed: null });
   assert.equal(out.mallory, undefined);
   assert.equal(Object.keys(out).length, 2);
 });
@@ -201,6 +201,9 @@ test('per-client usage: a client\'s input side counts its cache reads and writes
     const out = tracker.export();
     assert.equal(out.alice.inputTokens, (7 + 900 + 20) + (100 + 5000 + 300));
     assert.equal(out.alice.outputTokens, 3 + 40);
+    assert.equal(out.alice.cacheTokens, (900 + 20) + (5000 + 300), 'the cached part of that input, reads and writes');
+    assert.equal(out.alice.windows['5h'].cacheTokens, 900 + 20 + 5000 + 300, 'in the windows too');
+    assert.equal(tracker.series().clients.alice.cacheTokens.at(-1), 6220, 'and in the hourly history');
     // The account keeps its uncached figure; the cache sits in its own fields.
     assert.equal(am.accounts[0].usage.totalInputTokens, 7 + 100);
     assert.equal(am.accounts[0].usage.totalCacheReadTokens, 900 + 5000);
@@ -362,10 +365,12 @@ test('the recorder books one request and its tokens to every target', () => {
     dimensionUsage,
   });
   rec.recordRequest();
-  rec.onUsage(100, 20);
+  rec.onUsage(100, 20, 80);
   assert.equal(clientUsage.export().ci.requests, 1);
   assert.equal(clientUsage.export().ci.inputTokens, 100);
   assert.equal(dimensionUsage.export().project['skaile-dev'].outputTokens, 20);
+  assert.equal(clientUsage.export().ci.cacheTokens, 80, 'the cached part of the input');
+  assert.equal(dimensionUsage.export().project['skaile-dev'].cacheTokens, 80);
 
   // Nothing to attribute means no work and no onUsage hook to install.
   const none = createUsageRecorder({ client: null, clientUsage, dimensions: [], dimensionUsage });
@@ -535,7 +540,7 @@ test('a client with traffic in any window carries every window, zeros included',
 
   const windows = t.export().alice.windows;
   assert.deepEqual(Object.keys(windows).sort(), [...USAGE_WINDOW_LABELS].sort(), 'no window is dropped for being empty');
-  assert.deepEqual(windows['5h'], { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+  assert.deepEqual(windows['5h'], { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0 });
   assert.equal(windows['24h'].inputTokens, 5);
 });
 
@@ -748,7 +753,7 @@ test('the month window holds everything since the 1st and resets when the month 
   now = at(2026, 11, 1, 1);
   t.record('alice', { requests: 1, inputTokens: 7, outputTokens: 3 });
   const w = t.export().alice.windows;
-  assert.deepEqual(w[USAGE_MONTH], { requests: 1, connections: 0, inputTokens: 7, outputTokens: 3 }, 'October is not November');
+  assert.deepEqual(w[USAGE_MONTH], { requests: 1, connections: 0, inputTokens: 7, outputTokens: 3, cacheTokens: 0 }, 'October is not November');
   assert.equal(w['24h'].inputTokens, 107, 'while the rolling day still spans the turn');
   assert.deepEqual(Object.keys(t.exportState().alice.days), ['2026-11-01'], 'and the old month is dropped from the state');
 });
@@ -765,7 +770,7 @@ test('monthSeries lays the month out by day, from the 1st through today', () => 
   assert.equal(m.span, USAGE_MONTH);
   assert.deepEqual(m.days, ['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04']);
   assert.equal(m.buckets, 4);
-  assert.deepEqual(m.clients.alice, { requests: [0, 1, 0, 2], inputTokens: [0, 50, 0, 20], outputTokens: [0, 5, 0, 2] });
+  assert.deepEqual(m.clients.alice, { requests: [0, 1, 0, 2], inputTokens: [0, 50, 0, 20], outputTokens: [0, 5, 0, 2], cacheTokens: [0, 0, 0, 0] });
   assert.deepEqual(m.clients.bob.inputTokens, [0, 0, 0, 1]);
   assert.equal(m.clients.idle, undefined, 'a connection alone draws nothing, as in series()');
   assert.equal(usageDayKey(at(2026, 1, 9)), '2026-01-09');
@@ -825,4 +830,21 @@ test('GET /teamclaude/usage/series?span=month serves the month by day', async ()
   } finally {
     proxy.close();
   }
+});
+
+test('the cache figure survives a restart, and an older snapshot without it reads as none', () => {
+  let now = at(2026, 10, 10);
+  const before = new ClientUsageTracker({ now: () => now });
+  before.record('alice', { requests: 1, inputTokens: 500, outputTokens: 5, cacheTokens: 450 });
+  const after = new ClientUsageTracker({ now: () => now });
+  after.restore(before.exportState());
+  const e = after.export().alice;
+  assert.equal(e.cacheTokens, 450);
+  assert.equal(e.windows['24h'].cacheTokens, 450);
+  assert.equal(e.windows[USAGE_MONTH].cacheTokens, 450);
+  assert.deepEqual(after.monthSeries().clients.alice.cacheTokens, [0, 0, 0, 0, 0, 0, 0, 0, 0, 450]);
+
+  const old = new ClientUsageTracker({ now: () => now });
+  old.restore({ alice: { requests: 1, inputTokens: 9, lastUsed: new Date(now).toISOString() } });
+  assert.equal(old.export().alice.cacheTokens, 0);
 });

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
-  renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens, accountTokenSplit,
+  renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit,
   accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
   sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
@@ -52,12 +52,20 @@ test('scopedWeekly falls back to the dedicated fields, and never doubles a famil
   assert.deepEqual(scopedWeeklyRows(null), []);
 });
 
-test('account token split puts the cache on the input side', () => {
+test('account token split keeps the cache apart, reads and writes together', () => {
   assert.deepEqual(accountTokenSplit({
     totalInputTokens: 1, totalOutputTokens: 2,
     totalCacheReadTokens: 100, totalCacheCreationTokens: 10,
-  }), { input: 111, output: 2 });
-  assert.deepEqual(accountTokenSplit(null), { input: 0, output: 0 });
+  }), { input: 1, cache: 110, output: 2 });
+  assert.deepEqual(accountTokenSplit(null), { input: 0, cache: 0, output: 0 });
+});
+
+test('a usage row splits its input into the uncached part and the cache', () => {
+  // A client's input counts its cache; cacheTokens is how much of it that was.
+  assert.deepEqual(usageTokenSplit({ inputTokens: 500, cacheTokens: 450, outputTokens: 9 }), { input: 50, cache: 450, output: 9 });
+  // A row from before the cache was counted apart: all of its input is uncached.
+  assert.deepEqual(usageTokenSplit({ inputTokens: 500, outputTokens: 9 }), { input: 500, cache: 0, output: 9 });
+  assert.deepEqual(usageTokenSplit(null), { input: 0, cache: 0, output: 0 });
 });
 
 test('account token total includes the cache fields', () => {
@@ -821,7 +829,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, accountTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -1004,8 +1012,8 @@ test('the overview draws a column per client and switches measure without pollin
   // The big figure is every client's traffic on the window.
   assert.equal(page.byId('heroMain').textContent, '110');
   assert.equal(page.byId('heroLabel').textContent, 'Tokens used');
-  assert.equal(page.byId('heroSplit').textContent, '15 in · 95 out', 'and under it, the two sides');
-  assert.ok(page.byId('grp0').title.includes('(10 in · 90 out)'), "a column's tooltip splits its figure too");
+  assert.equal(page.byId('heroSplit').textContent, '15 in · 0 cache · 95 out', 'and under it, the two sides');
+  assert.ok(page.byId('grp0').title.includes('(10 in · 0 cache · 90 out)'), "a column's tooltip splits its figure too");
   // Named by its column, its Clients row, and its Usage by user row and legend.
   assert.equal(page.labelled('alice'), 4);
   page.click('Requests');
@@ -1027,11 +1035,26 @@ test('without client keys the overview shows what the accounts served, and says 
   assert.equal(page.byId('heroMain').textContent, '2');
   assert.equal(page.byId('heroFrac').textContent, '.5k');
   assert.equal(page.byId('heroLabel').textContent, 'Tokens served since start');
-  // Input carries the cache, as the total does: 1000 uncached + 800 read.
-  assert.equal(page.byId('heroSplit').textContent, '1.8k in · 700 out');
+  // The cache is its own side: 1000 uncached, 800 read.
+  assert.equal(page.byId('heroSplit').textContent, '1.0k in · 800 cache · 700 out');
   // Each card's footer splits its own spend the same way.
-  assert.equal(page.labelled('4 req · 1.8k in · 200 out'), 1);
+  assert.equal(page.labelled('4 req · 1.0k in · 800 cache · 200 out'), 1);
   assert.equal(page.byId('usageViewWrap').style.display, 'none', 'nothing windowed for the control to change');
+});
+
+test('a client\'s cache is shown apart wherever its tokens are', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    accounts: [],
+    clients: { alice: { requests: 3, inputTokens: 1000, cacheTokens: 900, outputTokens: 20 } },
+    usageDimensions: { project: { widgets: { requests: 2, inputTokens: 600, cacheTokens: 550, outputTokens: 7 } } },
+  });
+  assert.equal(page.byId('heroSplit').textContent, '100 in · 900 cache · 20 out');
+  assert.equal(page.labelled(' · 100 / 900 / 20'), 1, 'the Clients row, in / cache / out');
+  assert.equal(page.labelled('100 in · 900 cache · 20 out'), 2, 'the Spend by user row, as under the hero');
+  assert.equal(page.labelled('Cache tok'), 1, 'the dimension table has a column for it');
+  assert.equal(page.labelled('550'), 1);
+  assert.equal(page.labelled('50'), 1, 'and its Input column is the uncached part');
 });
 
 test('a figure in the billions reads as one', async () => {
@@ -1040,7 +1063,7 @@ test('a figure in the billions reads as one', async () => {
   await page.answer(200, { accounts: [{ name: 'a', usage: { totalCacheReadTokens: 2_500_000_000, totalOutputTokens: 1_000 } }] });
   assert.equal(page.byId('heroMain').textContent, '2');
   assert.equal(page.byId('heroFrac').textContent, '.5b');
-  assert.equal(page.byId('heroSplit').textContent, '2.5b in · 1.0k out');
+  assert.equal(page.byId('heroSplit').textContent, '0 in · 2.5b cache · 1.0k out');
 });
 
 test('viewerCan mirrors the server: operator everything, tenant the nudges, readonly nothing', () => {
@@ -1640,13 +1663,13 @@ const ENTRY = {
 };
 
 test('the total view reads the lifetime counters', () => {
-  assert.deepEqual(usageFor(ENTRY, 'total'), { requests: 100, connections: 4, inputTokens: 9000, outputTokens: 500 });
+  assert.deepEqual(usageFor(ENTRY, 'total'), { requests: 100, connections: 4, inputTokens: 9000, outputTokens: 500, cacheTokens: 0 });
   // No view at all is the same question, asked before the page has state.
   assert.deepEqual(usageFor(ENTRY), usageFor(ENTRY, 'total'));
 });
 
 test('a window view reads that window, not the lifetime counters', () => {
-  assert.deepEqual(usageFor(ENTRY, '24h'), { requests: 12, connections: 1, inputTokens: 1200, outputTokens: 80 });
+  assert.deepEqual(usageFor(ENTRY, '24h'), { requests: 12, connections: 1, inputTokens: 1200, outputTokens: 80, cacheTokens: 0 });
   assert.equal(usageFor(ENTRY, '5h').inputTokens, 300);
 });
 
@@ -1654,9 +1677,9 @@ test('a window the payload does not carry reads as zero, never as the total', ()
   // The alternative — falling back to the lifetime figure — would label an
   // all-time number as a five-hour one, which is the one answer that misleads
   // rather than merely disappoints.
-  assert.deepEqual(usageFor({ requests: 7, inputTokens: 5 }, '24h'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
-  assert.deepEqual(usageFor(null, '5h'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
-  assert.deepEqual(usageFor(undefined, 'total'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0 });
+  assert.deepEqual(usageFor({ requests: 7, inputTokens: 5 }, '24h'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0 });
+  assert.deepEqual(usageFor(null, '5h'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0 });
+  assert.deepEqual(usageFor(undefined, 'total'), { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0 });
 });
 
 test('every offered view names a window the tracker actually keeps', () => {
@@ -2007,7 +2030,7 @@ test('Usage by user ranks every client and draws their lines in the same colours
   // alice's row, agreeing with her overview column while both are on Total.
   assert.equal(page.labelled('170 tok'), 2);
   assert.equal(page.labelled(' · 81%'), 1, 'and her share');
-  assert.equal(page.labelled('150 in · 20 out'), 1, 'and the two sides of it');
+  assert.equal(page.labelled('150 in · 0 cache · 20 out'), 1, 'and the three sides of it');
   assert.equal(page.byId('userEmpty').textContent, 'Loading usage history…');
   await page.answerSeries(SERIES);
   assert.equal(page.byId('userEmpty').style.display, 'none');
@@ -2091,7 +2114,7 @@ test('dayTicks labels a short month every day and a long one weekly', () => {
 
 test('This month shows the month, and fetches its days only once it is chosen', async () => {
   const page = bootPage();
-  const month = { requests: 7, connections: 0, inputTokens: 450, outputTokens: 80 };
+  const month = { requests: 7, connections: 0, inputTokens: 450, outputTokens: 80, cacheTokens: 400 };
   await page.answer(200, { accounts: [], clients: {
     alice: { requests: 3, inputTokens: 150, outputTokens: 20, windows: { '5h': {}, '24h': {}, month } },
   } });
@@ -2102,7 +2125,7 @@ test('This month shows the month, and fetches its days only once it is chosen', 
   assert.equal(page.monthRequests().length, 1, 'chosen, it is fetched at once');
   assert.equal(page.monthRequests()[0].init.headers['x-api-key'], '', 'with the same key as the status poll');
   assert.equal(page.byId('heroMain').textContent, '530', "the figures are the month's window");
-  assert.equal(page.byId('heroSplit').textContent, '450 in · 80 out');
+  assert.equal(page.byId('heroSplit').textContent, '50 in · 400 cache · 80 out', 'the month carries its cache too');
   assert.equal(page.byId('clientsHeading').textContent, 'Clients · this month');
   assert.equal(page.byId('rangeStart').textContent, 'The 1st');
   assert.equal(page.byId('seriesEmpty').textContent, 'Loading usage history…', 'the chart waits for the days');
