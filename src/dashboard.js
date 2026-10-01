@@ -112,14 +112,26 @@ export function accountTokens(usage) {
     + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
 }
 
-// The same spend as accountTokens, as the two sides a card shows: input is the
-// uncached figure and both cache fields, output what the account generated.
+// The same spend as accountTokens, as the three sides a card shows: the
+// uncached input, the cache read and written, and what the account generated.
 export function accountTokenSplit(usage) {
   var u = usage || {};
   return {
-    input: (u.totalInputTokens || 0) + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0),
+    input: u.totalInputTokens || 0,
+    cache: (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0),
     output: u.totalOutputTokens || 0,
   };
+}
+
+// A usage row's tokens as the same three sides. A client's `inputTokens`
+// counts its cache, and `cacheTokens` says how much of it that was, so the
+// uncached side is the difference; a row from before the cache was counted
+// apart has none, and its input is all uncached.
+/** @param {any} usage */
+export function usageTokenSplit(usage) {
+  var u = usage || {};
+  var cache = u.cacheTokens || 0;
+  return { input: Math.max(0, (u.inputTokens || 0) - cache), cache: cache, output: u.outputTokens || 0 };
 }
 
 export function providerLabel(provider) {
@@ -385,7 +397,8 @@ export function clientGroups(ranking) {
 // anything. With no names there are no lines, only the total.
 // `peakAt` is the busiest hour overall, `linePeak` the highest point of any
 // one line, and `last` the newest hour's whole traffic. The measure is
-// `requests`, `input` or `output` tokens, or anything else for both sides.
+// `requests`, `input` (cache included), `output` or `cache` tokens, or
+// anything else for input and output together.
 // A month series (GET /teamclaude/usage/series?span=month) is read the same
 // way, a day a point: its points name their `day` instead of an instant.
 /**
@@ -407,6 +420,7 @@ export function seriesLines(series, view, metric, names) {
     if (metric === 'requests') return (c.requests || [])[i] || 0;
     if (metric === 'input') return (c.inputTokens || [])[i] || 0;
     if (metric === 'output') return (c.outputTokens || [])[i] || 0;
+    if (metric === 'cache') return (c.cacheTokens || [])[i] || 0;
     return ((c.inputTokens || [])[i] || 0) + ((c.outputTokens || [])[i] || 0);
   };
   var all = Object.keys(clients).sort();
@@ -492,8 +506,8 @@ export function smoothPath(pts, floor) {
 // heavy-tailed — one client often spends ten times the next — and on a linear
 // scale every client but the busiest would sit in the faintest shade; the root
 // keeps them apart while the busiest cell still takes the darkest. Each cell
-// also carries its `input` and `output` tokens, whatever the measure, for the
-// tooltip that splits them. A month series is a column per week from the
+// also carries its `input` (cache included), `output` and `cache` tokens,
+// whatever the measure, for the tooltip that splits them. A month series is a column per week from the
 // 1st, its columns naming their `first` and `last` day.
 /**
  * @param {any} series
@@ -531,21 +545,22 @@ export function heatGrid(series, view, metric) {
     return { name: name, sum: sum };
   }).filter(function (r) { return r.sum > 0; });
   ranked.sort(function (x, y) { return (y.sum - x.sum) || (x.name < y.name ? -1 : x.name > y.name ? 1 : 0); });
-  /** @type {Array<{ name: string, others: boolean, members: string[], cells: Array<{ value: number, input: number, output: number, level: number }> }>} */
+  /** @type {Array<{ name: string, others: boolean, members: string[], cells: Array<{ value: number, input: number, output: number, cache: number, level: number }> }>} */
   var rows = ranked.map(function (r) { return { name: r.name, others: false, members: [r.name], cells: [] }; });
   var max = 0;
   rows.forEach(function (row) {
     row.cells = cols.map(function (col) {
-      var v = 0, inp = 0, out = 0;
+      var v = 0, inp = 0, out = 0, cached = 0;
       row.members.forEach(function (name) {
         for (var i = col.from; i < col.to; i++) {
           v += at(clients[name], i);
           inp += side(clients[name], 'inputTokens', i);
           out += side(clients[name], 'outputTokens', i);
+          cached += side(clients[name], 'cacheTokens', i);
         }
       });
       if (v > max) max = v;
-      return { value: v, input: inp, output: out, level: 0 };
+      return { value: v, input: inp, output: out, cache: cached, level: 0 };
     });
   });
   rows.forEach(function (row) {
@@ -965,6 +980,7 @@ export function usageFor(entry, view) {
     connections: src.connections || 0,
     inputTokens: src.inputTokens || 0,
     outputTokens: src.outputTokens || 0,
+    cacheTokens: src.cacheTokens || 0,
   };
 }
 
@@ -1092,7 +1108,7 @@ export function viewerCan(viewer, action) {
 // as it is, and the card cannot format or judge a cap differently from
 // `teamclaude status` and the router.
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, accountTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
+  scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
   formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
@@ -1690,7 +1706,7 @@ const PAGE = `<!doctype html>
           <div class="card-cap" id="seriesCaption"></div>
         </div>
         <div class="legend"><span><i class="sw main"></i>All users</span></div>
-        <div class="panel-head" id="seriesInHead" style="display:none"><span><i class="sw main"></i>Input</span><span class="panel-scale" id="seriesInMax"></span></div>
+        <div class="panel-head" id="seriesInHead" style="display:none"><span><i class="sw main"></i>Input, cache included</span><span class="panel-scale" id="seriesInMax"></span></div>
         <div class="plot" id="seriesPlot">
           <svg viewBox="0 0 400 170" preserveAspectRatio="none" aria-hidden="true">
             <defs><linearGradient id="tcArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="ga"></stop><stop offset="1" class="gb"></stop></linearGradient></defs>
@@ -1760,7 +1776,7 @@ const PAGE = `<!doctype html>
       <section class="card rise" id="clientsWrap" style="display:none;animation-delay:.36s">
         <div class="card-head">
           <h2 class="card-title">${ICONS.clients}<span id="clientsHeading">Clients</span></h2>
-          <span class="card-cap">Requests · tokens in / out</span>
+          <span class="card-cap">Requests · tokens in / cache / out</span>
         </div>
         <div id="clients"></div>
       </section>
@@ -1792,7 +1808,7 @@ const PAGE = `<!doctype html>
           <div class="card-cap" id="userCaption"></div>
         </div>
         <div class="legend" id="userLegend"></div>
-        <div class="panel-head" id="userInHead" style="display:none"><span>Input</span></div>
+        <div class="panel-head" id="userInHead" style="display:none"><span>Input, cache included</span></div>
         <div class="plot uplot" id="userPlot">
           <div class="ug top"></div><div class="ug mid"></div><div class="ug base"></div>
           <div class="umax" id="userMax"></div>
@@ -2086,6 +2102,11 @@ ${SHARED_HELPERS}
     return new Date(+p[0], +p[1] - 1, +p[2]).toLocaleDateString([], { month: 'short', day: 'numeric' });
   }
 
+  // Three sides as one line: "1.2k in · 3.4m cache · 56.0k out".
+  function sidesText(sd) {
+    return fmtNum(sd.input) + ' in · ' + fmtNum(sd.cache) + ' cache · ' + fmtNum(sd.output) + ' out';
+  }
+
   // The series a window draws from: the month by day under This month, the
   // last day by hour under every other window.
   function seriesFor(view) {
@@ -2308,12 +2329,10 @@ ${SHARED_HELPERS}
     card.appendChild(meters);
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
-    // Input is the uncached figure and both cache fields, as accountTokens adds
-    // them; the tooltip takes the three apart.
-    var sides = accountTokenSplit(u);
-    var foot = el('div', 'acct-foot', (u.totalRequests || 0) + ' req · ' + fmtNum(sides.input) + ' in · ' + fmtNum(sides.output) + ' out' + last);
-    foot.title = 'Input: ' + fmtNum(u.totalInputTokens || 0) + ' uncached, ' + fmtNum(u.totalCacheReadTokens || 0) + ' cache reads, '
-      + fmtNum(u.totalCacheCreationTokens || 0) + ' cache writes · ' + fmtNum(accountTokens(u)) + ' tokens in all';
+    // The cache is reads and writes together; the tooltip takes them apart.
+    var foot = el('div', 'acct-foot', (u.totalRequests || 0) + ' req · ' + sidesText(accountTokenSplit(u)) + last);
+    foot.title = 'Cache: ' + fmtNum(u.totalCacheReadTokens || 0) + ' reads, ' + fmtNum(u.totalCacheCreationTokens || 0)
+      + ' writes · ' + fmtNum(accountTokens(u)) + ' tokens in all';
     card.appendChild(foot);
     return card;
   }
@@ -2874,28 +2893,31 @@ ${SHARED_HELPERS}
   function heroFigure(s) {
     var requests = chartMetric === 'requests';
     if (hasClients(s)) {
-      var total = 0, inTok = 0, outTok = 0;
+      var total = 0, sides = { input: 0, cache: 0, output: 0 };
       clientRanking(s.clients, usageView, chartMetric).forEach(function (r) {
+        var sd = usageTokenSplit(r.usage);
         total += r.value;
-        inTok += r.usage.inputTokens;
-        outTok += r.usage.outputTokens;
+        sides.input += sd.input;
+        sides.cache += sd.cache;
+        sides.output += sd.output;
       });
       return {
-        value: total, label: requests ? 'Requests served' : 'Tokens used', input: inTok, output: outTok,
+        value: total, label: requests ? 'Requests served' : 'Tokens used', sides: sides,
         title: 'Every client key\\'s ' + (requests ? 'requests' : 'input and output tokens, cache reads and writes included') + ', ' + (usageView === 'total' ? 'all time' : viewLabel().toLowerCase())
           + '. Traffic on the shared proxy key is not attributed to anyone.',
       };
     }
-    var sum = 0, inAll = 0, outAll = 0;
+    var sum = 0, all = { input: 0, cache: 0, output: 0 };
     (s.accounts || []).forEach(function (a) {
       var u = a.usage || {};
-      var sides = accountTokenSplit(u);
+      var sd = accountTokenSplit(u);
       sum += requests ? (u.totalRequests || 0) : accountTokens(u);
-      inAll += sides.input;
-      outAll += sides.output;
+      all.input += sd.input;
+      all.cache += sd.cache;
+      all.output += sd.output;
     });
     return {
-      value: sum, label: (requests ? 'Requests served' : 'Tokens served') + ' since start', input: inAll, output: outAll,
+      value: sum, label: (requests ? 'Requests served' : 'Tokens served') + ' since start', sides: all,
       title: 'What every account has served since the proxy started' + (requests ? '' : ', cache reads and writes included'),
     };
   }
@@ -2931,9 +2953,9 @@ ${SHARED_HELPERS}
     label.textContent = fig.label;
     label.title = fig.title;
     setHero(fig.value);
-    // The big figure is both sides; under it, the two apart.
+    // The big figure is every side; under it, the three apart.
     var split = byId('heroSplit');
-    split.textContent = chartMetric === 'requests' ? '' : fmtNum(fig.input) + ' in · ' + fmtNum(fig.output) + ' out';
+    split.textContent = chartMetric === 'requests' ? '' : sidesText(fig.sides);
     split.style.display = chartMetric === 'requests' ? 'none' : '';
     // Where a new request goes: one cursor per provider, since a mixed
     // Claude/Codex fleet has two current accounts and naming one of them "the"
@@ -2976,11 +2998,16 @@ ${SHARED_HELPERS}
     var g = clientGroups(ranking);
     var usageOf = {};
     ranking.forEach(function (r) { usageOf[r.name] = r.usage; });
-    var sidesText = function (members) {
+    var groupSides = function (members) {
       if (chartMetric === 'requests') return '';
-      var a = 0, b = 0;
-      members.forEach(function (name) { a += usageOf[name].inputTokens; b += usageOf[name].outputTokens; });
-      return ' (' + fmtNum(a) + ' in · ' + fmtNum(b) + ' out)';
+      var sum = { input: 0, cache: 0, output: 0 };
+      members.forEach(function (name) {
+        var sd = usageTokenSplit(usageOf[name]);
+        sum.input += sd.input;
+        sum.cache += sd.cache;
+        sum.output += sd.output;
+      });
+      return ' (' + sidesText(sum) + ')';
     };
     var empty = byId('groupsEmpty');
     if (g.groups.length) empty.style.display = 'none';
@@ -2995,7 +3022,7 @@ ${SHARED_HELPERS}
       slot.style.display = '';
       slot.style.flexGrow = String(grp.grow);
       slot.style.paddingTop = lift(grp.lift) + 'px';
-      slot.title = (grp.others ? grp.members.join(', ') : grp.name) + ' · ' + metricText(grp.value) + sidesText(grp.members) + ' · ' + fmtShare(grp.share);
+      slot.title = (grp.others ? grp.members.join(', ') : grp.name) + ' · ' + metricText(grp.value) + groupSides(grp.members) + ' · ' + fmtShare(grp.share);
       byId('grp' + i + 'Val').textContent = metricText(grp.value);
       byId('grp' + i + 'Pct').textContent = fmtShare(grp.share);
       byId('grp' + i + 'Name').textContent = grp.others ? grp.members.length + ' others' : grp.name;
@@ -3052,10 +3079,13 @@ ${SHARED_HELPERS}
     if (!drawn) empty.textContent = historyEmptyText(hours, usageView);
     var IN = split ? seriesLines(series, usageView, 'input', null) : L;
     var OUT = split ? seriesLines(series, usageView, 'output', null) : null;
+    var CACHE = split ? seriesLines(series, usageView, 'cache', null) : null;
     var colTitle = function (i) {
       var p = L.points[i];
       var head = pointText(p) + ' · ';
-      return split ? head + fmtNum(IN.points[i].total) + ' in · ' + fmtNum(OUT.points[i].total) + ' out' : head + metricText(p.total);
+      if (!split) return head + metricText(p.total);
+      var cache = CACHE.points[i].total;
+      return head + sidesText({ input: Math.max(0, IN.points[i].total - cache), cache: cache, output: OUT.points[i].total });
     };
     drawSeriesPanel({ main: 'seriesMain', area: 'seriesArea', peak: 'peakLine', tags: 'peakTags', tag: 'peakMain', hover: 'seriesHover', max: split ? 'seriesInMax' : null },
       drawn ? IN : null, colTitle);
@@ -3127,7 +3157,7 @@ ${SHARED_HELPERS}
     ranking.forEach(function (r) {
       var tone = toneOf({ name: r.name, others: false });
       var row = el('div', 'sp-row');
-      var sides = fmtNum(r.usage.inputTokens) + ' in · ' + fmtNum(r.usage.outputTokens) + ' out';
+      var sides = sidesText(usageTokenSplit(r.usage));
       row.title = r.name + ' · ' + metricText(r.value, userMetric) + (split ? ' (' + sides + ')' : '') + ' · ' + fmtShare(r.share);
       var name = el('span', 'sp-name');
       name.appendChild(el('i', 'dot ' + tone));
@@ -3190,12 +3220,13 @@ ${SHARED_HELPERS}
     };
     var IN = split ? align(seriesLines(series, userView, 'input', names)) : L;
     var OUT = split ? align(seriesLines(series, userView, 'output', names)) : null;
+    var CACHE = split ? align(seriesLines(series, userView, 'cache', names)) : null;
     var colTitle = function (i) {
       var p = L.points[i];
       return pointText(p) + ' · ' + lines.map(function (line, k) {
-        return label(line) + ' ' + (split
-          ? fmtNum(IN.lines[k].values[i]) + ' in / ' + fmtNum(OUT.lines[k].values[i]) + ' out'
-          : metricText(line.values[i], userMetric));
+        if (!split) return label(line) + ' ' + metricText(line.values[i], userMetric);
+        var cache = CACHE.lines[k].values[i];
+        return label(line) + ' ' + fmtNum(Math.max(0, IN.lines[k].values[i] - cache)) + ' in / ' + fmtNum(cache) + ' cache / ' + fmtNum(OUT.lines[k].values[i]) + ' out';
       }).join(' · ');
     };
     drawUserPanel({ svg: 'userLines', max: 'userMax', hover: 'userHover' }, drawn ? IN : null, toneOf, colTitle);
@@ -3274,7 +3305,7 @@ ${SHARED_HELPERS}
       row.cells.forEach(function (cell, c) {
         var d = el('div', 'cell' + (cell.level ? ' l' + cell.level : ''));
         d.title = name + ' · ' + colText(G.columns[c]) + ' · ' + metricText(cell.value, userMetric)
-          + (userMetric === 'requests' ? '' : ' (' + fmtNum(cell.input) + ' in · ' + fmtNum(cell.output) + ' out)');
+          + (userMetric === 'requests' ? '' : ' (' + sidesText({ input: Math.max(0, cell.input - cell.cache), cache: cell.cache, output: cell.output }) + ')');
         grid.appendChild(d);
       });
     });
@@ -3353,9 +3384,10 @@ ${SHARED_HELPERS}
       var c = clients[n];
       var u = usageFor(c, usageView);
       var row = el('div', 'cl-row');
+      var sd = usageTokenSplit(u);
       row.title = n + ' · ' + fmtNum(u.requests) + ' requests'
         + (u.connections ? ', ' + fmtNum(u.connections) + ' WebSockets' : '')
-        + ' · ' + fmtNum(u.inputTokens) + ' tokens in, ' + fmtNum(u.outputTokens) + ' out';
+        + ' · ' + sidesText(sd);
       row.appendChild(el('span', 'cl-name', n));
       // Last used stays the lifetime figure under every window: it answers
       // when this client was last seen at all, which a window cannot.
@@ -3366,7 +3398,7 @@ ${SHARED_HELPERS}
       row.appendChild(last);
       var val = el('span', 'cl-val');
       val.appendChild(el('b', '', fmtNum(u.requests)));
-      val.appendChild(el('span', '', ' · ' + fmtNum(u.inputTokens) + ' / ' + fmtNum(u.outputTokens)));
+      val.appendChild(el('span', '', ' · ' + fmtNum(sd.input) + ' / ' + fmtNum(sd.cache) + ' / ' + fmtNum(sd.output)));
       row.appendChild(val);
       box.appendChild(row);
     });
@@ -3469,11 +3501,13 @@ ${SHARED_HELPERS}
       var rows = Object.keys(entries).map(function (key) {
         var e = entries[key] || {};
         var u = usageFor(e, usageView);
+        var sd = usageTokenSplit(u);
         return {
           name: key,
           requests: u.requests,
-          inputTokens: u.inputTokens,
-          outputTokens: u.outputTokens,
+          inputTokens: sd.input,
+          cacheTokens: sd.cache,
+          outputTokens: sd.output,
           lastUsed: e.lastUsed ? Date.parse(e.lastUsed) : 0,
         };
       });
@@ -3493,6 +3527,7 @@ ${SHARED_HELPERS}
       [{ key: 'name', label: title },
         { key: 'requests', label: 'Req', num: true },
         { key: 'inputTokens', label: 'Input tok', num: true },
+        { key: 'cacheTokens', label: 'Cache tok', num: true },
         { key: 'outputTokens', label: 'Output tok', num: true },
         { key: 'lastUsed', label: lastUsedLabel(), num: true }].forEach(function (c) {
         addSortableHeader(hr, name, c.label, c.key, !!c.num);
@@ -3503,6 +3538,7 @@ ${SHARED_HELPERS}
         tr.appendChild(el('td', '', r.name));
         tr.appendChild(el('td', 'num', fmtNum(r.requests)));
         tr.appendChild(el('td', 'num', fmtNum(r.inputTokens)));
+        tr.appendChild(el('td', 'num', fmtNum(r.cacheTokens)));
         tr.appendChild(el('td', 'num', fmtNum(r.outputTokens)));
         tr.appendChild(el('td', 'num soft', r.lastUsed ? fmtAgo(r.lastUsed) : '—'));
         table.appendChild(tr);
