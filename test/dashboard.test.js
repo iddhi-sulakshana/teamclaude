@@ -6,13 +6,13 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens, accountTokenSplit,
-  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks,
+  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
   sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
 } from '../src/dashboard.js';
-import { USAGE_WINDOWS } from '../src/client-usage.js';
+import { USAGE_WINDOW_LABELS } from '../src/client-usage.js';
 import { normalizeSpend } from '../src/oauth.js';
 
 function listen(server) {
@@ -821,7 +821,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, accountTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, accountTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -891,7 +891,8 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
   // client. `answer` resolves the oldest request that is NOT that one, so a
   // test about the controls reads the same whether or not a chart is on the
   // page; `answerSeries` resolves it.
-  const isSeries = r => r.url === '/teamclaude/usage/series';
+  const isSeries = r => r.url.startsWith('/teamclaude/usage/series');
+  const isMonth = r => r.url === '/teamclaude/usage/series?span=month';
   const settle = async (index, status, body) => {
     assert.notEqual(index, -1, 'no such request pending');
     const [req] = requests.splice(index, 1);
@@ -899,7 +900,9 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     await new Promise(r => setImmediate(r));
   };
   const answer = (status, body = {}) => settle(requests.findIndex(r => !isSeries(r)), status, body);
-  const answerSeries = (body, status = 200) => settle(requests.findIndex(isSeries), status, body);
+  const answerSeries = (body, status = 200) => settle(requests.findIndex(r => isSeries(r) && !isMonth(r)), status, body);
+  const answerMonth = (body, status = 200) => settle(requests.findIndex(isMonth), status, body);
+  const monthRequests = () => requests.filter(isMonth);
   const pending = () => requests.filter(r => !isSeries(r));
   // Click the control carrying this label, whoever built it. A render replaces
   // a table by building new elements rather than mutating the old ones, so the
@@ -932,7 +935,7 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
   const titled = title => built.slice(mark).filter(e => e.title === title).length;
   // A field the page filled, such as a revealed key, found by its value.
   const valued = value => built.slice(mark).filter(e => e.value === value).length;
-  return { byId, store, requests, pending, answer, answerSeries, rootAttrs, click, clickNth, clickTitled, titled, labelled, valued, keydown };
+  return { byId, store, requests, pending, answer, answerSeries, answerMonth, monthRequests, rootAttrs, click, clickNth, clickTitled, titled, labelled, valued, keydown };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
@@ -1029,6 +1032,15 @@ test('without client keys the overview shows what the accounts served, and says 
   // Each card's footer splits its own spend the same way.
   assert.equal(page.labelled('4 req · 1.8k in · 200 out'), 1);
   assert.equal(page.byId('usageViewWrap').style.display, 'none', 'nothing windowed for the control to change');
+});
+
+test('a figure in the billions reads as one', async () => {
+  // A month of cache reads gets here; "2500.0m" would be the figure otherwise.
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', usage: { totalCacheReadTokens: 2_500_000_000, totalOutputTokens: 1_000 } }] });
+  assert.equal(page.byId('heroMain').textContent, '2');
+  assert.equal(page.byId('heroFrac').textContent, '.5b');
+  assert.equal(page.byId('heroSplit').textContent, '2.5b in · 1.0k out');
 });
 
 test('viewerCan mirrors the server: operator everything, tenant the nudges, readonly nothing', () => {
@@ -1648,10 +1660,12 @@ test('a window the payload does not carry reads as zero, never as the total', ()
 });
 
 test('every offered view names a window the tracker actually keeps', () => {
-  // The buttons are derived from USAGE_WINDOWS rather than listed twice: a
-  // renamed window must not leave behind a button that reads zero for everyone.
+  // The buttons are derived from the tracker's windows rather than listed
+  // twice: a renamed window must not leave behind a button that reads zero for
+  // everyone.
   assert.equal(USAGE_VIEWS[0].key, 'total');
-  assert.deepEqual(USAGE_VIEWS.slice(1).map(v => v.key), Object.keys(USAGE_WINDOWS));
+  assert.deepEqual(USAGE_VIEWS.slice(1).map(v => v.key), USAGE_WINDOW_LABELS);
+  assert.equal(USAGE_VIEWS.at(-1).label, 'This month');
   for (const view of USAGE_VIEWS) assert.ok(view.label, 'every view carries a button label');
 });
 
@@ -1884,8 +1898,8 @@ test('clientGroups never folds a single client', () => {
 test('heatGrid lays clients against four-hour stretches of the day', () => {
   const g = heatGrid(SERIES, '24h', 'tokens');
   assert.equal(g.columns.length, 6);
-  assert.deepEqual(g.columns[0], { start: END - 24 * HOUR, end: END - 20 * HOUR });
-  assert.deepEqual(g.columns[5], { start: END - 4 * HOUR, end: END });
+  assert.deepEqual(g.columns[0], { start: END - 24 * HOUR, end: END - 20 * HOUR, first: null, last: null });
+  assert.deepEqual(g.columns[5], { start: END - 4 * HOUR, end: END, first: null, last: null });
   assert.deepEqual(g.rows.map(r => r.name), ['alice', 'bob', 'carol', 'dave'], 'busiest first');
   // alice: 50 in bucket 10 (column 2), 120 in bucket 23 (column 5).
   assert.deepEqual(g.rows[0].cells.map(c => c.value), [0, 0, 50, 0, 0, 120]);
@@ -1908,7 +1922,7 @@ test('heatGrid lays clients against four-hour stretches of the day', () => {
 test('heatGrid gives five hours a column each, and every active client a row of its own', () => {
   const five = heatGrid(SERIES, '5h', 'requests');
   assert.equal(five.columns.length, 5);
-  assert.deepEqual(five.columns[4], { start: END - HOUR, end: END });
+  assert.deepEqual(five.columns[4], { start: END - HOUR, end: END, first: null, last: null });
   assert.deepEqual(five.rows.map(r => r.name), ['bob', 'alice', 'carol', 'dave']);
   const clients = {};
   for (let i = 0; i < 9; i++) clients['c' + i] = { requests: hourly([[23, 10 - i]]), inputTokens: hourly([]), outputTokens: hourly([]) };
@@ -2036,6 +2050,84 @@ test('a series that fails to load says so in the chart', async () => {
   assert.equal(page.byId('seriesEmpty').textContent, 'Usage history unavailable: status 500');
   assert.equal(page.byId('userEmpty').textContent, 'Usage history unavailable: status 500');
   assert.equal(page.byId('heatEmpty').textContent, 'History unavailable');
+});
+
+// The month by day, as GET /teamclaude/usage/series?span=month answers it.
+const MONTH = {
+  span: 'month', days: ['2026-10-01', '2026-10-02', '2026-10-03'], buckets: 3,
+  clients: {
+    alice: { requests: [1, 0, 2], inputTokens: [100, 0, 300], outputTokens: [10, 0, 30] },
+    bob: { requests: [0, 4, 0], inputTokens: [0, 50, 0], outputTokens: [0, 40, 0] },
+  },
+};
+const day = key => { const [y, m, d] = key.split('-').map(Number); return new Date(y, m - 1, d).toLocaleDateString([], { month: 'short', day: 'numeric' }); };
+
+test('seriesLines reads a month series a day a point', () => {
+  const lines = seriesLines(MONTH, 'month', 'input', ['alice']);
+  assert.deepEqual(lines.points.map(p => [p.day, p.total]), [['2026-10-01', 100], ['2026-10-02', 50], ['2026-10-03', 300]]);
+  assert.equal(lines.points[0].start, null, 'a day is named, not measured from an instant');
+  assert.equal(lines.peakAt, 2);
+  assert.deepEqual(lines.lines[0].values, [100, 0, 300]);
+  assert.equal(lines.lines[1].name, 'others');
+});
+
+test('heatGrid lays a month out a week a column, from the 1st', () => {
+  const days = Array.from({ length: 17 }, (_, i) => `2026-10-${String(i + 1).padStart(2, '0')}`);
+  const series = { span: 'month', days, buckets: 17, clients: { alice: { requests: days.map(() => 1), inputTokens: days.map((_, i) => i), outputTokens: days.map(() => 0) } } };
+  const g = heatGrid(series, 'month', 'tokens');
+  assert.deepEqual(g.columns.map(c => [c.first, c.last]), [['2026-10-01', '2026-10-07'], ['2026-10-08', '2026-10-14'], ['2026-10-15', '2026-10-17']]);
+  assert.deepEqual(g.rows[0].cells.map(c => c.value), [0 + 1 + 2 + 3 + 4 + 5 + 6, 7 + 8 + 9 + 10 + 11 + 12 + 13, 14 + 15 + 16]);
+  // A week or less: a column a day.
+  assert.equal(heatGrid(MONTH, 'month', 'tokens').columns.length, 3);
+});
+
+test('dayTicks labels a short month every day and a long one weekly', () => {
+  assert.deepEqual(dayTicks(['a', 'b']), ['a', 'b']);
+  const days = Array.from({ length: 31 }, (_, i) => 'd' + (i + 1));
+  assert.deepEqual(dayTicks(days), ['d1', 'd8', 'd15', 'd22', 'd31']);
+  assert.deepEqual(dayTicks(days.slice(0, 9)), ['d1', 'd9'], 'no tick crowds today');
+  assert.deepEqual(dayTicks(null), []);
+});
+
+test('This month shows the month, and fetches its days only once it is chosen', async () => {
+  const page = bootPage();
+  const month = { requests: 7, connections: 0, inputTokens: 450, outputTokens: 80 };
+  await page.answer(200, { accounts: [], clients: {
+    alice: { requests: 3, inputTokens: 150, outputTokens: 20, windows: { '5h': {}, '24h': {}, month } },
+  } });
+  await page.answerSeries(SERIES);
+  assert.equal(page.monthRequests().length, 0, 'nothing asks for the month until a control is on it');
+
+  page.click('This month');
+  assert.equal(page.monthRequests().length, 1, 'chosen, it is fetched at once');
+  assert.equal(page.monthRequests()[0].init.headers['x-api-key'], '', 'with the same key as the status poll');
+  assert.equal(page.byId('heroMain').textContent, '530', "the figures are the month's window");
+  assert.equal(page.byId('heroSplit').textContent, '450 in · 80 out');
+  assert.equal(page.byId('clientsHeading').textContent, 'Clients · this month');
+  assert.equal(page.byId('rangeStart').textContent, 'The 1st');
+  assert.equal(page.byId('seriesEmpty').textContent, 'Loading usage history…', 'the chart waits for the days');
+
+  await page.answerMonth(MONTH);
+  assert.equal(page.byId('seriesEmpty').style.display, 'none');
+  assert.equal(page.byId('seriesCaption').textContent, 'Tokens / day · this month');
+  assert.equal(page.byId('peakMain').textContent, 'Peak 300 tok', "the input panel's busiest day");
+  assert.equal(page.byId('peakOut').textContent, 'Peak 40 tok');
+  assert.ok(page.labelled(day('2026-10-01')) >= 1, 'the axis reads the days');
+  assert.equal(page.byId('userCaption').textContent, 'Tokens / hour · last 24h', 'Usage by user keeps its own window');
+
+  page.clickNth('This month', 1);
+  assert.equal(page.byId('userCaption').textContent, 'Tokens / day · this month');
+  assert.equal(page.byId('heatEmpty').style.display, 'none');
+});
+
+test('a month that fails to load says so, apart from the day', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], clients: { alice: { requests: 1 } } });
+  await page.answerSeries(SERIES);
+  page.click('This month');
+  await page.answerMonth({}, 500);
+  assert.equal(page.byId('seriesEmpty').textContent, 'Usage history unavailable: status 500');
+  assert.equal(page.byId('userEmpty').style.display, 'none', 'the hourly chart under its own window is unaffected');
 });
 
 test('no client, no chart and no series fetch', async () => {

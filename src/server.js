@@ -21,7 +21,7 @@ import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
-import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames, USAGE_SLOT_MS } from './client-usage.js';
+import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames, USAGE_SLOT_MS, USAGE_MONTH } from './client-usage.js';
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
@@ -658,11 +658,17 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // behind them — ~100 numbers per client that only the chart reads. The
       // same readers as status: behind the same gate, and every client key sees
       // every client, as the Clients table already shows them.
-      if (req.method === 'GET' && req.url === '/teamclaude/usage/series') {
+      //
+      // `?span=month` asks instead for the calendar month by day, which the
+      // charts draw under This month: the hourly tally above holds one day.
+      if (req.method === 'GET' && (req.url === '/teamclaude/usage/series' || req.url === '/teamclaude/usage/series?span=month')) {
+        const month = req.url.endsWith('?span=month');
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(clientUsage
-          ? clientUsage.series()
-          : { slotMs: USAGE_SLOT_MS, bucketMs: 4 * USAGE_SLOT_MS, buckets: 0, end: Date.now(), clients: {} }));
+        res.end(JSON.stringify(month
+          ? (clientUsage ? clientUsage.monthSeries() : { span: USAGE_MONTH, days: [], buckets: 0, clients: {} })
+          : clientUsage
+            ? clientUsage.series()
+            : { slotMs: USAGE_SLOT_MS, bucketMs: 4 * USAGE_SLOT_MS, buckets: 0, end: Date.now(), clients: {} }));
         return;
       }
 
