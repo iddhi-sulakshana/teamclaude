@@ -112,6 +112,16 @@ export function accountTokens(usage) {
     + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0);
 }
 
+// The same spend as accountTokens, as the two sides a card shows: input is the
+// uncached figure and both cache fields, output what the account generated.
+export function accountTokenSplit(usage) {
+  var u = usage || {};
+  return {
+    input: (u.totalInputTokens || 0) + (u.totalCacheReadTokens || 0) + (u.totalCacheCreationTokens || 0),
+    output: u.totalOutputTokens || 0,
+  };
+}
+
 export function providerLabel(provider) {
   if (provider === 'codex') return 'Codex';
   if (provider === 'anthropic') return 'Claude';
@@ -374,7 +384,8 @@ export function clientGroups(ranking) {
 // every other client folded into one "others" line when any of them spent
 // anything. With no names there are no lines, only the total.
 // `peakAt` is the busiest hour overall, `linePeak` the highest point of any
-// one line, and `last` the newest hour's whole traffic.
+// one line, and `last` the newest hour's whole traffic. The measure is
+// `requests`, `input` or `output` tokens, or anything else for both sides.
 /**
  * @param {any} series
  * @param {string} [view]
@@ -391,6 +402,8 @@ export function seriesLines(series, view, metric, names) {
   var at = function (/** @type {any} */ c, /** @type {number} */ i) {
     if (!c) return 0;
     if (metric === 'requests') return (c.requests || [])[i] || 0;
+    if (metric === 'input') return (c.inputTokens || [])[i] || 0;
+    if (metric === 'output') return (c.outputTokens || [])[i] || 0;
     return ((c.inputTokens || [])[i] || 0) + ((c.outputTokens || [])[i] || 0);
   };
   var all = Object.keys(clients).sort();
@@ -473,7 +486,9 @@ export function smoothPath(pts, floor) {
 // quarters of the square root of its share of the busiest cell. Usage is
 // heavy-tailed — one client often spends ten times the next — and on a linear
 // scale every client but the busiest would sit in the faintest shade; the root
-// keeps them apart while the busiest cell still takes the darkest.
+// keeps them apart while the busiest cell still takes the darkest. Each cell
+// also carries its `input` and `output` tokens, whatever the measure, for the
+// tooltip that splits them.
 /**
  * @param {any} series
  * @param {string} [view]
@@ -498,21 +513,28 @@ export function heatGrid(series, view, metric) {
     if (metric === 'requests') return (cl.requests || [])[i] || 0;
     return ((cl.inputTokens || [])[i] || 0) + ((cl.outputTokens || [])[i] || 0);
   };
+  var side = function (/** @type {any} */ cl, /** @type {string} */ key, /** @type {number} */ i) { return (cl[key] || [])[i] || 0; };
   var ranked = Object.keys(clients).map(function (name) {
     var sum = 0;
     for (var i = from; i < n; i++) sum += at(clients[name], i);
     return { name: name, sum: sum };
   }).filter(function (r) { return r.sum > 0; });
   ranked.sort(function (x, y) { return (y.sum - x.sum) || (x.name < y.name ? -1 : x.name > y.name ? 1 : 0); });
-  /** @type {Array<{ name: string, others: boolean, members: string[], cells: Array<{ value: number, level: number }> }>} */
+  /** @type {Array<{ name: string, others: boolean, members: string[], cells: Array<{ value: number, input: number, output: number, level: number }> }>} */
   var rows = ranked.map(function (r) { return { name: r.name, others: false, members: [r.name], cells: [] }; });
   var max = 0;
   rows.forEach(function (row) {
     row.cells = cols.map(function (col) {
-      var v = 0;
-      row.members.forEach(function (name) { for (var i = col.from; i < col.to; i++) v += at(clients[name], i); });
+      var v = 0, inp = 0, out = 0;
+      row.members.forEach(function (name) {
+        for (var i = col.from; i < col.to; i++) {
+          v += at(clients[name], i);
+          inp += side(clients[name], 'inputTokens', i);
+          out += side(clients[name], 'outputTokens', i);
+        }
+      });
       if (v > max) max = v;
-      return { value: v, level: 0 };
+      return { value: v, input: inp, output: out, level: 0 };
     });
   });
   rows.forEach(function (row) {
@@ -1042,7 +1064,7 @@ export function viewerCan(viewer, action) {
 // as it is, and the card cannot format or judge a cap differently from
 // `teamclaude status` and the router.
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
+  scopedWeeklyRows, accountTokens, accountTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
   formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks,
@@ -1255,6 +1277,7 @@ const PAGE = `<!doctype html>
   .big { font-size: 64px; font-weight: 600; letter-spacing: -0.04em; line-height: .9; white-space: nowrap; }
   .big .frac { color: var(--faint); }
   .delta { font-size: 12px; color: var(--lime-text); padding-bottom: 4px; white-space: nowrap; }
+  .hero-split { font-size: 13px; color: var(--muted); margin-top: -8px; }
   .routing-to { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
   .routing-to b { color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 100%; }
   .routing-to .prov { color: var(--dim); }
@@ -1291,7 +1314,7 @@ const PAGE = `<!doctype html>
   .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); flex-wrap: wrap; align-items: center; min-height: 18px; }
   .legend span { display: flex; align-items: center; gap: 7px; min-width: 0; }
   .sw { width: 11px; height: 11px; border-radius: 3px; flex: none; display: inline-block; }
-  .sw.main { background: var(--area); }
+  .sw.main { background: var(--area); } .sw.out { background: var(--lilac); }
   .sw.u0, .dot.u0, .sp-track i.u0 { background: var(--user-0); } .sw.u1, .dot.u1, .sp-track i.u1 { background: var(--user-1); }
   .sw.u2, .dot.u2, .sp-track i.u2 { background: var(--user-2); } .sw.u3, .dot.u3, .sp-track i.u3 { background: var(--user-3); }
   .sw.u4, .dot.u4, .sp-track i.u4 { background: var(--user-4); } .sw.u5, .dot.u5, .sp-track i.u5 { background: var(--user-5); }
@@ -1307,6 +1330,13 @@ const PAGE = `<!doctype html>
   .plot path { transition: d .6s cubic-bezier(.2,.8,.2,1); }
   .ga { stop-color: var(--area); stop-opacity: .22; } .gb { stop-color: var(--area); stop-opacity: 0; }
   #seriesMain { fill: none; stroke: var(--area); stroke-width: 2; }
+  .oa { stop-color: var(--lilac); stop-opacity: .22; } .ob { stop-color: var(--lilac); stop-opacity: 0; }
+  #seriesOutMain { fill: none; stroke: var(--lilac); stroke-width: 2; }
+  /* Tokens split into an input and an output panel, each on its own scale. */
+  .plot.split { height: 110px; }
+  .panel-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12px; color: var(--muted); }
+  .panel-head span { display: flex; align-items: center; gap: 7px; }
+  .panel-scale { color: var(--dim); }
   .hover-cols { position: absolute; inset: 0; display: flex; }
   .hover-cols div { flex: 1; border-radius: 6px; }
   .hover-cols div:hover { background: var(--line); }
@@ -1315,6 +1345,7 @@ const PAGE = `<!doctype html>
   .peak-tags.flip { transform: translateX(calc(-100% - 8px)); align-items: flex-end; }
   .tag { height: 24px; padding: 0 9px; border-radius: 999px; background: var(--raised); color: var(--text); font-size: 11px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
   .tag i { width: 3px; height: 12px; border-radius: 2px; background: var(--area); flex: none; }
+  .tag.out i { background: var(--lilac); }
   .plot-empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; font-size: 12px; color: var(--dim); text-align: center; padding: 0 12px; }
   .ticks { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
 
@@ -1330,20 +1361,23 @@ const PAGE = `<!doctype html>
   .sp-row:hover { background: var(--row-hover); }
   .sp-name { display: flex; align-items: center; gap: 8px; font-weight: 500; min-width: 0; }
   .sp-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .sp-track { height: 6px; border-radius: 999px; background: var(--raised); overflow: hidden; }
-  .sp-track i { display: block; height: 100%; border-radius: 999px; transition: width .6s cubic-bezier(.2,.8,.2,1); }
+  .sp-track { height: 6px; border-radius: 999px; background: var(--raised); overflow: hidden; display: flex; gap: 2px; }
+  .sp-track i { display: block; height: 100%; border-radius: 999px; flex: none; transition: width .6s cubic-bezier(.2,.8,.2,1); }
+  .sp-track i.out { opacity: .45; }
   .sp-val { text-align: right; white-space: nowrap; min-width: 110px; }
   .sp-val b { font-weight: 500; }
   .sp-val span { color: var(--dim); }
+  .sp-sub { font-size: 11px; color: var(--dim); margin-top: 2px; }
   .ug { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--grid-dash); pointer-events: none; }
   .ug.top { top: 0; } .ug.mid { top: 50%; } .ug.base { bottom: 0; border-top-style: solid; }
   .umax { position: absolute; top: 4px; left: 0; font-size: 11px; color: var(--dim); pointer-events: none; }
-  #userPlot path { fill: none; stroke-width: 2; }
-  #userPlot path.u0 { stroke: var(--user-0); } #userPlot path.u1 { stroke: var(--user-1); }
-  #userPlot path.u2 { stroke: var(--user-2); } #userPlot path.u3 { stroke: var(--user-3); }
-  #userPlot path.u4 { stroke: var(--user-4); } #userPlot path.u5 { stroke: var(--user-5); }
-  #userPlot path.u6 { stroke: var(--user-6); } #userPlot path.u7 { stroke: var(--user-7); }
-  #userPlot path.uo { stroke: var(--user-o); }
+  .uplot path { fill: none; stroke-width: 2; }
+  .uplot.out path { stroke-dasharray: 5 3; }
+  .uplot path.u0 { stroke: var(--user-0); } .uplot path.u1 { stroke: var(--user-1); }
+  .uplot path.u2 { stroke: var(--user-2); } .uplot path.u3 { stroke: var(--user-3); }
+  .uplot path.u4 { stroke: var(--user-4); } .uplot path.u5 { stroke: var(--user-5); }
+  .uplot path.u6 { stroke: var(--user-6); } .uplot path.u7 { stroke: var(--user-7); }
+  .uplot path.uo { stroke: var(--user-o); }
 
   /* By time */
   .heat { display: grid; gap: 5px; align-items: center; }
@@ -1603,6 +1637,7 @@ const PAGE = `<!doctype html>
             <div class="big" id="heroNum"><span id="heroMain">0</span><span class="frac" id="heroFrac"></span></div>
             <div class="delta" id="heroDelta" style="display:none"></div>
           </div>
+          <div class="hero-split" id="heroSplit" style="display:none"></div>
           <div class="routing-to" id="statActive"></div>
           <div class="hero-btns">
             <button id="addAcct" class="pill-btn" type="button">Add account <span class="glyph" aria-hidden="true">+</span></button>
@@ -1627,7 +1662,8 @@ const PAGE = `<!doctype html>
           <div class="card-cap" id="seriesCaption"></div>
         </div>
         <div class="legend"><span><i class="sw main"></i>All users</span></div>
-        <div class="plot">
+        <div class="panel-head" id="seriesInHead" style="display:none"><span><i class="sw main"></i>Input</span><span class="panel-scale" id="seriesInMax"></span></div>
+        <div class="plot" id="seriesPlot">
           <svg viewBox="0 0 400 170" preserveAspectRatio="none" aria-hidden="true">
             <defs><linearGradient id="tcArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="ga"></stop><stop offset="1" class="gb"></stop></linearGradient></defs>
             <path id="seriesArea" fill="url(#tcArea)" d=""></path>
@@ -1639,6 +1675,19 @@ const PAGE = `<!doctype html>
           </div>
           <div class="hover-cols" id="seriesHover"></div>
           <div class="plot-empty" id="seriesEmpty"></div>
+        </div>
+        <div class="panel-head" id="seriesOutHead" style="display:none"><span><i class="sw out"></i>Output</span><span class="panel-scale" id="seriesOutMax"></span></div>
+        <div class="plot split" id="seriesOutPlot" style="display:none">
+          <svg viewBox="0 0 400 170" preserveAspectRatio="none" aria-hidden="true">
+            <defs><linearGradient id="tcAreaOut" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="oa"></stop><stop offset="1" class="ob"></stop></linearGradient></defs>
+            <path id="seriesOutArea" fill="url(#tcAreaOut)" d=""></path>
+            <path id="seriesOutMain" vector-effect="non-scaling-stroke" d=""></path>
+          </svg>
+          <div class="peak" id="peakOutLine" style="display:none"></div>
+          <div class="peak-tags" id="peakOutTags" style="display:none">
+            <div class="tag out"><i></i><span id="peakOut"></span></div>
+          </div>
+          <div class="hover-cols" id="seriesOutHover"></div>
         </div>
         <div class="ticks" id="seriesTicks"></div>
       </section>
@@ -1715,12 +1764,20 @@ const PAGE = `<!doctype html>
           <div class="card-cap" id="userCaption"></div>
         </div>
         <div class="legend" id="userLegend"></div>
-        <div class="plot" id="userPlot">
+        <div class="panel-head" id="userInHead" style="display:none"><span>Input</span></div>
+        <div class="plot uplot" id="userPlot">
           <div class="ug top"></div><div class="ug mid"></div><div class="ug base"></div>
           <div class="umax" id="userMax"></div>
           <svg id="userLines" viewBox="0 0 400 170" preserveAspectRatio="none" aria-hidden="true"></svg>
           <div class="hover-cols" id="userHover"></div>
           <div class="plot-empty" id="userEmpty"></div>
+        </div>
+        <div class="panel-head" id="userOutHead" style="display:none"><span>Output</span></div>
+        <div class="plot uplot split out" id="userOutPlot" style="display:none">
+          <div class="ug top"></div><div class="ug mid"></div><div class="ug base"></div>
+          <div class="umax" id="userOutMax"></div>
+          <svg id="userOutLines" viewBox="0 0 400 170" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <div class="hover-cols" id="userOutHover"></div>
         </div>
         <div class="ticks" id="userTicks"></div>
       </section>
@@ -2180,7 +2237,13 @@ ${SHARED_HELPERS}
     card.appendChild(meters);
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
-    card.appendChild(el('div', 'acct-foot', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
+    // Input is the uncached figure and both cache fields, as accountTokens adds
+    // them; the tooltip takes the three apart.
+    var sides = accountTokenSplit(u);
+    var foot = el('div', 'acct-foot', (u.totalRequests || 0) + ' req · ' + fmtNum(sides.input) + ' in · ' + fmtNum(sides.output) + ' out' + last);
+    foot.title = 'Input: ' + fmtNum(u.totalInputTokens || 0) + ' uncached, ' + fmtNum(u.totalCacheReadTokens || 0) + ' cache reads, '
+      + fmtNum(u.totalCacheCreationTokens || 0) + ' cache writes · ' + fmtNum(accountTokens(u)) + ' tokens in all';
+    card.appendChild(foot);
     return card;
   }
 
@@ -2737,21 +2800,28 @@ ${SHARED_HELPERS}
   function heroFigure(s) {
     var requests = chartMetric === 'requests';
     if (hasClients(s)) {
-      var total = 0;
-      clientRanking(s.clients, usageView, chartMetric).forEach(function (r) { total += r.value; });
+      var total = 0, inTok = 0, outTok = 0;
+      clientRanking(s.clients, usageView, chartMetric).forEach(function (r) {
+        total += r.value;
+        inTok += r.usage.inputTokens;
+        outTok += r.usage.outputTokens;
+      });
       return {
-        value: total, label: requests ? 'Requests served' : 'Tokens used',
-        title: 'Every client key\\'s ' + (requests ? 'requests' : 'uncached input and output tokens') + ', ' + (usageView === 'total' ? 'all time' : viewLabel().toLowerCase())
+        value: total, label: requests ? 'Requests served' : 'Tokens used', input: inTok, output: outTok,
+        title: 'Every client key\\'s ' + (requests ? 'requests' : 'input and output tokens, cache reads and writes included') + ', ' + (usageView === 'total' ? 'all time' : viewLabel().toLowerCase())
           + '. Traffic on the shared proxy key is not attributed to anyone.',
       };
     }
-    var sum = 0;
+    var sum = 0, inAll = 0, outAll = 0;
     (s.accounts || []).forEach(function (a) {
       var u = a.usage || {};
+      var sides = accountTokenSplit(u);
       sum += requests ? (u.totalRequests || 0) : accountTokens(u);
+      inAll += sides.input;
+      outAll += sides.output;
     });
     return {
-      value: sum, label: (requests ? 'Requests served' : 'Tokens served') + ' since start',
+      value: sum, label: (requests ? 'Requests served' : 'Tokens served') + ' since start', input: inAll, output: outAll,
       title: 'What every account has served since the proxy started' + (requests ? '' : ', cache reads and writes included'),
     };
   }
@@ -2787,6 +2857,10 @@ ${SHARED_HELPERS}
     label.textContent = fig.label;
     label.title = fig.title;
     setHero(fig.value);
+    // The big figure is both sides; under it, the two apart.
+    var split = byId('heroSplit');
+    split.textContent = chartMetric === 'requests' ? '' : fmtNum(fig.input) + ' in · ' + fmtNum(fig.output) + ' out';
+    split.style.display = chartMetric === 'requests' ? 'none' : '';
     // Where a new request goes: one cursor per provider, since a mixed
     // Claude/Codex fleet has two current accounts and naming one of them "the"
     // current account would be wrong.
@@ -2824,7 +2898,16 @@ ${SHARED_HELPERS}
     if (!hasClients(s)) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
     byId('rangeStart').textContent = rangeStartText();
-    var g = clientGroups(clientRanking(s.clients, usageView, chartMetric));
+    var ranking = clientRanking(s.clients, usageView, chartMetric);
+    var g = clientGroups(ranking);
+    var usageOf = {};
+    ranking.forEach(function (r) { usageOf[r.name] = r.usage; });
+    var sidesText = function (members) {
+      if (chartMetric === 'requests') return '';
+      var a = 0, b = 0;
+      members.forEach(function (name) { a += usageOf[name].inputTokens; b += usageOf[name].outputTokens; });
+      return ' (' + fmtNum(a) + ' in · ' + fmtNum(b) + ' out)';
+    };
     var empty = byId('groupsEmpty');
     if (g.groups.length) empty.style.display = 'none';
     else {
@@ -2838,7 +2921,7 @@ ${SHARED_HELPERS}
       slot.style.display = '';
       slot.style.flexGrow = String(grp.grow);
       slot.style.paddingTop = lift(grp.lift) + 'px';
-      slot.title = (grp.others ? grp.members.join(', ') : grp.name) + ' · ' + metricText(grp.value) + ' · ' + fmtShare(grp.share);
+      slot.title = (grp.others ? grp.members.join(', ') : grp.name) + ' · ' + metricText(grp.value) + sidesText(grp.members) + ' · ' + fmtShare(grp.share);
       byId('grp' + i + 'Val').textContent = metricText(grp.value);
       byId('grp' + i + 'Pct').textContent = fmtShare(grp.share);
       byId('grp' + i + 'Name').textContent = grp.others ? grp.members.length + ' others' : grp.name;
@@ -2868,53 +2951,86 @@ ${SHARED_HELPERS}
   }
 
   // Usage over time, drawn from the last series fetched: every client key's
-  // traffic as one line, an hour a point, its busiest hour marked. Total has
-  // no series of its own — the tracker keeps a day of history, not a lifetime
-  // — so it shows the day, and the caption says which span is on screen.
+  // traffic, an hour a point, its busiest hour marked. Tokens are drawn as two
+  // panels, input over output, each on its own scale: cache reads put input a
+  // hundred times above output, and on one scale the output line would lie flat
+  // on the axis. Requests are one panel. Total has no series of its own — the
+  // tracker keeps a day of history, not a lifetime — so it shows the day, and
+  // the caption says which span is on screen.
   function renderSeries() {
     var wrap = byId('seriesWrap');
     if (!hasClients(lastStatus)) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
+    var split = chartMetric !== 'requests';
     var L = seriesLines(lastSeries, usageView, chartMetric, null);
     var hours = spanHours(L.spanMs, usageView);
-    byId('seriesCaption').textContent = (chartMetric === 'requests' ? 'Requests' : 'Tokens') + ' / hour · last ' + hours;
-    var hover = byId('seriesHover');
-    hover.textContent = '';
+    byId('seriesCaption').textContent = (split ? 'Tokens' : 'Requests') + ' / hour · last ' + hours;
+    byId('seriesPlot').className = 'plot' + (split ? ' split' : '');
+    byId('seriesInHead').style.display = split ? '' : 'none';
+    byId('seriesOutHead').style.display = split ? '' : 'none';
+    var drawn = !!lastSeries && L.total > 0;
+    byId('seriesOutPlot').style.display = split && drawn ? '' : 'none';
     var empty = byId('seriesEmpty');
-    if (!lastSeries || !L.total) {
-      empty.textContent = historyEmptyText(hours);
-      empty.style.display = 'flex';
-      byId('seriesMain').setAttribute('d', '');
-      byId('seriesArea').setAttribute('d', '');
-      byId('peakLine').style.display = 'none';
-      byId('peakTags').style.display = 'none';
+    empty.style.display = drawn ? 'none' : 'flex';
+    if (!drawn) empty.textContent = historyEmptyText(hours);
+    var IN = split ? seriesLines(lastSeries, usageView, 'input', null) : L;
+    var OUT = split ? seriesLines(lastSeries, usageView, 'output', null) : null;
+    var colTitle = function (i) {
+      var p = L.points[i];
+      var head = fmtHM(p.start) + '–' + fmtHM(p.end) + ' · ';
+      return split ? head + fmtNum(IN.points[i].total) + ' in · ' + fmtNum(OUT.points[i].total) + ' out' : head + metricText(p.total);
+    };
+    drawSeriesPanel({ main: 'seriesMain', area: 'seriesArea', peak: 'peakLine', tags: 'peakTags', tag: 'peakMain', hover: 'seriesHover', max: split ? 'seriesInMax' : null },
+      drawn ? IN : null, colTitle);
+    drawSeriesPanel({ main: 'seriesOutMain', area: 'seriesOutArea', peak: 'peakOutLine', tags: 'peakOutTags', tag: 'peakOut', hover: 'seriesOutHover', max: 'seriesOutMax' },
+      drawn && split ? OUT : null, colTitle);
+    var ticks = byId('seriesTicks');
+    ticks.textContent = '';
+    seriesTicks(L.spanMs || (usageView === '5h' ? 5 : 24) * 3600000, seriesEnd()).forEach(function (t) { ticks.appendChild(el('span', '', fmtHM(t))); });
+  }
+
+  // One panel of Usage over time: the line and its area, the busiest hour
+  // marked, and a tooltip column per hour. No lines clears it. A side that
+  // spent nothing all day draws flat on its axis rather than dividing by a
+  // zero peak.
+  function drawSeriesPanel(ids, P, colTitle) {
+    var hover = byId(ids.hover);
+    hover.textContent = '';
+    var peak = byId(ids.peak), tags = byId(ids.tags);
+    if (ids.max) byId(ids.max).textContent = '';
+    if (!P) {
+      byId(ids.main).setAttribute('d', '');
+      byId(ids.area).setAttribute('d', '');
+      peak.style.display = 'none';
+      tags.style.display = 'none';
+      return;
+    }
+    var n = P.points.length;
+    var top = (P.peak || 1) * 1.15;
+    var X = function (i) { return n > 1 ? i / (n - 1) * 400 : 200; };
+    var Y = function (v) { return 165 - v / top * 150; };
+    var d = smoothPath(P.points.map(function (p, i) { return [X(i), Y(p.total)]; }), 165);
+    byId(ids.main).setAttribute('d', d);
+    byId(ids.area).setAttribute('d', d + ' L400,170 L0,170 Z');
+    if (ids.max && P.peak) byId(ids.max).textContent = 'scale to ' + scaleText(top);
+    if (P.peakAt < 0) {
+      peak.style.display = 'none';
+      tags.style.display = 'none';
     } else {
-      empty.style.display = 'none';
-      var n = L.points.length;
-      var top = L.peak * 1.15;
-      var X = function (i) { return n > 1 ? i / (n - 1) * 400 : 200; };
-      var Y = function (v) { return 165 - v / top * 150; };
-      var d = smoothPath(L.points.map(function (p, i) { return [X(i), Y(p.total)]; }), 165);
-      byId('seriesMain').setAttribute('d', d);
-      byId('seriesArea').setAttribute('d', d + ' L400,170 L0,170 Z');
-      var left = X(L.peakAt) / 4;
-      var peak = byId('peakLine'), tags = byId('peakTags');
+      var left = X(P.peakAt) / 4;
       peak.style.left = left + '%';
       peak.style.display = '';
       tags.style.left = left + '%';
       // Past the middle the tag sits left of the line, so it stays on the chart.
       tags.className = 'peak-tags' + (left > 62 ? ' flip' : '');
       tags.style.display = '';
-      byId('peakMain').textContent = 'Peak ' + metricText(L.points[L.peakAt].total);
-      L.points.forEach(function (p) {
-        var col = el('div');
-        col.title = fmtHM(p.start) + '–' + fmtHM(p.end) + ' · ' + metricText(p.total);
-        hover.appendChild(col);
-      });
+      byId(ids.tag).textContent = 'Peak ' + metricText(P.points[P.peakAt].total);
     }
-    var ticks = byId('seriesTicks');
-    ticks.textContent = '';
-    seriesTicks(L.spanMs || (usageView === '5h' ? 5 : 24) * 3600000, seriesEnd()).forEach(function (t) { ticks.appendChild(el('span', '', fmtHM(t))); });
+    P.points.forEach(function (p, i) {
+      var col = el('div');
+      col.title = colTitle(i);
+      hover.appendChild(col);
+    });
   }
 
   // Usage by user, on the section's own window and measure: every client's
@@ -2932,30 +3048,42 @@ ${SHARED_HELPERS}
     var toneOf = function (line) { return line.others || !(line.name in slots) ? 'uo' : 'u' + slots[line.name]; };
     var rows = byId('spendRows');
     rows.textContent = '';
+    var split = userMetric !== 'requests';
     ranking.forEach(function (r) {
       var tone = toneOf({ name: r.name, others: false });
       var row = el('div', 'sp-row');
-      row.title = r.name + ' · ' + metricText(r.value, userMetric) + ' · ' + fmtShare(r.share);
+      var sides = fmtNum(r.usage.inputTokens) + ' in · ' + fmtNum(r.usage.outputTokens) + ' out';
+      row.title = r.name + ' · ' + metricText(r.value, userMetric) + (split ? ' (' + sides + ')' : '') + ' · ' + fmtShare(r.share);
       var name = el('span', 'sp-name');
       name.appendChild(el('i', 'dot ' + tone));
       name.appendChild(el('span', '', r.name));
       row.appendChild(name);
+      // Tokens split the bar: input solid, output beside it in a lighter tint.
       var track = el('div', 'sp-track');
+      var inShare = split && r.value ? r.share * r.usage.inputTokens / r.value : r.share;
       var fill = el('i', tone);
-      fill.style.width = (r.share * 100).toFixed(1) + '%';
+      fill.style.width = (inShare * 100).toFixed(1) + '%';
       track.appendChild(fill);
+      if (split && r.usage.outputTokens) {
+        var outFill = el('i', tone + ' out');
+        outFill.style.width = ((r.share - inShare) * 100).toFixed(1) + '%';
+        track.appendChild(outFill);
+      }
       row.appendChild(track);
       var val = el('span', 'sp-val');
       val.appendChild(el('b', '', metricText(r.value, userMetric)));
       val.appendChild(el('span', '', ' · ' + fmtShare(r.share)));
+      if (split) val.appendChild(el('div', 'sp-sub', sides));
       row.appendChild(val);
       rows.appendChild(row);
     });
 
+    // Tokens are two panels, input over output, as Usage over time draws
+    // them: each client a line in both, the output one dashed.
     var L = seriesLines(lastSeries, userView, userMetric, names);
     var lines = L.lines;
     var hours = spanHours(L.spanMs, userView);
-    byId('userCaption').textContent = (userMetric === 'requests' ? 'Requests' : 'Tokens') + ' / hour · last ' + hours;
+    byId('userCaption').textContent = (split ? 'Tokens' : 'Requests') + ' / hour · last ' + hours;
     var label = function (line) { return line.others ? line.members.length + ' others' : line.name; };
     var legend = byId('userLegend');
     legend.textContent = '';
@@ -2965,40 +3093,66 @@ ${SHARED_HELPERS}
       item.appendChild(el('span', '', label(line)));
       legend.appendChild(item);
     });
-    var hover = byId('userHover');
-    hover.textContent = '';
-    var empty = byId('userEmpty');
     var drawn = !!lastSeries && L.linePeak > 0;
+    var empty = byId('userEmpty');
     empty.style.display = drawn ? 'none' : 'flex';
     if (!drawn) empty.textContent = historyEmptyText(hours);
-    var n = L.points.length;
-    var top = L.linePeak * 1.15;
-    byId('userMax').textContent = drawn ? scaleText(top, userMetric) : '';
-    var X = function (i) { return n > 1 ? i / (n - 1) * 400 : 200; };
-    // Drawn last to first, so the busiest client's line sits on top.
-    var svg = byId('userLines');
-    svg.textContent = '';
-    if (drawn) {
-      lines.slice().reverse().forEach(function (line) {
-        var path = document.createElementNS(SVG_NS, 'path');
-        path.setAttribute('vector-effect', 'non-scaling-stroke');
-        path.setAttribute('class', toneOf(line));
-        path.setAttribute('d', smoothPath(line.values.map(function (v, i) { return [X(i), 170 - v / top * 170]; }), 170));
-        svg.appendChild(path);
+    byId('userPlot').className = 'plot uplot' + (split ? ' split' : '');
+    byId('userInHead').style.display = split ? '' : 'none';
+    byId('userOutHead').style.display = split ? '' : 'none';
+    byId('userOutPlot').style.display = split && drawn ? '' : 'none';
+    // A panel draws the legend's lines, whatever its own side spent: the fold
+    // into "others" is decided on both sides together, and a side where the
+    // folded clients spent nothing still draws their line, flat.
+    var align = function (P) {
+      var byName = {};
+      P.lines.forEach(function (line) { byName[line.name] = line; });
+      P.lines = lines.map(function (line) {
+        return byName[line.name] || { name: line.name, members: line.members, others: line.others, values: P.points.map(function () { return 0; }) };
       });
-    }
-    if (drawn) {
-      L.points.forEach(function (p, i) {
-        var col = el('div');
-        col.title = fmtHM(p.start) + '–' + fmtHM(p.end) + ' · ' + lines.map(function (line) {
-          return label(line) + ' ' + metricText(line.values[i], userMetric);
-        }).join(' · ');
-        hover.appendChild(col);
-      });
-    }
+      return P;
+    };
+    var IN = split ? align(seriesLines(lastSeries, userView, 'input', names)) : L;
+    var OUT = split ? align(seriesLines(lastSeries, userView, 'output', names)) : null;
+    var colTitle = function (i) {
+      var p = L.points[i];
+      return fmtHM(p.start) + '–' + fmtHM(p.end) + ' · ' + lines.map(function (line, k) {
+        return label(line) + ' ' + (split
+          ? fmtNum(IN.lines[k].values[i]) + ' in / ' + fmtNum(OUT.lines[k].values[i]) + ' out'
+          : metricText(line.values[i], userMetric));
+      }).join(' · ');
+    };
+    drawUserPanel({ svg: 'userLines', max: 'userMax', hover: 'userHover' }, drawn ? IN : null, toneOf, colTitle);
+    drawUserPanel({ svg: 'userOutLines', max: 'userOutMax', hover: 'userOutHover' }, drawn && split ? OUT : null, toneOf, colTitle);
     var ticks = byId('userTicks');
     ticks.textContent = '';
     seriesTicks(L.spanMs || (userView === '5h' ? 5 : 24) * 3600000, seriesEnd()).forEach(function (t) { ticks.appendChild(el('span', '', fmtHM(t))); });
+  }
+
+  // One panel of Usage by user: a line per client on the panel's own scale,
+  // drawn last to first so the busiest client's line sits on top.
+  function drawUserPanel(ids, P, toneOf, colTitle) {
+    var svg = byId(ids.svg);
+    svg.textContent = '';
+    var hover = byId(ids.hover);
+    hover.textContent = '';
+    if (!P) { byId(ids.max).textContent = ''; return; }
+    var n = P.points.length;
+    var top = (P.linePeak || 1) * 1.15;
+    byId(ids.max).textContent = P.linePeak ? scaleText(top, userMetric) : '';
+    var X = function (i) { return n > 1 ? i / (n - 1) * 400 : 200; };
+    P.lines.slice().reverse().forEach(function (line) {
+      var path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('vector-effect', 'non-scaling-stroke');
+      path.setAttribute('class', toneOf(line));
+      path.setAttribute('d', smoothPath(line.values.map(function (v, i) { return [X(i), 170 - v / top * 170]; }), 170));
+      svg.appendChild(path);
+    });
+    P.points.forEach(function (p, i) {
+      var col = el('div');
+      col.title = colTitle(i);
+      hover.appendChild(col);
+    });
   }
 
   // Traffic by time, beside Spend by user and on that section's window and
@@ -3038,7 +3192,8 @@ ${SHARED_HELPERS}
       grid.appendChild(label);
       row.cells.forEach(function (cell, c) {
         var d = el('div', 'cell' + (cell.level ? ' l' + cell.level : ''));
-        d.title = name + ' · ' + fmtHM(G.columns[c].start) + '–' + fmtHM(G.columns[c].end) + ' · ' + metricText(cell.value, userMetric);
+        d.title = name + ' · ' + fmtHM(G.columns[c].start) + '–' + fmtHM(G.columns[c].end) + ' · ' + metricText(cell.value, userMetric)
+          + (userMetric === 'requests' ? '' : ' (' + fmtNum(cell.input) + ' in · ' + fmtNum(cell.output) + ' out)');
         grid.appendChild(d);
       });
     });

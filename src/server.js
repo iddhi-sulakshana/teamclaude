@@ -4294,6 +4294,16 @@ export function createSseLineScanner(onLine, maxChars = SSE_MAX_LINE_CHARS) {
   };
 }
 
+// The input side a client is booked: uncached input plus the cache reads and
+// writes upstream reports beside it. The account keeps the three apart (its
+// cards add them back up); a client has one input figure, and without the
+// cache it would be ~0.05% of what Claude Code traffic actually sends.
+/** @param {any} usage */
+function clientInputTokens(usage) {
+  const n = (/** @type {any} */ v) => (Number.isFinite(v) && v > 0 ? v : 0);
+  return n(usage?.input_tokens) + n(usage?.cache_read_input_tokens) + n(usage?.cache_creation_input_tokens);
+}
+
 // A streaming response reports its usage twice. `message_start` carries the
 // input side, including the two cache fields, with an output figure that is only
 // a placeholder. `message_delta` then reports figures that are cumulative for
@@ -4333,7 +4343,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
     const data = JSON.parse(line.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
-      onUsage?.(data.message.usage.input_tokens || 0, 0);
+      onUsage?.(clientInputTokens(data.message.usage), 0);
       if (merged) Object.assign(merged, data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
@@ -4350,7 +4360,7 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
       if (usage) {
         if (responsesTurn) responsesTurn.settled = true;
         accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
-        onUsage?.(usage.input_tokens, usage.output_tokens);
+        onUsage?.(clientInputTokens(usage), usage.output_tokens);
         if (merged) Object.assign(merged, usage);
       }
     }
@@ -4374,7 +4384,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
       const usage = isResponsesBody(json) ? normalizeResponsesUsage(json.usage) : json.usage;
       if (!usage) return;
       accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
-      onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0);
+      onUsage?.(clientInputTokens(usage), usage.output_tokens || 0);
       accountManager.recordTokenUsage(accountIndex, pinKey, model, usage);
     }
   } catch {
