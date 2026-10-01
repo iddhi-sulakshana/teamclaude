@@ -19,7 +19,7 @@
 
 import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
-import { USAGE_WINDOWS } from './client-usage.js';
+import { USAGE_WINDOWS, USAGE_MONTH } from './client-usage.js';
 import { formatMoney } from './oauth.js';
 import { resolveMaxSpendMinor, spendCapReached } from './model.js';
 import { DM_SANS_WOFF2, DM_MONO_WOFF2 } from './dashboard-fonts.js';
@@ -386,6 +386,8 @@ export function clientGroups(ranking) {
 // `peakAt` is the busiest hour overall, `linePeak` the highest point of any
 // one line, and `last` the newest hour's whole traffic. The measure is
 // `requests`, `input` or `output` tokens, or anything else for both sides.
+// A month series (GET /teamclaude/usage/series?span=month) is read the same
+// way, a day a point: its points name their `day` instead of an instant.
 /**
  * @param {any} series
  * @param {string} [view]
@@ -394,7 +396,8 @@ export function clientGroups(ranking) {
  */
 export function seriesLines(series, view, metric, names) {
   var s = series || {};
-  var n = Number.isInteger(s.buckets) && s.buckets > 0 ? s.buckets : 0;
+  var days = Array.isArray(s.days) ? s.days : null;
+  var n = days ? days.length : Number.isInteger(s.buckets) && s.buckets > 0 ? s.buckets : 0;
   var bucketMs = s.bucketMs || 0;
   var shown = view === '5h' && bucketMs ? Math.min(n, Math.max(1, Math.round(5 * 3600000 / bucketMs))) : n;
   var from = n - shown;
@@ -414,13 +417,15 @@ export function seriesLines(series, view, metric, names) {
   var restSpent = false;
   rest.forEach(function (name) { for (var i = from; i < n; i++) if (at(clients[name], i) > 0) restSpent = true; });
   if (picked.length && restSpent) lines.push({ name: 'others', members: rest, others: true, values: [] });
-  /** @type {Array<{ start: number, end: number, total: number }>} */
+  /** @type {Array<{ start: number|null, end: number|null, day: string|null, total: number }>} */
   var points = [];
   var peak = 0, linePeak = 0, total = 0;
   for (var i = from; i < n; i++) {
     var sum = 0;
     all.forEach(function (name) { sum += at(clients[name], i); });
-    points.push({ start: s.end - (n - i) * bucketMs, end: s.end - (n - 1 - i) * bucketMs, total: sum });
+    points.push(days
+      ? { start: null, end: null, day: days[i], total: sum }
+      : { start: s.end - (n - i) * bucketMs, end: s.end - (n - 1 - i) * bucketMs, day: null, total: sum });
     if (sum > peak) peak = sum;
     total += sum;
     lines.forEach(function (line) {
@@ -488,7 +493,8 @@ export function smoothPath(pts, floor) {
 // scale every client but the busiest would sit in the faintest shade; the root
 // keeps them apart while the busiest cell still takes the darkest. Each cell
 // also carries its `input` and `output` tokens, whatever the measure, for the
-// tooltip that splits them.
+// tooltip that splits them. A month series is a column per week from the
+// 1st, its columns naming their `first` and `last` day.
 /**
  * @param {any} series
  * @param {string} [view]
@@ -500,11 +506,16 @@ export function heatGrid(series, view, metric) {
   var bucketMs = s.bucketMs || 0;
   var shown = view === '5h' && bucketMs ? Math.min(n, Math.max(1, Math.round(5 * 3600000 / bucketMs))) : n;
   var from = n - shown;
-  var per = shown > 6 ? 4 : 1;
+  var days = Array.isArray(s.days) ? s.days : null;
+  if (days) { n = days.length; shown = n; from = 0; }
+  var per = days ? (shown > 7 ? 7 : 1) : shown > 6 ? 4 : 1;
   var count = shown ? Math.ceil(shown / per) : 0;
   /** @type {Array<{ from: number, to: number }>} */
   var cols = [];
   for (var c = 0; c < count; c++) {
+    // A day's columns run from the 1st, a week each, the last one this week
+    // so far; an hour's end with the newest, the first one cut short.
+    if (days) { cols.push({ from: c * per, to: Math.min(n, (c + 1) * per) }); continue; }
     var a = Math.max(from, n - (count - c) * per), b = n - (count - 1 - c) * per;
     cols.push({ from: a, to: b });
   }
@@ -541,7 +552,11 @@ export function heatGrid(series, view, metric) {
     row.cells.forEach(function (cell) { cell.level = cell.value > 0 ? 1 + Math.min(3, Math.floor(Math.sqrt(cell.value / max) * 4)) : 0; });
   });
   return {
-    columns: cols.map(function (col) { return { start: s.end - (n - col.from) * bucketMs, end: s.end - (n - col.to) * bucketMs }; }),
+    columns: cols.map(function (col) {
+      return days
+        ? { start: null, end: null, first: days[col.from], last: days[col.to - 1] }
+        : { start: s.end - (n - col.from) * bucketMs, end: s.end - (n - col.to) * bucketMs, first: null, last: null };
+    }),
     rows: rows, max: max, spanMs: shown * bucketMs,
   };
 }
@@ -560,6 +575,18 @@ export function seriesTicks(spanMs, end) {
   var out = [];
   for (var h = hours; h >= 0; h -= step) out.push(end - h * 3600000);
   if (out[out.length - 1] !== end) out.push(end);
+  return out;
+}
+
+// The days a month chart's axis is labelled with: every day of a week or
+// less, and beyond that the 1st, today and up to three between, a week apart.
+/** @param {string[]|null|undefined} days */
+export function dayTicks(days) {
+  var all = days || [];
+  if (all.length <= 7) return all.slice();
+  var out = [];
+  for (var i = 0; i < all.length - 3; i += 7) out.push(all[i]);
+  out.push(all[all.length - 1]);
   return out;
 }
 
@@ -922,7 +949,8 @@ export function problems(status) {
 // `total` is first because it is the lifetime counter the status payload has
 // always carried, and the view the page opens on.
 export const USAGE_VIEWS = [{ key: 'total', label: 'Total' }].concat(
-  Object.keys(USAGE_WINDOWS).map(key => ({ key, label: 'Last ' + key })));
+  Object.keys(USAGE_WINDOWS).map(key => ({ key, label: 'Last ' + key })),
+  [{ key: USAGE_MONTH, label: 'This month' }]);
 
 // Which counters one usage row shows. Every usage table reads the selected
 // window through this, rather than each renderer reaching into `windows`
@@ -1067,7 +1095,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, accountTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
-  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks,
+  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1923,6 +1951,11 @@ const PAGE = `<!doctype html>
   var lastSeries = null;
   var seriesError = null;
   var seriesInFlight = false;
+  // The month by day (?span=month), fetched the same way but only while a
+  // window control is on This month: nothing else draws it.
+  var lastMonthSeries = null;
+  var monthSeriesError = null;
+  var monthInFlight = false;
   // How the header names a signed-in client key's role.
   var VIEWER_ROLE_TEXT = { operator: 'admin', tenant: 'user', readonly: 'read-only' };
   // Add account: the state naming the sign-in link now open, or null. The
@@ -1989,6 +2022,8 @@ ${SHARED_HELPERS}
 
   function fmtNum(n) {
     n = Number(n) || 0;
+    // A month of cache reads runs to billions.
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + 'b';
     if (n >= 1e6) return (n / 1e6).toFixed(1) + 'm';
     if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
     return String(n);
@@ -2041,6 +2076,42 @@ ${SHARED_HELPERS}
   // loaded, and the clock until then.
   function seriesEnd() {
     return lastSeries && lastSeries.end ? lastSeries.end : Date.now();
+  }
+
+  // "Oct 3", for a day of the month series. Built from the date's parts, not
+  // parsed as an instant: the day is the server's, and parsing would move it
+  // by the browser's offset from UTC.
+  function fmtDay(key) {
+    var p = String(key || '').split('-');
+    return new Date(+p[0], +p[1] - 1, +p[2]).toLocaleDateString([], { month: 'short', day: 'numeric' });
+  }
+
+  // The series a window draws from: the month by day under This month, the
+  // last day by hour under every other window.
+  function seriesFor(view) {
+    return view === 'month' ? lastMonthSeries : lastSeries;
+  }
+
+  // A point's span, for a tooltip: its day, or its hour by the clock.
+  function pointText(p) {
+    return p.day ? fmtDay(p.day) : fmtHM(p.start) + '–' + fmtHM(p.end);
+  }
+
+  // A chart's caption: what one point holds, and the span on screen.
+  function spanCaption(metric, L, view) {
+    var what = metric === 'requests' ? 'Requests' : 'Tokens';
+    return view === 'month' ? what + ' / day · this month' : what + ' / hour · last ' + spanHours(L.spanMs, view);
+  }
+
+  // A chart's axis, oldest first: the month's days, or the clock.
+  function drawTicks(id, L, view) {
+    var ticks = byId(id);
+    ticks.textContent = '';
+    if (view === 'month') {
+      dayTicks(L.points.map(function (p) { return p.day; })).forEach(function (d) { ticks.appendChild(el('span', '', fmtDay(d))); });
+      return;
+    }
+    seriesTicks(L.spanMs || (view === '5h' ? 5 : 24) * 3600000, seriesEnd()).forEach(function (t) { ticks.appendChild(el('span', '', fmtHM(t))); });
   }
 
   // "3 pm", the way the heatmap heads its columns.
@@ -2697,6 +2768,7 @@ ${SHARED_HELPERS}
         markSelected(usageButtons, usageView);
         movePill();
         if (lastStatus) render(lastStatus);
+        if (v.key === 'month' && hasClients(lastStatus)) pollMonthSeries();
       });
       views.appendChild(btn);
       usageButtons.push({ key: v.key, btn: btn });
@@ -2723,6 +2795,7 @@ ${SHARED_HELPERS}
         markSelected(userViewButtons, userView);
         renderUsers();
         renderHeat();
+        if (v.key === 'month' && hasClients(lastStatus)) pollMonthSeries();
       });
       byId('userViewSeg').appendChild(btn);
       userViewButtons.push({ key: v.key, btn: btn });
@@ -2788,6 +2861,7 @@ ${SHARED_HELPERS}
   // Where the overview's span starts, under its columns.
   function rangeStartText() {
     if (usageView === 'total') return 'All time';
+    if (usageView === 'month') return 'The 1st';
     var n = parseInt(usageView, 10);
     var unit = usageView.slice(-1) === 'd' ? ' day' : ' hour';
     return n + unit + (n === 1 ? '' : 's') + ' ago';
@@ -2828,7 +2902,7 @@ ${SHARED_HELPERS}
 
   function drawHero(v) {
     var str = fmtNum(Math.round(v));
-    var cut = str.search(/[.km]/);
+    var cut = str.search(/[.kmb]/);
     byId('heroMain').textContent = cut < 0 ? str : str.slice(0, cut);
     byId('heroFrac').textContent = cut < 0 ? '' : str.slice(cut);
   }
@@ -2945,9 +3019,11 @@ ${SHARED_HELPERS}
 
   // Why a chart has nothing to draw: its history has not landed, could not be
   // fetched, or holds nothing for the span.
-  function historyEmptyText(hours) {
-    if (!lastSeries) return seriesError ? 'Usage history unavailable: ' + seriesError : 'Loading usage history…';
-    return 'No client-key traffic in the last ' + hours;
+  function historyEmptyText(hours, view) {
+    var month = view === 'month';
+    var err = month ? monthSeriesError : seriesError;
+    if (!seriesFor(view)) return err ? 'Usage history unavailable: ' + err : 'Loading usage history…';
+    return month ? 'No client-key traffic this month' : 'No client-key traffic in the last ' + hours;
   }
 
   // Usage over time, drawn from the last series fetched: every client key's
@@ -2962,31 +3038,30 @@ ${SHARED_HELPERS}
     if (!hasClients(lastStatus)) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
     var split = chartMetric !== 'requests';
-    var L = seriesLines(lastSeries, usageView, chartMetric, null);
+    var series = seriesFor(usageView);
+    var L = seriesLines(series, usageView, chartMetric, null);
     var hours = spanHours(L.spanMs, usageView);
-    byId('seriesCaption').textContent = (split ? 'Tokens' : 'Requests') + ' / hour · last ' + hours;
+    byId('seriesCaption').textContent = spanCaption(chartMetric, L, usageView);
     byId('seriesPlot').className = 'plot' + (split ? ' split' : '');
     byId('seriesInHead').style.display = split ? '' : 'none';
     byId('seriesOutHead').style.display = split ? '' : 'none';
-    var drawn = !!lastSeries && L.total > 0;
+    var drawn = !!series && L.total > 0;
     byId('seriesOutPlot').style.display = split && drawn ? '' : 'none';
     var empty = byId('seriesEmpty');
     empty.style.display = drawn ? 'none' : 'flex';
-    if (!drawn) empty.textContent = historyEmptyText(hours);
-    var IN = split ? seriesLines(lastSeries, usageView, 'input', null) : L;
-    var OUT = split ? seriesLines(lastSeries, usageView, 'output', null) : null;
+    if (!drawn) empty.textContent = historyEmptyText(hours, usageView);
+    var IN = split ? seriesLines(series, usageView, 'input', null) : L;
+    var OUT = split ? seriesLines(series, usageView, 'output', null) : null;
     var colTitle = function (i) {
       var p = L.points[i];
-      var head = fmtHM(p.start) + '–' + fmtHM(p.end) + ' · ';
+      var head = pointText(p) + ' · ';
       return split ? head + fmtNum(IN.points[i].total) + ' in · ' + fmtNum(OUT.points[i].total) + ' out' : head + metricText(p.total);
     };
     drawSeriesPanel({ main: 'seriesMain', area: 'seriesArea', peak: 'peakLine', tags: 'peakTags', tag: 'peakMain', hover: 'seriesHover', max: split ? 'seriesInMax' : null },
       drawn ? IN : null, colTitle);
     drawSeriesPanel({ main: 'seriesOutMain', area: 'seriesOutArea', peak: 'peakOutLine', tags: 'peakOutTags', tag: 'peakOut', hover: 'seriesOutHover', max: 'seriesOutMax' },
       drawn && split ? OUT : null, colTitle);
-    var ticks = byId('seriesTicks');
-    ticks.textContent = '';
-    seriesTicks(L.spanMs || (usageView === '5h' ? 5 : 24) * 3600000, seriesEnd()).forEach(function (t) { ticks.appendChild(el('span', '', fmtHM(t))); });
+    drawTicks('seriesTicks', L, usageView);
   }
 
   // One panel of Usage over time: the line and its area, the busiest hour
@@ -3080,10 +3155,11 @@ ${SHARED_HELPERS}
 
     // Tokens are two panels, input over output, as Usage over time draws
     // them: each client a line in both, the output one dashed.
-    var L = seriesLines(lastSeries, userView, userMetric, names);
+    var series = seriesFor(userView);
+    var L = seriesLines(series, userView, userMetric, names);
     var lines = L.lines;
     var hours = spanHours(L.spanMs, userView);
-    byId('userCaption').textContent = (split ? 'Tokens' : 'Requests') + ' / hour · last ' + hours;
+    byId('userCaption').textContent = spanCaption(userMetric, L, userView);
     var label = function (line) { return line.others ? line.members.length + ' others' : line.name; };
     var legend = byId('userLegend');
     legend.textContent = '';
@@ -3093,10 +3169,10 @@ ${SHARED_HELPERS}
       item.appendChild(el('span', '', label(line)));
       legend.appendChild(item);
     });
-    var drawn = !!lastSeries && L.linePeak > 0;
+    var drawn = !!series && L.linePeak > 0;
     var empty = byId('userEmpty');
     empty.style.display = drawn ? 'none' : 'flex';
-    if (!drawn) empty.textContent = historyEmptyText(hours);
+    if (!drawn) empty.textContent = historyEmptyText(hours, userView);
     byId('userPlot').className = 'plot uplot' + (split ? ' split' : '');
     byId('userInHead').style.display = split ? '' : 'none';
     byId('userOutHead').style.display = split ? '' : 'none';
@@ -3112,11 +3188,11 @@ ${SHARED_HELPERS}
       });
       return P;
     };
-    var IN = split ? align(seriesLines(lastSeries, userView, 'input', names)) : L;
-    var OUT = split ? align(seriesLines(lastSeries, userView, 'output', names)) : null;
+    var IN = split ? align(seriesLines(series, userView, 'input', names)) : L;
+    var OUT = split ? align(seriesLines(series, userView, 'output', names)) : null;
     var colTitle = function (i) {
       var p = L.points[i];
-      return fmtHM(p.start) + '–' + fmtHM(p.end) + ' · ' + lines.map(function (line, k) {
+      return pointText(p) + ' · ' + lines.map(function (line, k) {
         return label(line) + ' ' + (split
           ? fmtNum(IN.lines[k].values[i]) + ' in / ' + fmtNum(OUT.lines[k].values[i]) + ' out'
           : metricText(line.values[i], userMetric));
@@ -3124,9 +3200,7 @@ ${SHARED_HELPERS}
     };
     drawUserPanel({ svg: 'userLines', max: 'userMax', hover: 'userHover' }, drawn ? IN : null, toneOf, colTitle);
     drawUserPanel({ svg: 'userOutLines', max: 'userOutMax', hover: 'userOutHover' }, drawn && split ? OUT : null, toneOf, colTitle);
-    var ticks = byId('userTicks');
-    ticks.textContent = '';
-    seriesTicks(L.spanMs || (userView === '5h' ? 5 : 24) * 3600000, seriesEnd()).forEach(function (t) { ticks.appendChild(el('span', '', fmtHM(t))); });
+    drawTicks('userTicks', L, userView);
   }
 
   // One panel of Usage by user: a line per client on the panel's own scale,
@@ -3165,11 +3239,14 @@ ${SHARED_HELPERS}
     byId('heatTitle').textContent = (userMetric === 'requests' ? 'Requests' : 'Tokens') + ' by time';
     var grid = byId('heat');
     grid.textContent = '';
-    var G = heatGrid(lastSeries, userView, userMetric);
+    var series = seriesFor(userView);
+    var month = userView === 'month';
+    var G = heatGrid(series, userView, userMetric);
     var empty = byId('heatEmpty');
-    if (!lastSeries || !G.rows.length) {
+    if (!series || !G.rows.length) {
       // Short on purpose: the chart below it carries the whole reason.
-      empty.textContent = !lastSeries ? (seriesError ? 'History unavailable' : 'Loading…') : 'Nothing in the last ' + (userView === '5h' ? 5 : 24) + 'h';
+      empty.textContent = !series ? ((month ? monthSeriesError : seriesError) ? 'History unavailable' : 'Loading…')
+        : month ? 'Nothing this month' : 'Nothing in the last ' + (userView === '5h' ? 5 : 24) + 'h';
       empty.style.display = 'flex';
       grid.style.display = 'none';
       byId('heatLegend').style.display = 'none';
@@ -3180,9 +3257,13 @@ ${SHARED_HELPERS}
     byId('heatLegend').style.display = '';
     grid.style.gridTemplateColumns = '64px repeat(' + G.columns.length + ', minmax(0, 1fr))';
     grid.appendChild(el('span'));
+    var colText = function (c) {
+      if (!c.first) return fmtHM(c.start) + '–' + fmtHM(c.end);
+      return c.first === c.last ? fmtDay(c.first) : fmtDay(c.first) + '–' + fmtDay(c.last);
+    };
     G.columns.forEach(function (c) {
-      var h = el('span', 'hd', fmtHour(c.start));
-      h.title = fmtHM(c.start) + '–' + fmtHM(c.end);
+      var h = el('span', 'hd', c.first ? fmtDay(c.first) : fmtHour(c.start));
+      h.title = colText(c);
       grid.appendChild(h);
     });
     G.rows.forEach(function (row) {
@@ -3192,7 +3273,7 @@ ${SHARED_HELPERS}
       grid.appendChild(label);
       row.cells.forEach(function (cell, c) {
         var d = el('div', 'cell' + (cell.level ? ' l' + cell.level : ''));
-        d.title = name + ' · ' + fmtHM(G.columns[c].start) + '–' + fmtHM(G.columns[c].end) + ' · ' + metricText(cell.value, userMetric)
+        d.title = name + ' · ' + colText(G.columns[c]) + ' · ' + metricText(cell.value, userMetric)
           + (userMetric === 'requests' ? '' : ' (' + fmtNum(cell.input) + ' in · ' + fmtNum(cell.output) + ' out)');
         grid.appendChild(d);
       });
@@ -3217,6 +3298,23 @@ ${SHARED_HELPERS}
       .then(function (json) { lastSeries = json; seriesError = null; })
       .catch(function (e) { seriesError = e.message; })
       .then(function () { seriesInFlight = false; renderHistory(); });
+    if (usageView === 'month' || userView === 'month') pollMonthSeries();
+  }
+
+  // The month by day, for the charts under This month; asked for alongside
+  // the hourly series while a window control is on it, and at once when one
+  // is switched to it, so the charts do not wait out a poll.
+  function pollMonthSeries() {
+    if (monthInFlight) return;
+    monthInFlight = true;
+    fetch('/teamclaude/usage/series?span=month', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        if (!res.ok) throw new Error('status ' + res.status);
+        return res.json();
+      })
+      .then(function (json) { lastMonthSeries = json; monthSeriesError = null; })
+      .catch(function (e) { monthSeriesError = e.message; })
+      .then(function () { monthInFlight = false; renderHistory(); });
   }
 
   // ── Tables ───────────────────────────────────────────────────────────────

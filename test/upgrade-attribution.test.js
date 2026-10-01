@@ -5,7 +5,7 @@ import net from 'node:net';
 import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { ClientUsageTracker, USAGE_WINDOWS } from '../src/client-usage.js';
+import { ClientUsageTracker, USAGE_WINDOW_LABELS } from '../src/client-usage.js';
 
 // The upgrade gate resolved a client identity and the handler threw it away,
 // so a WebSocket handshake authenticated with a clientKeys entry was relayed
@@ -88,7 +88,7 @@ test('a handshake authenticated with a client key is booked as that client\'s co
       assert.deepEqual(tracker.export().alice, {
         ...booked,
         lastUsed: tracker.export().alice.lastUsed,
-        windows: Object.fromEntries(Object.keys(USAGE_WINDOWS).map(label => [label, { ...booked }])),
+        windows: Object.fromEntries(USAGE_WINDOW_LABELS.map(label => [label, { ...booked }])),
       });
       assert.ok(tracker.export().alice.lastUsed, 'a connection is use');
       await close();
