@@ -174,6 +174,40 @@ test('per-client usage: tokens are booked against the key that authenticated', a
   }
 });
 
+test('per-client usage: a client\'s input side counts its cache reads and writes', async () => {
+  const upstream = http.createServer((req, res) => {
+    if (req.url === '/stream') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":5000,"cache_creation_input_tokens":300}}}\n\n');
+      res.write('event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":40}}\n\n');
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 900, cache_creation_input_tokens: 20 } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'acct', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  const tracker = new ClientUsageTracker();
+  const proxy = createProxyServer(am, { proxy: PROXY, upstream: `http://127.0.0.1:${upstreamPort}` }, {}, null, tracker);
+  const proxyPort = await listen(proxy);
+
+  try {
+    assert.equal(await postAs(proxyPort, 'alice-key'), 200);
+    assert.equal(await postAs(proxyPort, 'alice-key', '/stream'), 200);
+
+    const out = tracker.export();
+    assert.equal(out.alice.inputTokens, (7 + 900 + 20) + (100 + 5000 + 300));
+    assert.equal(out.alice.outputTokens, 3 + 40);
+    // The account keeps its uncached figure; the cache sits in its own fields.
+    assert.equal(am.accounts[0].usage.totalInputTokens, 7 + 100);
+    assert.equal(am.accounts[0].usage.totalCacheReadTokens, 900 + 5000);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('per-client usage: an invalid key on a loopback call neither fails the request nor mis-attributes it', async () => {
   // The gate itself is exercised through resolveClientAuth (unit-tested above);
   // over real sockets every test connection is loopback and thus exempt. What

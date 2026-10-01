@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
-  renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens,
+  renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens, accountTokenSplit,
   accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks,
   sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
@@ -50,6 +50,14 @@ test('scopedWeekly falls back to the dedicated fields, and never doubles a famil
   assert.equal(both[0].utilization, 0.5);
   assert.deepEqual(scopedWeeklyRows({}), []);
   assert.deepEqual(scopedWeeklyRows(null), []);
+});
+
+test('account token split puts the cache on the input side', () => {
+  assert.deepEqual(accountTokenSplit({
+    totalInputTokens: 1, totalOutputTokens: 2,
+    totalCacheReadTokens: 100, totalCacheCreationTokens: 10,
+  }), { input: 111, output: 2 });
+  assert.deepEqual(accountTokenSplit(null), { input: 0, output: 0 });
 });
 
 test('account token total includes the cache fields', () => {
@@ -813,7 +821,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, accountTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -993,6 +1001,8 @@ test('the overview draws a column per client and switches measure without pollin
   // The big figure is every client's traffic on the window.
   assert.equal(page.byId('heroMain').textContent, '110');
   assert.equal(page.byId('heroLabel').textContent, 'Tokens used');
+  assert.equal(page.byId('heroSplit').textContent, '15 in · 95 out', 'and under it, the two sides');
+  assert.ok(page.byId('grp0').title.includes('(10 in · 90 out)'), "a column's tooltip splits its figure too");
   // Named by its column, its Clients row, and its Usage by user row and legend.
   assert.equal(page.labelled('alice'), 4);
   page.click('Requests');
@@ -1002,6 +1012,7 @@ test('the overview draws a column per client and switches measure without pollin
   assert.equal(page.byId('grp0Pct').textContent, '75%');
   assert.equal(page.byId('heroMain').textContent, '12');
   assert.equal(page.byId('heroLabel').textContent, 'Requests served');
+  assert.equal(page.byId('heroSplit').style.display, 'none', 'requests have no sides');
 });
 
 test('without client keys the overview shows what the accounts served, and says so', async () => {
@@ -1013,6 +1024,10 @@ test('without client keys the overview shows what the accounts served, and says 
   assert.equal(page.byId('heroMain').textContent, '2');
   assert.equal(page.byId('heroFrac').textContent, '.5k');
   assert.equal(page.byId('heroLabel').textContent, 'Tokens served since start');
+  // Input carries the cache, as the total does: 1000 uncached + 800 read.
+  assert.equal(page.byId('heroSplit').textContent, '1.8k in · 700 out');
+  // Each card's footer splits its own spend the same way.
+  assert.equal(page.labelled('4 req · 1.8k in · 200 out'), 1);
   assert.equal(page.byId('usageViewWrap').style.display, 'none', 'nothing windowed for the control to change');
 });
 
@@ -1776,6 +1791,19 @@ test('seriesLines shows the last five hours for 5h, and Total as the whole day',
   assert.deepEqual(seriesLines(SERIES, '5h', 'tokens', ['alice', 'bob', 'carol', 'dave']).lines.map(l => l.name), ['alice', 'bob', 'carol', 'dave']);
 });
 
+test('seriesLines draws one side of the tokens when asked', () => {
+  const input = seriesLines(SERIES, '24h', 'input', ['alice']);
+  assert.equal(input.points[23].total, 100 + 10 + 3);
+  assert.equal(input.lines[0].values[23], 100);
+  assert.equal(input.total, 100 + 50 + 10 + 7 + 3);
+  const output = seriesLines(SERIES, '24h', 'output', ['alice']);
+  assert.equal(output.points[23].total, 20);
+  assert.equal(output.peak, 30, "bob's hour");
+  assert.equal(output.total, 20 + 30);
+  // The sides add up to the whole.
+  assert.equal(input.total + output.total, seriesLines(SERIES, '24h', 'tokens', null).total);
+});
+
 test('seriesLines sums by requests when asked', () => {
   const lines = seriesLines(SERIES, '24h', 'requests', ['bob']);
   assert.equal(lines.points[23].total, 2 + 5 + 1);
@@ -1870,6 +1898,11 @@ test('heatGrid lays clients against four-hour stretches of the day', () => {
   assert.equal(g.rows[1].cells[5].value, 40);
   assert.equal(g.rows[1].cells[5].level, 3);
   assert.equal(g.rows[3].cells[5].level, 1, 'dave\'s 3 tokens are faint, not empty');
+  // Every cell carries its two sides, for the tooltip, whatever the measure.
+  assert.deepEqual([g.rows[0].cells[5].input, g.rows[0].cells[5].output], [100, 20]);
+  assert.deepEqual([g.rows[1].cells[5].input, g.rows[1].cells[5].output], [10, 30]);
+  const byRequests = heatGrid(SERIES, '24h', 'requests');
+  assert.deepEqual([byRequests.rows[0].cells[5].input, byRequests.rows[0].cells[5].output], [10, 30], 'bob leads by requests; his sides still ride along');
 });
 
 test('heatGrid gives five hours a column each, and every active client a row of its own', () => {
@@ -1930,14 +1963,20 @@ test('a status with a client fetches the usage series and draws it', async () =>
   await page.answerSeries(SERIES);
   assert.equal(page.byId('seriesEmpty').style.display, 'none');
   assert.equal(page.byId('seriesCaption').textContent, 'Tokens / hour · last 24h');
-  assert.equal(page.byId('peakMain').textContent, 'Peak 133 tok', 'the busiest hour, every client in it');
-  assert.equal(page.byId('heroDelta').textContent, '+133 last hour');
+  // Tokens are two panels, each marking its own busiest hour, every client in it.
+  assert.equal(page.byId('peakMain').textContent, 'Peak 113 tok', 'input: alice 100, bob 10, dave 3 in the last hour');
+  assert.equal(page.byId('peakOut').textContent, 'Peak 30 tok', "output: bob's 30 three hours earlier");
+  assert.equal(page.byId('seriesOutPlot').style.display, '');
+  assert.equal(page.byId('seriesInMax').textContent, 'scale to 130 tok', 'each panel names its own scale');
+  assert.equal(page.byId('heroDelta').textContent, '+133 last hour', 'the delta is still both sides');
   assert.equal(page.byId('heatTitle').textContent, 'Tokens by time');
   page.click('Last 5h');
   assert.equal(page.byId('seriesCaption').textContent, 'Tokens / hour · last 5h', 'the window control redraws it');
   assert.equal(page.labelled('-5h'), 0, 'the axis reads the clock, not hours ago');
   page.click('Requests');
   assert.equal(page.byId('peakMain').textContent, 'Peak 8 req');
+  assert.equal(page.byId('seriesOutPlot').style.display, 'none', 'requests are one panel');
+  assert.equal(page.byId('seriesInHead').style.display, 'none');
   assert.equal(page.byId('heatTitle').textContent, 'Tokens by time', 'the grid follows Usage by user, not the overview');
   page.clickNth('Requests', 1);
   assert.equal(page.byId('heatTitle').textContent, 'Requests by time');
@@ -1954,6 +1993,7 @@ test('Usage by user ranks every client and draws their lines in the same colours
   // alice's row, agreeing with her overview column while both are on Total.
   assert.equal(page.labelled('170 tok'), 2);
   assert.equal(page.labelled(' · 81%'), 1, 'and her share');
+  assert.equal(page.labelled('150 in · 20 out'), 1, 'and the two sides of it');
   assert.equal(page.byId('userEmpty').textContent, 'Loading usage history…');
   await page.answerSeries(SERIES);
   assert.equal(page.byId('userEmpty').style.display, 'none');
@@ -1964,8 +2004,11 @@ test('Usage by user ranks every client and draws their lines in the same colours
   // The axis ends on the series' own end, by the clock.
   const clock = new Date(END).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   assert.ok(page.labelled(clock) >= 1, 'the last tick is the end of the series');
-  // The scale tops out a little over the highest line: alice's 120, times 1.15.
-  assert.equal(page.byId('userMax').textContent, '138 tok');
+  // Each panel's scale tops out a little over its highest line: alice's 100
+  // input, and bob's 30 output, times 1.15.
+  assert.equal(page.byId('userMax').textContent, '115 tok');
+  assert.equal(page.byId('userOutMax').textContent, '35 tok');
+  assert.equal(page.byId('userOutPlot').style.display, '');
 });
 
 test('Usage by user keeps its own window and measure', async () => {
