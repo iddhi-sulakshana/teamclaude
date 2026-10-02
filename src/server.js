@@ -10,7 +10,7 @@ import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
 import { sanitizeContentBlocks, contentBlockTypesToStrip } from './content-block-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
-import { TopLevelFieldFinder, modelGlobMatches, parseRequestStream } from './model.js';
+import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequestStream } from './model.js';
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
@@ -21,7 +21,7 @@ import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
-import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames, USAGE_SLOT_MS, USAGE_MONTH } from './client-usage.js';
+import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames, usageMixKey, USAGE_SLOT_MS, USAGE_MONTH } from './client-usage.js';
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
@@ -1812,9 +1812,16 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Usage dimensions (proxy.usageDimensions) ride the same hook: each
       // configured header the caller sent becomes one more counter the response
       // tokens are booked against, so one CI key can still be split by project.
+      //
+      // The client's share is also broken down by the model and effort the
+      // request runs at, read here, after both admin-only swaps above: a
+      // downgraded request is booked as what it was sent as, since that is what
+      // it spent. Only for a request booked to a client at all, as the effort
+      // read walks the body and unattributed traffic has no row to break down.
       const client = req.tcClient ?? forcedClient ?? null;
       const usageDimensions = resolveUsageDimensions(config.proxy, req.headers);
-      const usageRecorder = createUsageRecorder({ client, clientUsage, dimensions: usageDimensions, dimensionUsage });
+      const mix = client && clientUsage ? usageMixKey(model, parseRequestEffort(body)) : null;
+      const usageRecorder = createUsageRecorder({ client, clientUsage, dimensions: usageDimensions, dimensionUsage, mix });
       usageRecorder.recordRequest();
 
       // The dimension headers are ours, not upstream's: they exist to label

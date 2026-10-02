@@ -1015,6 +1015,46 @@ export function clientRanking(clients, view, metric) {
   return rows;
 }
 
+// One user's traffic split by model and by effort, on the window and measure
+// Usage by user is showing: what an opened Spend by user row lists. Both lists
+// sum the same `mix` rows, so they total the same; models run largest first,
+// efforts from the highest level down, with a level the page does not know
+// after the known ones and the overflow row last. Every share is of the
+// user's own figure, the one on the row above, so the rows and `rest` add up
+// to it: `rest` is what the user spent that has no breakdown, the traffic from
+// before the proxy recorded one. Names are caller-supplied, hence the
+// null-prototype tallies: a model named `__proto__` is a row like any other.
+/** @param {any} entry @param {string} [view] @param {string} [metric] */
+export function userMix(entry, view, metric) {
+  var e = entry || {};
+  var LEVELS = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none', 'default'];
+  /** @param {string} name */
+  var rank = function (name) { var i = LEVELS.indexOf(name); return i >= 0 ? i : name === '(other)' ? LEVELS.length + 1 : LEVELS.length; };
+  /** @param {any} u */
+  var pick = function (u) { return metric === 'requests' ? u.requests : u.inputTokens + u.outputTokens; };
+  var byModel = Object.create(null), byEffort = Object.create(null), sum = 0;
+  (Array.isArray(e.mix) ? e.mix : []).forEach(/** @param {any} row */ function (row) {
+    var v = pick(usageFor(row, view));
+    if (!v) return;
+    var model = String(row.model || '(unknown)'), effort = String(row.effort || 'default');
+    if (!byModel[model]) byModel[model] = { value: 0, efforts: Object.create(null) };
+    byModel[model].value += v;
+    byModel[model].efforts[effort] = (byModel[model].efforts[effort] || 0) + v;
+    byEffort[effort] = (byEffort[effort] || 0) + v;
+    sum += v;
+  });
+  var total = Math.max(pick(usageFor(e, view)), sum);
+  /** @param {Record<string, number>} tally */
+  var levels = function (tally) {
+    return Object.keys(tally).map(function (name) { return { name: name, value: tally[name], share: total ? tally[name] / total : 0 }; })
+      .sort(function (a, b) { return (rank(a.name) - rank(b.name)) || (b.value - a.value) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0); });
+  };
+  var models = Object.keys(byModel).map(function (name) {
+    return { name: name, value: byModel[name].value, share: total ? byModel[name].value / total : 0, efforts: levels(byModel[name].efforts) };
+  }).sort(function (a, b) { return (b.value - a.value) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0); });
+  return { total: total, rest: total - sum, models: models, efforts: levels(byEffort) };
+}
+
 // The two requests Add account sends: start answers a sign-in link and the
 // state naming it, finish hands back that state with the code Claude showed.
 // The code is trimmed here because it is pasted, and a trailing newline from a
@@ -1110,7 +1150,7 @@ export function viewerCan(viewer, action) {
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
+  clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
   formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -1412,6 +1452,19 @@ const PAGE = `<!doctype html>
   .sp-val b { font-weight: 500; }
   .sp-val span { color: var(--dim); }
   .sp-sub { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  .sp-row.expand { cursor: pointer; }
+  .chev { width: 6px; height: 6px; flex: none; margin: 0 2px 2px 0; border-right: 1.5px solid var(--dim); border-bottom: 1.5px solid var(--dim); transform: rotate(-45deg); transition: transform .2s ease; }
+  .sp-row.open .chev { transform: rotate(45deg); margin-bottom: 4px; }
+  .sp-mix { display: flex; flex-direction: column; gap: 2px; padding: 0 0 12px 22px; font-size: 12px; }
+  .mx-row { display: grid; grid-template-columns: minmax(68px,138px) minmax(0,1fr) auto; gap: 16px; align-items: center; padding: 5px 0; }
+  .mx-name { font-family: 'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mx-row .sp-track { height: 4px; }
+  .mx-row .sp-track i { opacity: .75; }
+  .mx-row.rest .mx-name { font-family: inherit; color: var(--dim); }
+  .mx-eff { display: flex; flex-wrap: wrap; gap: 4px 14px; padding-top: 6px; color: var(--dim); }
+  .mx-eff b { font-weight: 500; color: var(--text); }
+  .mx-label { color: var(--muted); }
+  .mx-empty { color: var(--dim); padding: 4px 0; }
   .ug { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--grid-dash); pointer-events: none; }
   .ug.top { top: 0; } .ug.mid { top: 50%; } .ug.base { bottom: 0; border-top-style: solid; }
   .umax { position: absolute; top: 4px; left: 0; font-size: 11px; color: var(--dim); pointer-events: none; }
@@ -1961,6 +2014,10 @@ const PAGE = `<!doctype html>
   var userMetric = 'tokens';
   var userViewButtons = [];
   var userMetricButtons = [];
+  // The Spend by user rows opened on their model and effort split, by client
+  // name. Page state like the window, so a poll redraws a row open; a null
+  // prototype, as a client may be named __proto__.
+  var openUsers = Object.create(null);
   // The usage series behind the two charts, fetched on its own (GET
   // /teamclaude/usage/series) after each status poll that shows a client. One
   // fetch at a time: a slow answer is not stacked behind by the next poll's.
@@ -3156,10 +3213,24 @@ ${SHARED_HELPERS}
     var split = userMetric !== 'requests';
     ranking.forEach(function (r) {
       var tone = toneOf({ name: r.name, others: false });
-      var row = el('div', 'sp-row');
+      var open = !!openUsers[r.name];
+      var row = el('div', 'sp-row expand' + (open ? ' open' : ''));
       var sides = sidesText(usageTokenSplit(r.usage));
       row.title = r.name + ' · ' + metricText(r.value, userMetric) + (split ? ' (' + sides + ')' : '') + ' · ' + fmtShare(r.share);
+      row.setAttribute('role', 'button');
+      row.setAttribute('tabindex', '0');
+      row.setAttribute('aria-expanded', open ? 'true' : 'false');
+      var toggle = function () {
+        if (openUsers[r.name]) delete openUsers[r.name];
+        else openUsers[r.name] = true;
+        renderUsers();
+      };
+      row.addEventListener('click', toggle);
+      row.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
+      });
       var name = el('span', 'sp-name');
+      name.appendChild(el('i', 'chev'));
       name.appendChild(el('i', 'dot ' + tone));
       name.appendChild(el('span', '', r.name));
       row.appendChild(name);
@@ -3181,6 +3252,7 @@ ${SHARED_HELPERS}
       if (split) val.appendChild(el('div', 'sp-sub', sides));
       row.appendChild(val);
       rows.appendChild(row);
+      if (open) rows.appendChild(userMixPanel(s.clients[r.name], tone));
     });
 
     // Tokens are two panels, input over output, as Usage over time draws
@@ -3258,6 +3330,54 @@ ${SHARED_HELPERS}
       col.title = colTitle(i);
       hover.appendChild(col);
     });
+  }
+
+  // An opened Spend by user row: the user's models, each with a bar in the
+  // user's colour, what has no breakdown as a row of its own, and one line of
+  // effort levels — all on the section's window and measure (see userMix).
+  function userMixPanel(entry, tone) {
+    var M = userMix(entry, userView, userMetric);
+    var box = el('div', 'sp-mix');
+    if (!M.total) {
+      box.appendChild(el('div', 'mx-empty', userView === 'total' ? 'Nothing spent yet' : userView === 'month' ? 'Nothing this month' : 'Nothing in the last ' + userView));
+      return box;
+    }
+    var addRow = function (cls, label, value, share, fillCls, title) {
+      var row = el('div', 'mx-row' + cls);
+      row.title = title;
+      row.appendChild(el('span', 'mx-name', label));
+      var track = el('div', 'sp-track');
+      var fill = el('i', fillCls);
+      fill.style.width = (share * 100).toFixed(1) + '%';
+      track.appendChild(fill);
+      row.appendChild(track);
+      var val = el('span', 'sp-val');
+      val.appendChild(el('b', '', metricText(value, userMetric)));
+      val.appendChild(el('span', '', ' · ' + fmtShare(share)));
+      row.appendChild(val);
+      box.appendChild(row);
+    };
+    M.models.forEach(function (m) {
+      addRow('', m.name, m.value, m.share, tone, m.name + ' · ' + metricText(m.value, userMetric) + ' · ' + fmtShare(m.share)
+        + ' · ' + m.efforts.map(function (e) { return e.name + ' ' + metricText(e.value, userMetric); }).join(', '));
+    });
+    if (M.rest > 0) {
+      addRow(' rest', 'Not broken down', M.rest, M.total ? M.rest / M.total : 0, 'uo',
+        'Spent before the proxy recorded models and effort · ' + metricText(M.rest, userMetric));
+    }
+    if (M.efforts.length) {
+      var line = el('div', 'mx-eff');
+      line.appendChild(el('span', 'mx-label', 'Effort'));
+      M.efforts.forEach(function (e) {
+        var item = el('span', 'mx-lvl');
+        item.title = e.name + ' · ' + metricText(e.value, userMetric) + ' · ' + fmtShare(e.share);
+        item.appendChild(el('b', '', e.name));
+        item.appendChild(el('span', '', ' ' + metricText(e.value, userMetric)));
+        line.appendChild(item);
+      });
+      box.appendChild(line);
+    }
+    return box;
   }
 
   // Traffic by time, beside Spend by user and on that section's window and

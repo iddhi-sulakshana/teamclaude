@@ -565,3 +565,101 @@ export function parseAdvisorModel(body) {
     return new AdvisorModelFinder().push(buf);
   } catch { return null; }
 }
+
+// Byte-exact locator for a string field ONE level down: `root[parent][field]`,
+// for any root key in `parents`. The effort a request runs at lives there —
+// `output_config.effort` on the Messages API, `reasoning.effort` on Responses —
+// rather than at the top level TopLevelFieldFinder reads. Same discipline as
+// the finders above: only a direct field of the object that IS the value of a
+// named root key matches, so an "effort" in conversation text, or in the
+// output_config a system message inside messages[] carries (one level deeper),
+// never does. A value that is not a string matches nothing.
+export class ChildFieldFinder {
+  /** @param {Iterable<string>} parents @param {string} field */
+  constructor(parents, field) {
+    this.parents = new Set(parents); // root keys whose object holds the field
+    this.field = field;
+    /** @type {Array<{ isObj: boolean, key: string|null, awaitingKey: boolean }>} */
+    this.stack = [];                  // frames: {isObj, key, awaitingKey}
+    this.inStr = false;
+    this.esc = false;
+    /** @type {'key'|'value'|null} */
+    this.reading = null;              // 'key' | 'value' while in a string
+    /** @type {number[]} */
+    this.buf = [];
+    /** @type {string|null} */
+    this.value = null;                // the found value, or null
+    this.done = false;                // found it, or the root object closed without it
+  }
+
+  /** Feed a chunk (Buffer). Returns the found value so far (string) or null. @param {Buffer} chunk */
+  push(chunk) {
+    if (this.done) return this.value;
+    for (let i = 0; i < chunk.length && !this.done; i++) this.#byte(chunk[i]);
+    return this.value;
+  }
+
+  // The stack is exactly [root object (last key a parent), its object value].
+  #inParent() {
+    const s = this.stack;
+    return s.length === 2 && s[0].isObj && s[0].key != null && this.parents.has(s[0].key) && s[1].isObj;
+  }
+
+  /** @param {number} b */
+  #byte(b) {
+    if (this.inStr) {
+      if (this.esc) { this.esc = false; if (this.reading) this.buf.push(b); return; }
+      if (b === 0x5c) { this.esc = true; if (this.reading) this.buf.push(b); return; } // backslash
+      if (b === 0x22) {                                            // closing quote
+        this.inStr = false;
+        if (this.reading === 'key') {
+          this.stack[this.stack.length - 1].key = Buffer.from(this.buf).toString('utf8');
+        } else if (this.reading === 'value') {
+          this.value = Buffer.from(this.buf).toString('utf8');
+          this.done = true;
+        }
+        this.reading = null;
+        this.buf = [];
+        return;
+      }
+      if (this.reading) this.buf.push(b);
+      return;
+    }
+
+    switch (b) {
+      case 0x7b: this.stack.push({ isObj: true, key: null, awaitingKey: true }); break;   // {
+      case 0x5b: this.stack.push({ isObj: false, key: null, awaitingKey: false }); break; // [
+      case 0x7d: case 0x5d:                                        // } ]
+        this.stack.pop();
+        if (this.stack.length === 0) this.done = true;             // root closed → absent
+        break;
+      case 0x3a: { const t = this.stack[this.stack.length - 1]; if (t?.isObj) t.awaitingKey = false; break; } // :
+      case 0x2c: { const t = this.stack[this.stack.length - 1]; if (t?.isObj) t.awaitingKey = true; break; }  // ,
+      case 0x22: {                                                 // string begins
+        const t = this.stack[this.stack.length - 1];
+        if (t?.isObj && t.awaitingKey) this.reading = 'key';
+        else if (this.#inParent() && t.key === this.field) this.reading = 'value';
+        else this.reading = null;                                  // uninteresting string: skip bytes
+        this.buf = [];
+        this.inStr = true;
+        this.esc = false;
+        break;
+      }
+      default: break;                                              // scalars / whitespace
+    }
+  }
+}
+
+// The effort level a JSON request body asks for — `output_config.effort`, or
+// `reasoning.effort` for a Responses body — as sent, or null when it names
+// none (the request then runs at the model's default). Gated on a byte search
+// for the key, so a body that cannot hold one costs a single Buffer.includes.
+/** @param {Buffer|string|null|undefined} body */
+export function parseRequestEffort(body) {
+  if (!body) return null;
+  try {
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(String(body), 'utf8');
+    if (!buf.includes('"effort"')) return null;
+    return new ChildFieldFinder(['output_config', 'reasoning'], 'effort').push(buf);
+  } catch { return null; }
+}

@@ -13,6 +13,8 @@ import {
   usageDimensionHeaderNames,
   sanitizeUsageDimensionValue,
   createUsageRecorder,
+  usageMixKey,
+  MIX_MAX_KEYS,
   USAGE_SLOT_MS,
   USAGE_WINDOW_LABELS,
   USAGE_MONTH,
@@ -847,4 +849,153 @@ test('the cache figure survives a restart, and an older snapshot without it read
   const old = new ClientUsageTracker({ now: () => now });
   old.restore({ alice: { requests: 1, inputTokens: 9, lastUsed: new Date(now).toISOString() } });
   assert.equal(old.export().alice.cacheTokens, 0);
+});
+// ── per-client model and effort breakdown ───────────────────
+
+test('usageMixKey pairs the model with its effort, and names what the request left out', () => {
+  assert.equal(usageMixKey('claude-opus-5-5', 'high'), 'claude-opus-5-5\thigh');
+  assert.equal(usageMixKey('claude-opus-5-5', ' MAX '), 'claude-opus-5-5\tmax', 'effort compares lowercased');
+  assert.equal(usageMixKey('claude-opus-5-5', null), 'claude-opus-5-5\tdefault', 'no effort named runs at the default');
+  assert.equal(usageMixKey(null, 'low'), '(unknown)\tlow');
+  // Both halves come from the caller, so they are sanitized like a dimension
+  // value — which also means neither can carry the tab that joins them.
+  assert.equal(usageMixKey('opus\t\u001b[31mx', 'hi\tgh'), 'opus x\thi gh');
+  assert.equal(usageMixKey('m'.repeat(500), 'e'.repeat(500)).length, 100 + 1 + 32, 'both halves are length-capped');
+});
+
+test('a client books each request under its model and effort, alongside its own counters', () => {
+  const t = new ClientUsageTracker({ now: () => T0 });
+  t.record('alice', { requests: 1 }, 'claude-opus-5-5\tmax');
+  t.record('alice', { inputTokens: 100, outputTokens: 20 }, 'claude-opus-5-5\tmax');
+  t.record('alice', { requests: 1, inputTokens: 5, outputTokens: 1 }, 'claude-sonnet-5-5\tdefault');
+  const e = t.export().alice;
+  // The client's own counters are what they always were.
+  assert.equal(e.requests, 2);
+  assert.equal(e.inputTokens, 105);
+  // A mix row carries no connections: a WebSocket is not a request and has no model.
+  const opus = { requests: 1, inputTokens: 100, outputTokens: 20, cacheTokens: 0 };
+  const sonnet = { requests: 1, inputTokens: 5, outputTokens: 1, cacheTokens: 0 };
+  assert.deepEqual(e.mix, [
+    { model: 'claude-opus-5-5', effort: 'max', ...opus, windows: everyWindow(opus) },
+    { model: 'claude-sonnet-5-5', effort: 'default', ...sonnet, windows: everyWindow(sonnet) },
+  ]);
+});
+
+test('a tracker recorded without a breakdown carries no mix at all', () => {
+  const t = new ClientUsageTracker({ now: () => T0 });
+  t.record('alice', { requests: 1 });
+  assert.equal(t.export().alice.mix, undefined);
+  assert.equal(t.exportState().alice.mix, undefined);
+});
+
+test('a mix row that has aged out of every window keeps its lifetime counters', () => {
+  let now = T0;
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1, inputTokens: 10 }, 'claude-opus-5-5\thigh');
+  now += 40 * 24 * 3600_000;   // past the rolling day and into another month
+  const [row] = t.export().alice.mix;
+  assert.equal(row.requests, 1, 'Total still reads it');
+  assert.equal(row.windows, undefined, 'no window does');
+});
+
+test('the mix rides the state file and resumes its windows across a restart', () => {
+  let now = T0;
+  const before = new ClientUsageTracker({ now: () => now });
+  before.record('alice', { requests: 1, inputTokens: 40 }, 'claude-opus-5-5\tmax');
+  const saved = JSON.parse(JSON.stringify(before.exportState()));
+  assert.ok(saved.alice.mix, 'the state carries the breakdown');
+
+  now += 3600_000;
+  const after = new ClientUsageTracker({ now: () => now });
+  after.restore(saved);
+  const [row] = after.export().alice.mix;
+  assert.equal(row.model, 'claude-opus-5-5');
+  assert.equal(row.effort, 'max');
+  assert.equal(row.requests, 1);
+  assert.equal(row.windows['5h'].inputTokens, 40);
+});
+
+test('restore takes a malformed mix in its stride', () => {
+  const t = new ClientUsageTracker({ now: () => T0 });
+  t.restore({ alice: { requests: 1, mix: 'not-an-object' } });
+  t.restore({ bob: { requests: 1, mix: { 'claude-opus-5-5\thigh': { requests: 2 }, '': { requests: 9 }, x: 'nope' } } });
+  assert.equal(t.export().alice.mix, undefined);
+  assert.deepEqual(t.export().bob.mix.map(r => [r.model, r.effort, r.requests]), [['claude-opus-5-5', 'high', 2]]);
+});
+
+test('a client past its cap of model and effort pairs folds the rest into (other)', () => {
+  const t = new ClientUsageTracker({ now: () => T0 });
+  for (let i = 0; i < MIX_MAX_KEYS + 5; i++) t.record('alice', { requests: 1 }, `m${i}\thigh`);
+  const mix = t.export().alice.mix;
+  assert.equal(mix.length, MIX_MAX_KEYS + 1);
+  const other = mix.find(r => r.model === OVERFLOW_KEY);
+  assert.deepEqual([other.effort, other.requests], [OVERFLOW_KEY, 5], 'summed, not dropped');
+  // The client itself is never folded: clientKeys is bounded by the config.
+  assert.equal(t.export().alice.requests, MIX_MAX_KEYS + 5);
+});
+
+test('a mix row carries the cached part of its input and the month window', () => {
+  const now = new Date(2026, 9, 10, 12).getTime();
+  const t = new ClientUsageTracker({ now: () => now });
+  t.record('alice', { requests: 1, inputTokens: 500, outputTokens: 5, cacheTokens: 450 }, 'claude-opus-5-5\thigh');
+  const [row] = t.export().alice.mix;
+  assert.equal(row.cacheTokens, 450);
+  assert.equal(row.windows[USAGE_MONTH].inputTokens, 500);
+  assert.equal(row.windows[USAGE_MONTH].cacheTokens, 450);
+});
+
+test('the recorder breaks down the client only, never a dimension', () => {
+  const clientUsage = new ClientUsageTracker();
+  const dimensionUsage = new UsageDimensionTracker();
+  const rec = createUsageRecorder({
+    client: 'ci', clientUsage, dimensions: [{ name: 'project', key: 'web' }], dimensionUsage,
+    mix: 'claude-opus-5-5\thigh',
+  });
+  rec.recordRequest();
+  rec.onUsage(100, 20);
+  assert.deepEqual(clientUsage.export().ci.mix.map(r => [r.model, r.effort, r.requests, r.inputTokens, r.outputTokens]),
+    [['claude-opus-5-5', 'high', 1, 100, 20]]);
+  assert.equal(dimensionUsage.export().project.web.mix, undefined);
+});
+
+async function postBody(port, key, body, path = '/v1/messages') {
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(key ? { 'x-api-key': key } : {}) },
+    body: JSON.stringify(body),
+  });
+  await res.text();
+  return res.status;
+}
+
+test('per-client usage: each request is broken down by the model and effort it was sent as', async () => {
+  const upstream = usageUpstream();
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'acct', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  const tracker = new ClientUsageTracker();
+  // alice is a tenant, so the admin-only effort is swapped before it is booked:
+  // what was spent is the replacement, not what was asked for.
+  const config = { proxy: { ...PROXY, adminOnlyEfforts: { max: 'medium' } }, upstream: `http://127.0.0.1:${upstreamPort}` };
+  const proxy = createProxyServer(am, config, {}, null, tracker);
+  const proxyPort = await listen(proxy);
+
+  try {
+    assert.equal(await postBody(proxyPort, 'alice-key', { model: 'claude-opus-5-5', messages: [], output_config: { effort: 'high' } }), 200);
+    assert.equal(await postBody(proxyPort, 'alice-key', { model: 'claude-opus-5-5', messages: [], output_config: { effort: 'max' } }), 200);
+    assert.equal(await postBody(proxyPort, 'alice-key', { model: 'claude-haiku-4-5', messages: [] }), 200);
+    assert.equal(await postBody(proxyPort, 'alice-key', { model: 'claude-opus-5-5', messages: [], output_config: { effort: 'high' } }, '/stream'), 200);
+    assert.equal(await postBody(proxyPort, 'shared-key', { model: 'claude-opus-5-5', messages: [], output_config: { effort: 'max' } }), 200);
+
+    const out = tracker.export();
+    assert.deepEqual(Object.keys(out), ['alice'], 'unattributed traffic has no row to break down');
+    const mix = Object.fromEntries(out.alice.mix.map(r => [`${r.model} ${r.effort}`, [r.requests, r.inputTokens, r.outputTokens]]));
+    assert.deepEqual(mix, {
+      'claude-opus-5-5 high': [2, 107, 43],   // the JSON reply plus the SSE one
+      'claude-opus-5-5 medium': [1, 7, 3],    // asked for max, sent as medium
+      'claude-haiku-4-5 default': [1, 7, 3],  // named no effort
+    });
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
 });

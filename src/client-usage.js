@@ -22,6 +22,14 @@
 // carries no tokens, so folding it into `requests` would misstate the usage
 // totals — but "which clients open channels here" is a question the same
 // table answers (#325).
+//
+// A client's traffic can also be broken down by the model and effort level it
+// ran at (`record`'s third argument, a usageMixKey()). The breakdown is a
+// tracker of its own inside the client's record, keyed by the pair, so the
+// split by model and the split by effort are two sums over the same rows and
+// can never disagree about the total. Its rows are caller-supplied and capped
+// per client (MIX_MAX_KEYS), folding the rest into OVERFLOW_KEY like a
+// dimension does. A client recorded without one carries none.
 
 export const DEFAULT_USAGE_DIMENSION_MAX_KEYS = 500;
 export const USAGE_DIMENSION_VALUE_MAX_LENGTH = 200;
@@ -85,8 +93,20 @@ export function usageDayKey(ms) {
 
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+// The model and effort pairs one client's breakdown keeps before folding the
+// rest into OVERFLOW_KEY. Both halves come from the request body, so the set is
+// the caller's to grow; a real client sees a handful of models at six or so
+// levels, well inside this.
+export const MIX_MAX_KEYS = 100;
+// What the breakdown names a request that set no effort (it runs at the
+// model's default) or no model.
+export const DEFAULT_EFFORT = 'default';
+export const UNKNOWN_MODEL = '(unknown)';
+const MIX_MODEL_MAX_LENGTH = 100;
+const MIX_EFFORT_MAX_LENGTH = 32;
+
 /** @typedef {{ requests: number, connections: number, inputTokens: number, outputTokens: number, cacheTokens: number }} UsageCounters */
-/** @typedef {UsageCounters & { lastUsed: number | null, slots: Map<number, UsageCounters>, days: Map<string, UsageCounters> }} ClientRecord */
+/** @typedef {UsageCounters & { lastUsed: number | null, slots: Map<number, UsageCounters>, days: Map<string, UsageCounters>, mix: ClientUsageTracker | null }} ClientRecord */
 
 const RESERVED_CUSTOM_HEADER_NAMES = new Set([
   'authorization',
@@ -111,7 +131,8 @@ export class ClientUsageTracker {
   constructor({ now = () => Date.now(), maxKeys = Infinity } = {}) {
     // name → { requests, connections, inputTokens, outputTokens, cacheTokens, lastUsed(ms),
     //          slots: Map<slotNumber, { requests, connections, inputTokens, outputTokens, cacheTokens }>,
-    //          days: Map<'YYYY-MM-DD', { requests, connections, inputTokens, outputTokens, cacheTokens }> }
+    //          days: Map<'YYYY-MM-DD', { requests, connections, inputTokens, outputTokens, cacheTokens }>,
+    //          mix: ClientUsageTracker keyed by usageMixKey(), or null }
     // `cacheTokens` is the part of `inputTokens` served from or written to the
     // prompt cache: input counts it, so a total is still input plus output.
     this.clients = new Map();
@@ -123,16 +144,24 @@ export class ClientUsageTracker {
     let c = this.clients.get(name);
     if (!c) {
       if (this.clients.size >= this.maxKeys && name !== OVERFLOW_KEY) return this._ensure(OVERFLOW_KEY);
-      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0, lastUsed: null, slots: new Map(), days: new Map() };
+      c = { requests: 0, connections: 0, inputTokens: 0, outputTokens: 0, cacheTokens: 0, lastUsed: null, slots: new Map(), days: new Map(), mix: null };
       this.clients.set(name, c);
     }
     return c;
   }
 
-  /** Book usage against a client name. A null/empty name is dropped (unattributed). */
-  record(name, { requests = 0, connections = 0, inputTokens = 0, outputTokens = 0, cacheTokens = 0 } = {}) {
+  /**
+   * Book usage against a client name. A null/empty name is dropped (unattributed).
+   * `mix`, a usageMixKey(), also books it in the client's model and effort
+   * breakdown.
+   * @param {string|null|undefined} name
+   * @param {Partial<UsageCounters>} [usage]
+   * @param {string|null} [mix]
+   */
+  record(name, { requests = 0, connections = 0, inputTokens = 0, outputTokens = 0, cacheTokens = 0 } = {}, mix = null) {
     if (!name) return;
     const c = this._ensure(name);
+    if (mix) this._mixFor(c).record(mix, { requests, inputTokens, outputTokens, cacheTokens });
     c.requests += requests;
     c.connections += connections;
     c.inputTokens += inputTokens;
@@ -154,6 +183,12 @@ export class ClientUsageTracker {
       tally.outputTokens += outputTokens;
       tally.cacheTokens += cacheTokens;
     }
+  }
+
+  /** @param {ClientRecord} c @returns {ClientUsageTracker} */
+  _mixFor(c) {
+    if (!c.mix) c.mix = new ClientUsageTracker({ now: this._now, maxKeys: MIX_MAX_KEYS });
+    return c.mix;
   }
 
   /**
@@ -259,6 +294,7 @@ export class ClientUsageTracker {
    * rolled-up windows rather than the slots they were summed from: a reader
    * wants two figures per client, and the tally behind them is up to a hundred
    * rows that the dashboard would have to re-sum on every poll.
+   * @returns {Record<string, any>}
    */
   export() {
     const now = this._now();
@@ -272,9 +308,10 @@ export class ClientUsageTracker {
       // branches that are silent for good, and they were the bulk of the
       // payload. A reader that finds no `windows` reads zero for every window,
       // which is what the absence means.
-      return Object.values(windows).some(w => w.requests || w.connections || w.inputTokens || w.outputTokens)
+      const extra = Object.values(windows).some(w => w.requests || w.connections || w.inputTokens || w.outputTokens)
         ? { windows }
         : {};
+      return c.mix && c.mix.clients.size ? { ...extra, mix: mixRows(c.mix.export()) } : extra;
     });
   }
 
@@ -369,6 +406,7 @@ export class ClientUsageTracker {
    * restart resumes the windows rather than restarting them — an upgrade is
    * exactly when someone looks at the dashboard, and a 24h figure that reads
    * zero after every deploy is worse than not offering one.
+   * @returns {Record<string, any>}
    */
   exportState() {
     // An empty `slots` is left out for the same reason `export()` leaves out an
@@ -376,6 +414,7 @@ export class ClientUsageTracker {
     return this._snapshot(this._now(), c => ({
       ...(c.slots.size ? { slots: Object.fromEntries(c.slots) } : {}),
       ...(c.days.size ? { days: Object.fromEntries(c.days) } : {}),
+      ...(c.mix && c.mix.clients.size ? { mix: c.mix.exportState() } : {}),
     }));
   }
 
@@ -443,6 +482,7 @@ export class ClientUsageTracker {
           tally.cacheTokens += t.cacheTokens;
         }
       } else this._restoreDays(c, s.days);
+      if (s.mix && typeof s.mix === 'object') this._mixFor(c).restore(s.mix);
     }
   }
 
@@ -513,6 +553,43 @@ export class ClientUsageTracker {
     }
     return admitted;
   }
+}
+
+/**
+ * The key a request is booked under in its client's breakdown: the model it
+ * was sent as and the effort it ran at, joined by a tab. Both come from the
+ * request body, so both are sanitized and capped like a dimension value — which
+ * also strips any tab from either, so the join is unambiguous. The effort is
+ * lowercased, since levels compare case-insensitively everywhere else.
+ * @param {unknown} model @param {unknown} effort
+ */
+export function usageMixKey(model, effort) {
+  const m = sanitizeUsageDimensionValue(model, { maxLength: MIX_MODEL_MAX_LENGTH }) || UNKNOWN_MODEL;
+  const e = sanitizeUsageDimensionValue(typeof effort === 'string' ? effort.toLowerCase() : effort, { maxLength: MIX_EFFORT_MAX_LENGTH }) || DEFAULT_EFFORT;
+  return m + '\t' + e;
+}
+
+/**
+ * A breakdown's status rows: one `{ model, effort, requests, inputTokens,
+ * outputTokens, cacheTokens, windows? }` per pair, `windows` absent when the pair spent
+ * nothing in any of them, as export() leaves it out of a client. No
+ * `connections` and no `lastUsed`: a WebSocket has no model, and when a pair
+ * was last used is not a question the dashboard asks of it. The overflow row
+ * names OVERFLOW_KEY as both its model and its effort.
+ * @param {Record<string, any>} exported ClientUsageTracker.export() of a breakdown
+ */
+function mixRows(exported) {
+  /** @param {any} u */
+  const counts = u => ({ requests: u.requests, inputTokens: u.inputTokens, outputTokens: u.outputTokens, cacheTokens: u.cacheTokens });
+  return Object.entries(exported).map(([key, e]) => {
+    const tab = key.indexOf('\t');
+    const model = tab < 0 ? key : key.slice(0, tab);
+    const effort = tab < 0 ? (key === OVERFLOW_KEY ? OVERFLOW_KEY : DEFAULT_EFFORT) : key.slice(tab + 1);
+    /** @type {Record<string, unknown>} */
+    const row = { model, effort, ...counts(e) };
+    if (e.windows) row.windows = Object.fromEntries(Object.entries(e.windows).map(([label, w]) => [label, counts(w)]));
+    return row;
+  });
 }
 
 /**
@@ -619,9 +696,15 @@ export function usageDimensionHeaderNames(proxyConfig) {
   return out;
 }
 
-export function createUsageRecorder({ client, clientUsage, dimensions, dimensionUsage }) {
+/**
+ * The two hooks a request books its usage through: one request up front, and
+ * its tokens as the response reports them. `mix`, a usageMixKey(), breaks the
+ * client's share down by model and effort; a dimension is never broken down.
+ * @param {{ client: any, clientUsage: any, dimensions: any, dimensionUsage: any, mix?: string|null }} opts
+ */
+export function createUsageRecorder({ client, clientUsage, dimensions, dimensionUsage, mix = null }) {
   const targets = [];
-  if (client && clientUsage) targets.push({ tracker: clientUsage, key: client });
+  if (client && clientUsage) targets.push({ tracker: clientUsage, key: client, mix });
   if (dimensionUsage) {
     for (const dimension of dimensions || []) {
       targets.push({ tracker: dimensionUsage, dimension: dimension.name, key: dimension.key });
@@ -632,14 +715,14 @@ export function createUsageRecorder({ client, clientUsage, dimensions, dimension
     recordRequest() {
       for (const target of targets) {
         if (target.dimension) target.tracker.record(target.dimension, target.key, { requests: 1 });
-        else target.tracker.record(target.key, { requests: 1 });
+        else target.tracker.record(target.key, { requests: 1 }, target.mix);
       }
     },
     // `cacheTokens` is the cached part of `inputTokens`, not added to it.
     onUsage(inputTokens, outputTokens, cacheTokens = 0) {
       for (const target of targets) {
         if (target.dimension) target.tracker.record(target.dimension, target.key, { inputTokens, outputTokens, cacheTokens });
-        else target.tracker.record(target.key, { inputTokens, outputTokens, cacheTokens });
+        else target.tracker.record(target.key, { inputTokens, outputTokens, cacheTokens }, target.mix);
       }
     },
   };

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { findFamilyBlock, isFableModel, modelGlobOverlaps, parseRequestModel, parseRequestStream, TopLevelFieldFinder } from '../src/model.js';
+import { ChildFieldFinder, findFamilyBlock, isFableModel, modelGlobOverlaps, parseRequestEffort, parseRequestModel, parseRequestStream, TopLevelFieldFinder } from '../src/model.js';
 
 test('isFableModel matches the Fable family only', () => {
   assert.equal(isFableModel('claude-fable-5'), true);
@@ -87,4 +87,34 @@ test('parseRequestStream reads only the top-level stream field', () => {
   // The finder still reads string fields as before, scalar support notwithstanding.
   assert.equal(new TopLevelFieldFinder('n').push(Buffer.from('{"n": 42, "model":"m"}')), '42');
   assert.equal(new TopLevelFieldFinder('model').push(Buffer.from('{"n": 42, "model":"m"}')), 'm');
+});
+
+test('parseRequestEffort reads output_config.effort, and reasoning.effort for a Responses body', () => {
+  assert.equal(parseRequestEffort('{"model":"m","messages":[],"output_config":{"effort":"high"}}'), 'high');
+  assert.equal(parseRequestEffort(Buffer.from('{ "output_config" : { "format": null, "effort" : "max" }, "model":"m" }')), 'max');
+  assert.equal(parseRequestEffort('{"model":"gpt-5-codex","input":[],"reasoning":{"summary":"auto","effort":"xhigh"}}'), 'xhigh');
+  assert.equal(parseRequestEffort('{"model":"m","messages":[]}'), null, 'no effort named');
+  assert.equal(parseRequestEffort(''), null);
+  assert.equal(parseRequestEffort(null), null);
+});
+
+test('parseRequestEffort ignores an effort anywhere but directly under the root setting', () => {
+  // A system message carries its own output_config, one level deeper than the
+  // request's; conversation text can say "effort" in any shape at all.
+  assert.equal(parseRequestEffort('{"messages":[{"role":"system","output_config":{"effort":"max"}}],"model":"m"}'), null);
+  assert.equal(parseRequestEffort('{"messages":[{"content":"\\"effort\\": \\"max\\""}],"model":"m"}'), null);
+  assert.equal(parseRequestEffort('{"effort":"max","model":"m"}'), null, 'a top-level effort is not the setting');
+  assert.equal(parseRequestEffort('{"output_config":{"nested":{"effort":"max"}},"model":"m"}'), null, 'deeper inside the setting');
+  assert.equal(parseRequestEffort('{"metadata":{"effort":"max"},"model":"m"}'), null, 'under another root key');
+  assert.equal(parseRequestEffort('{"output_config":{"effort":3}}'), null, 'not a string');
+  // The request's own setting is still found past a system message's.
+  assert.equal(parseRequestEffort('{"messages":[{"role":"system","output_config":{"effort":"max"}}],"output_config":{"effort":"low"}}'), 'low');
+});
+
+test('ChildFieldFinder reads a field one level down, fed in pieces', () => {
+  const finder = new ChildFieldFinder(['output_config'], 'effort');
+  const body = Buffer.from('{"messages":[{"content":"x"}],"output_config":{"effort":"medium"}}');
+  for (let i = 0; i < body.length; i += 5) finder.push(body.subarray(i, i + 5));
+  assert.equal(finder.value, 'medium');
+  assert.equal(finder.done, true);
 });

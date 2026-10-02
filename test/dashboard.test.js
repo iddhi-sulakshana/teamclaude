@@ -10,7 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
-  usageFor, USAGE_VIEWS, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
+  usageFor, USAGE_VIEWS, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
 } from '../src/dashboard.js';
 import { USAGE_WINDOW_LABELS } from '../src/client-usage.js';
 import { normalizeSpend } from '../src/oauth.js';
@@ -829,7 +829,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -1973,10 +1973,78 @@ test('meterTone bands a meter on the legend\'s thresholds', () => {
   assert.equal(meterTone(null), 'ok');
 });
 
+// One user as the status payload reports them once the breakdown is on: the
+// client's own counters, and a row per model and effort pair beside them.
+// The lifetime counters run ahead of the breakdown by 50 tokens and a request,
+// the traffic from before the proxy kept one; the windows are all recent.
+const MIXED = {
+  requests: 5, inputTokens: 1000, outputTokens: 250,
+  windows: { '5h': { requests: 3, inputTokens: 700, outputTokens: 100 }, '24h': { requests: 4, inputTokens: 950, outputTokens: 250 } },
+  mix: [
+    { model: 'claude-opus-5-5', effort: 'high', requests: 1, inputTokens: 300, outputTokens: 100,
+      windows: { '5h': { requests: 1, inputTokens: 300, outputTokens: 100 }, '24h': { requests: 1, inputTokens: 300, outputTokens: 100 } } },
+    { model: 'claude-opus-5-5', effort: 'max', requests: 2, inputTokens: 400, outputTokens: 100,
+      windows: { '5h': { requests: 1, inputTokens: 300, outputTokens: 0 }, '24h': { requests: 2, inputTokens: 400, outputTokens: 100 } } },
+    { model: 'claude-haiku-4-5', effort: 'default', requests: 1, inputTokens: 250, outputTokens: 50,
+      windows: { '5h': { requests: 1, inputTokens: 100, outputTokens: 0 }, '24h': { requests: 1, inputTokens: 250, outputTokens: 50 } } },
+  ],
+};
+
+test('userMix splits a user by model, largest first, and by effort in level order', () => {
+  const m = userMix(MIXED, '24h', 'tokens');
+  assert.equal(m.total, 1200);
+  assert.equal(m.rest, 0, 'the window is all broken down');
+  assert.deepEqual(m.models.map(r => [r.name, r.value, r.share]), [
+    ['claude-opus-5-5', 900, 0.75],
+    ['claude-haiku-4-5', 300, 0.25],
+  ]);
+  // Highest level first, whatever the figures; the request that named none last.
+  assert.deepEqual(m.efforts.map(r => [r.name, r.value]), [['max', 500], ['high', 400], ['default', 300]]);
+  // Each model carries its own effort split, for the row's tooltip.
+  assert.deepEqual(m.models[0].efforts.map(r => [r.name, r.value]), [['max', 500], ['high', 400]]);
+});
+
+test('userMix reads the window and measure it is given', () => {
+  const m = userMix(MIXED, '5h', 'requests');
+  assert.equal(m.total, 3);
+  assert.deepEqual(m.models.map(r => [r.name, r.value]), [['claude-opus-5-5', 2], ['claude-haiku-4-5', 1]]);
+  assert.deepEqual(m.efforts.map(r => [r.name, r.value]), [['max', 1], ['high', 1], ['default', 1]]);
+});
+
+test('userMix shows what the user spent before the breakdown as the rest', () => {
+  // On Total the lifetime counters include traffic from before the proxy
+  // recorded models, so the rows fall short of the user's own figure.
+  const m = userMix(MIXED, 'total', 'tokens');
+  assert.equal(m.total, 1250);
+  assert.equal(m.rest, 50);
+  assert.equal(m.models.reduce((n, r) => n + r.value, 0) + m.rest, m.total, 'the rows add up to the row above them');
+  assert.equal(m.models[0].share, 900 / 1250, 'a share is of the user, not of the breakdown');
+  // A user with no breakdown at all is all rest.
+  const old = userMix({ requests: 2, inputTokens: 10, outputTokens: 5 }, 'total', 'tokens');
+  assert.deepEqual([old.total, old.rest, old.models, old.efforts], [15, 15, [], []]);
+});
+
+test('userMix leaves out a pair with nothing in the window, and tolerates nothing at all', () => {
+  const m = userMix({ mix: [{ model: 'a', effort: 'low', requests: 1, inputTokens: 5, outputTokens: 0 }] }, '5h', 'tokens');
+  assert.deepEqual([m.total, m.models, m.efforts], [0, [], []], 'a row with no windows reads zero in every window');
+  assert.deepEqual(userMix(null, 'total', 'tokens'), { total: 0, rest: 0, models: [], efforts: [] });
+});
+
+test('userMix keeps a hostile model name as a plain row, and puts an unknown level after the known ones', () => {
+  const m = userMix({ mix: [
+    { model: '__proto__', effort: 'turbo', requests: 1, inputTokens: 1, outputTokens: 0 },
+    { model: 'x', effort: '(other)', requests: 1, inputTokens: 9, outputTokens: 0 },
+    { model: 'x', effort: 'low', requests: 1, inputTokens: 1, outputTokens: 0 },
+  ] }, 'total', 'tokens');
+  assert.deepEqual(m.models.map(r => r.name), ['x', '__proto__']);
+  assert.deepEqual(m.efforts.map(r => r.name), ['low', 'turbo', '(other)']);
+});
+
 test('the chart helpers run inside the serialized bundle', () => {
   const script = inlineScripts(renderDashboardHtml()).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
-  const isolated = new Function(`${bundle}; return { clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, meterTone };`)();
+  const isolated = new Function(`${bundle}; return { clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, meterTone, userMix };`)();
+  assert.deepEqual(isolated.userMix(MIXED, '5h', 'tokens'), userMix(MIXED, '5h', 'tokens'));
   assert.deepEqual(isolated.seriesLines(SERIES, '5h', 'requests', ['alice']), seriesLines(SERIES, '5h', 'requests', ['alice']));
   assert.deepEqual(isolated.userLineNames([{ name: 'a' }]), ['a']);
   assert.deepEqual(isolated.heatGrid(SERIES, '24h', 'tokens'), heatGrid(SERIES, '24h', 'tokens'));
@@ -2064,6 +2132,42 @@ test('Usage by user keeps its own window and measure', async () => {
   assert.equal(page.byId('userCaption').textContent, 'Requests / hour · last 5h');
   assert.equal(page.byId('seriesCaption').textContent, 'Tokens / hour · last 24h', 'and on its own window');
   assert.equal(page.pending().length, 0, 'redrawn from what is held, not re-fetched');
+});
+
+test('a Spend by user row opens on its model and effort split, and stays open across polls', async () => {
+  const page = bootPage();
+  const status = { accounts: [], clients: { alice: MIXED, bob: { requests: 1, inputTokens: 10, outputTokens: 0 } } };
+  await page.answer(200, status);
+  assert.equal(page.labelled('claude-opus-5-5'), 0, 'rows start closed');
+  // alice's row, by the title the page gives it: her tokens, their sides, her share.
+  page.clickTitled('alice · 1.3k tok (1.0k in · 0 cache · 250 out) · 99%');
+  assert.equal(page.labelled('claude-opus-5-5'), 1);
+  assert.equal(page.labelled('claude-haiku-4-5'), 1);
+  assert.equal(page.labelled('Not broken down'), 1, 'Total names what has no breakdown');
+  assert.equal(page.labelled('max'), 1, 'and the effort levels');
+  assert.equal(page.labelled(' 500 tok'), 1);
+  assert.equal(page.pending().length, 0, 'opened from the last status, not fetched');
+  // The history landing redraws the section; the section's window and measure
+  // redraw it again, and apply inside the row too. alice stays open throughout.
+  await page.answerSeries(SERIES);
+  page.clickNth('Requests', 1);
+  assert.equal(page.labelled('claude-opus-5-5'), 1);
+  assert.equal(page.labelled('Not broken down'), 1, 'a request from before the breakdown, too');
+  page.clickNth('Last 5h', 1);
+  assert.equal(page.labelled('Not broken down'), 0, 'the window is all broken down');
+  assert.equal(page.labelled('2 req'), 1, 'opus on the window, by requests');
+  page.clickTitled('alice · 3 req · 100%');
+  assert.equal(page.labelled('claude-opus-5-5'), 0, 'a second click closes it');
+});
+
+test('an open row with nothing in the window says so', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], clients: { alice: { requests: 1, inputTokens: 10, outputTokens: 0 } } });
+  page.clickNth('Last 5h', 1);
+  page.clickTitled('alice · 0 tok (0 in · 0 cache · 0 out) · 0%');
+  assert.equal(page.labelled('Nothing in the last 5h'), 1);
+  page.clickNth('This month', 1);
+  assert.equal(page.labelled('Nothing this month'), 1, 'the calendar month is not a "last" span');
 });
 
 test('a series that fails to load says so in the chart', async () => {
