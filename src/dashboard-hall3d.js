@@ -463,7 +463,6 @@ export function createHall3d(opts) {
     // ── Fitting the canvas and camera to the building ───────────────────────
     var size = { w: 0, h: 0 };
     var view = { x: 0, y: 0, dist: 10 };
-    var pointer = { x: 0, y: 0 };
 
     function fit() {
       var w = Math.max(240, container.clientWidth || 800);
@@ -491,10 +490,10 @@ export function createHall3d(opts) {
 
     function placeCamera() {
       var cx = (layout.width - layout.margin) / 2, cy = layout.height / 2;
-      var px = reduced ? 0 : pointer.x, py = reduced ? 0 : pointer.y;
       // From a little above and to the right, looking down enough to see the
-      // floors, which is where the blood is.
-      camera.position.set(cx + 0.35 + px * 0.5, cy + view.dist * 0.2 - py * 0.3, view.dist);
+      // floors, which is where the blood is. It holds still: the building
+      // does not swing about under the pointer.
+      camera.position.set(cx + 0.35, cy + view.dist * 0.2, view.dist);
       camera.lookAt(cx, cy - 0.12, 0.2);
     }
 
@@ -661,7 +660,6 @@ export function createHall3d(opts) {
           r.flash.material.opacity = Math.max(0, r.flash.material.opacity - dt * 9);
         }
       });
-      placeCamera();
       renderer.render(scene, camera);
       placeLabels();
     }
@@ -711,9 +709,6 @@ export function createHall3d(opts) {
 
     /** @param {any} e */
     function onMove(e) {
-      var rect = canvas.getBoundingClientRect();
-      pointer.x = ((e.clientX - rect.left) / rect.width - 0.5) * 2;
-      pointer.y = ((e.clientY - rect.top) / rect.height - 0.5) * 2;
       var d = pick(e);
       if (d !== hovered) {
         hovered = d;
@@ -722,7 +717,7 @@ export function createHall3d(opts) {
       }
     }
 
-    function onLeave() { pointer.x = 0; pointer.y = 0; hovered = null; canvas.title = ''; }
+    function onLeave() { hovered = null; canvas.title = ''; canvas.style.cursor = ''; }
 
     /** @param {any} e */
     function onClick(e) {

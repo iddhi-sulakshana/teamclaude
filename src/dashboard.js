@@ -761,6 +761,22 @@ export function hallwayRows(s) {
   });
 }
 
+// How the flat Hallway lays `count` doors out in a card `avail` pixels wide:
+// floors of five doors, or four, or three, stacked, never a corridor to
+// scroll sideways. Three that still do not fit are drawn smaller (`scale`).
+// The numbers are the stylesheet's .door grid: a 140px slot, a 22px gap,
+// room on the left for the knocker at a floor's first door, 320px a floor.
+// An unknown width (0) is taken as wide.
+/** @param {number} count @param {number} avail */
+export function hallLayout(count, avail) {
+  var SLOT = 140, GAP = 22, PAD = 96, END = 48, FLOOR = 320;
+  var widthFor = function (/** @type {number} */ k) { return PAD + k * (SLOT + GAP) - GAP + END; };
+  var perFloor = !(avail > 0) || widthFor(5) <= avail ? 5 : widthFor(4) <= avail ? 4 : 3;
+  var width = widthFor(perFloor);
+  var floors = Math.max(1, Math.ceil((count || 0) / perFloor));
+  return { perFloor: perFloor, floors: floors, width: width, height: floors * FLOOR, scale: avail > 0 && width > avail ? avail / width : 1 };
+}
+
 export function uniqSorted(values) {
   var seen = Object.create(null);
   (values || []).forEach(function (v) { if (v) seen[v] = true; });
@@ -1224,7 +1240,7 @@ export function viewerCan(viewer, action) {
 // as it is, and the card cannot format or judge a cap differently from
 // `teamclaude status` and the router.
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows,
+  scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows, hallLayout,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
   formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
@@ -1687,12 +1703,15 @@ const PAGE = `<!doctype html>
      position below is set by the script on the same grid (HALL_* there): a
      door slot is 140px with a 22px gap, and the floor starts 250px down. */
   .hall { display: flex; flex-direction: column; gap: 14px; }
-  .hall-row { border-radius: 22px; overflow-x: auto; overflow-y: hidden; background: var(--card); scrollbar-width: thin; }
+  .hall-row { border-radius: 22px; overflow: hidden; background: var(--card); }
   .hall-label { position: absolute; top: 14px; left: 18px; font-size: 12px; color: var(--muted); z-index: 3; display: flex; align-items: center; gap: 7px; }
-  .hall-track { position: relative; height: 320px; min-width: 100%;
-    background: linear-gradient(to bottom, var(--wall-a), var(--wall-b) 250px, var(--baseboard) 250px, var(--baseboard) 254px, var(--floor-a) 254px, var(--floor-b)); }
+  /* A floor per 320px: the slab above it, the wall, the baseboard, the floor
+     the doors stand on, the pattern repeating down the building. */
+  .hall-track { position: relative; height: 320px; min-width: 100%; transform-origin: 0 0;
+    background: linear-gradient(to bottom, var(--baseboard) 0, var(--baseboard) 6px, var(--wall-a) 6px, var(--wall-b) 250px, var(--baseboard) 250px, var(--baseboard) 254px, var(--floor-a) 254px, var(--floor-b));
+    background-size: 100% 320px; background-repeat: repeat-y; }
   .hall-track::after { content: ''; position: absolute; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 50% 30%, transparent 55%, rgba(0,0,0,0.22)); }
-  .door { position: absolute; top: 0; width: 140px; height: 250px; padding: 0; border: none; background: none; cursor: pointer; text-align: center; transition: left .9s cubic-bezier(.45,0,.25,1); }
+  .door { position: absolute; top: 0; width: 140px; height: 250px; padding: 0; border: none; background: none; cursor: pointer; text-align: center; transition: left .9s cubic-bezier(.45,0,.25,1), top .9s cubic-bezier(.45,0,.25,1); }
   .door:disabled { cursor: default; }
   .door:focus-visible { outline-offset: -2px; border-radius: 14px; }
   .door-plaque { position: absolute; top: 12px; left: 4px; right: 4px; display: flex; flex-direction: column; gap: 1px; }
@@ -1717,7 +1736,7 @@ const PAGE = `<!doctype html>
   .door.d-blocked .door-blood { transform: none; opacity: 1; }
   .door-blood path, .door-blood circle { fill: var(--blood); }
   .door.knock .door-leaf { animation: tcRattle .62s linear both; }
-  .reaper { position: absolute; top: 106px; width: 150px; height: 200px; z-index: 2; pointer-events: none; transition: left 1.6s cubic-bezier(.45,0,.25,1), opacity .6s ease; }
+  .reaper { position: absolute; top: 106px; width: 150px; height: 200px; z-index: 2; pointer-events: none; transition: left 1.6s cubic-bezier(.45,0,.25,1), top 1.6s cubic-bezier(.45,0,.25,1), opacity .6s ease; }
   .reaper.idle { opacity: .55; }
   .reaper svg { overflow: visible; display: block; }
   .reaper .r-body { animation: tcFloat 3.4s ease-in-out infinite; }
@@ -2296,10 +2315,11 @@ const PAGE = `<!doctype html>
   // rather than the whole scene being redrawn from scratch every 5s.
   var hallRows = Object.create(null);
   var hallDoors = Object.create(null);
-  // The grid the stylesheet's .door and .reaper are drawn for: a 140px slot,
-  // a 22px gap, room on the left for the knocker at the first door, and the
-  // offset that puts its fist on the door's left panel.
-  var HALL_SLOT = 140, HALL_GAP = 22, HALL_PAD = 96, HALL_END = 48, HALL_FIST = 95;
+  // The grid the stylesheet's .door and .reaper are drawn for (hallLayout
+  // shares it): a 140px slot, a 22px gap, room on the left for the knocker at
+  // a floor's first door, 320px a floor, and the offsets that put the
+  // knocker's fist on a door's left panel.
+  var HALL_SLOT = 140, HALL_GAP = 22, HALL_PAD = 96, HALL_FIST = 95, HALL_FLOOR = 320, HALL_REAPER_TOP = 106;
   // A round of three raps every few seconds, landing where the stylesheet's
   // tcKnock does.
   var KNOCK_MS = 4200;
@@ -2795,7 +2815,7 @@ ${createHall3d.toString()}
     reaper.appendChild(art);
     track.appendChild(reaper);
     row.appendChild(track);
-    return { row: row, track: track, label: label, labelText: labelText, reaper: reaper, reaperCls: 'reaper', knockDoor: null, fresh: true };
+    return { row: row, track: track, label: label, labelText: labelText, reaper: reaper, reaperCls: 'reaper', knockDoor: null };
   }
 
   function buildDoor() {
@@ -2851,10 +2871,12 @@ ${createHall3d.toString()}
       hall.appendChild(el('div', 'acct-note', 'No accounts yet — an empty hallway.'));
       return;
     }
+    var avail = typeof hall.clientWidth === 'number' ? hall.clientWidth : 0;
     rows.forEach(function (r) {
       seenRows[r.provider] = true;
       var row = hallRows[r.provider];
       if (!row) row = hallRows[r.provider] = buildHallRow();
+      var lay = hallLayout(r.doors.length, avail);
       // Appending one already in place moves it, which keeps the corridors in
       // provider order without rebuilding them.
       hall.appendChild(row.row);
@@ -2862,6 +2884,9 @@ ${createHall3d.toString()}
       row.labelText.textContent = providerLabel(r.provider);
       row.knockDoor = null;
       var curPos = -1;
+      var at = function (/** @type {number} */ pos) {
+        return { left: HALL_PAD + (pos % lay.perFloor) * (HALL_SLOT + HALL_GAP), top: Math.floor(pos / lay.perFloor) * HALL_FLOOR };
+      };
       r.doors.forEach(function (d, pos) {
         var key = r.provider + ':' + d.name;
         seenDoors[key] = true;
@@ -2870,7 +2895,9 @@ ${createHall3d.toString()}
         if (fresh) door = hallDoors[key] = buildDoor();
         if (door.row !== row) { row.track.appendChild(door.el); door.row = row; }
         door.name = d.name;
-        door.el.style.left = (HALL_PAD + pos * (HALL_SLOT + HALL_GAP)) + 'px';
+        var spot = at(pos);
+        door.el.style.left = spot.left + 'px';
+        door.el.style.top = spot.top + 'px';
         door.nameEl.textContent = shortName(d.name);
         var stateText = doorStateText(d);
         door.stateEl.textContent = stateText;
@@ -2896,18 +2923,24 @@ ${createHall3d.toString()}
         }
         if (d.state === 'current') { curPos = pos; row.knockDoor = door; }
       });
-      var n = r.doors.length;
-      var end = HALL_PAD + n * (HALL_SLOT + HALL_GAP) - HALL_GAP;
-      // With nothing to knock on, the knocker waits past the last door.
-      var reaperLeft = curPos >= 0 ? HALL_PAD + curPos * (HALL_SLOT + HALL_GAP) - HALL_FIST : end + 24;
+      // With nothing to knock on, the knocker waits past the last door, or
+      // at the start of the last floor when that floor is full.
+      var spot = curPos >= 0 ? at(curPos) : at(Math.max(0, r.doors.length - 1));
+      var reaperLeft = spot.left - HALL_FIST;
+      if (curPos < 0) {
+        var lastCol = Math.max(0, r.doors.length - 1) % lay.perFloor;
+        reaperLeft = lastCol + 1 < lay.perFloor ? spot.left + HALL_SLOT + 10 : 0;
+      }
       row.reaper.style.left = reaperLeft + 'px';
+      row.reaper.style.top = (spot.top + HALL_REAPER_TOP) + 'px';
       var reaperCls = curPos >= 0 ? 'reaper' : 'reaper idle';
       if (reaperCls !== row.reaperCls.replace(' knock', '')) { row.reaperCls = reaperCls; row.reaper.className = reaperCls; }
-      row.track.style.width = Math.max(end + HALL_END, reaperLeft + 150 + HALL_END) + 'px';
-      if (row.fresh) {
-        row.fresh = false;
-        row.row.scrollLeft = Math.max(0, reaperLeft - 24);
-      }
+      row.track.style.width = lay.width + 'px';
+      row.track.style.height = lay.height + 'px';
+      // Too narrow for three doors a floor: the whole building drawn
+      // smaller, its box shrunk to match, rather than a sideways scroll.
+      row.track.style.transform = lay.scale < 1 ? 'scale(' + lay.scale.toFixed(4) + ')' : '';
+      row.row.style.height = lay.scale < 1 ? Math.ceil(lay.height * lay.scale) + 'px' : '';
     });
     Object.keys(hallDoors).forEach(function (k) {
       if (!seenDoors[k]) { hallDoors[k].el.remove(); delete hallDoors[k]; }
@@ -4851,6 +4884,13 @@ ${createHall3d.toString()}
   });
   if (win && win.addEventListener) {
     win.addEventListener('resize', movePill);
+    // The flat Hallway's doors a floor follow the card's width.
+    var hallResize = false;
+    win.addEventListener('resize', function () {
+      if (hallResize || acctView !== 'hall' || !lastStatus || !raf) return;
+      hallResize = true;
+      raf(function () { hallResize = false; if (acctView === 'hall' && lastStatus) renderHall(lastStatus); });
+    });
     win.addEventListener('scroll', onScroll, { passive: true });
   }
   // The pill is measured in the page's own font, which may land after the

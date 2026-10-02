@@ -7,7 +7,7 @@ import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, inlineScripts, THREE_BASE, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit,
   accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
-  sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows,
+  sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows, hallLayout,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
@@ -303,6 +303,22 @@ test('a mixed fleet gets a corridor per provider, Claude first, each with its ow
     ['anthropic', 'b', ['b', 'a']],
     ['codex', 'x', ['x']],
   ]);
+});
+
+test('the flat hallway stacks floors of five, four or three doors, and never scrolls sideways', () => {
+  // A floor of five is 96 + 5 x 162 - 22 + 48 = 932px wide; four, 770; three, 608.
+  assert.deepEqual(hallLayout(10, 1180), { perFloor: 5, floors: 2, width: 932, height: 640, scale: 1 });
+  assert.deepEqual(hallLayout(11, 1180), { perFloor: 5, floors: 3, width: 932, height: 960, scale: 1 });
+  assert.deepEqual(hallLayout(6, 800), { perFloor: 4, floors: 2, width: 770, height: 640, scale: 1 });
+  assert.deepEqual(hallLayout(7, 640), { perFloor: 3, floors: 3, width: 608, height: 960, scale: 1 });
+  // Narrower than three doors: drawn smaller to fit, not cut off or scrolled.
+  const phone = hallLayout(4, 358);
+  assert.equal(phone.perFloor, 3);
+  assert.equal(phone.floors, 2);
+  assert.ok(Math.abs(phone.width * phone.scale - 358) < 1e-9);
+  // An unmeasured card (0) is taken as wide, and an empty fleet is one floor.
+  assert.equal(hallLayout(3, 0).perFloor, 5);
+  assert.equal(hallLayout(0, 1180).floors, 1);
 });
 
 test('a corridor whose current account is blocked has no door to knock on', () => {
@@ -873,7 +889,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [hallwayRows, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
+  for (const fn of [hallwayRows, hallLayout, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
