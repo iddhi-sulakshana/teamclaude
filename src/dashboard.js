@@ -23,6 +23,32 @@ import { USAGE_WINDOWS, USAGE_MONTH } from './client-usage.js';
 import { formatMoney } from './oauth.js';
 import { resolveMaxSpendMinor, spendCapReached } from './model.js';
 import { DM_SANS_WOFF2, DM_MONO_WOFF2 } from './dashboard-fonts.js';
+import { createHall3d } from './dashboard-hall3d.js';
+import { readFileSync } from 'node:fs';
+
+// The 3D Hallway's three.js, from jsDelivr and pinned: the one thing the page
+// loads from elsewhere, and only once someone picks the 3D view. The policy
+// below allows exactly this version's path and nothing else on that host.
+export const THREE_BASE = 'https://cdn.jsdelivr.net/npm/three@0.186.1/';
+
+// The CC0 models that view loads (src/dashboard-assets, credited in its
+// LICENSE.txt), served by the proxy from GET /teamclaude/dashboard/assets/.
+const DASHBOARD_ASSETS = new Set(['doorway.glb', 'skeleton.glb']);
+const assetCache = new Map();
+
+/**
+ * One of the dashboard's model files, or null for any other name. Read once
+ * and kept: they are fixed for the life of the process.
+ * @param {string} name
+ * @returns {{ body: Buffer, type: string } | null}
+ */
+export function dashboardAsset(name) {
+  if (!DASHBOARD_ASSETS.has(name)) return null;
+  if (!assetCache.has(name)) {
+    assetCache.set(name, { body: readFileSync(new URL('./dashboard-assets/' + name, import.meta.url)), type: 'model/gltf-binary' });
+  }
+  return assetCache.get(name);
+}
 
 export function renderDashboardHtml() {
   return PAGE;
@@ -65,12 +91,16 @@ export function dashboardCsp(html = PAGE) {
     .join(' ');
   return [
     "default-src 'none'",
-    `script-src ${hashes}`,
+    // The page's own inline scripts by hash, and the one pinned three.js.
+    `script-src ${hashes} ${THREE_BASE}`,
     "style-src 'unsafe-inline'",
     // The two DM faces, inlined into the page's own stylesheet as data:
     // URLs (dashboard-fonts.js). Nothing else can be a font source.
     "font-src data:",
-    "connect-src 'self'",
+    // The models come from the proxy; three.js turns their embedded textures
+    // into blob: URLs, which it then fetches (connect) or draws (img).
+    "connect-src 'self' blob: data:",
+    "img-src blob: data:",
     "base-uri 'none'",
     "form-action 'none'",
     "frame-ancestors 'none'",
@@ -685,6 +715,52 @@ export function accountDisplayOrder(accounts) {
   return serving.concat(blocked);
 }
 
+// The Hallway view's corridors: one per provider (a mixed fleet has a current
+// account for each), Claude first, the rest by name. Each lists its doors
+// in walking order: the blocked ones first, the doors already knocked down
+// and left open, then the current account, the one being knocked on, then
+// the ones still waiting. Each group keeps the fleet's own order. `index` is
+// the account's place in the fleet, which gives it the same avatar colour its
+// card has. `current` names the knocked door, or null when the corridor has
+// none to knock on.
+/** @param {any} s */
+export function hallwayRows(s) {
+  s = s || {};
+  var ca = s.currentAccounts || null;
+  /** @type {string[]} */
+  var order = [];
+  var groups = Object.create(null);
+  (s.accounts || []).forEach(function (/** @type {any} */ a, /** @type {number} */ i) {
+    var p = a.provider || 'anthropic';
+    if (!groups[p]) { groups[p] = { blocked: [], current: [], waiting: [] }; order.push(p); }
+    var isCur = ca ? ca[p] === a.name : a.name === s.currentAccount;
+    var door = { name: a.name, index: i, state: 'waiting', why: null };
+    if (a.disabled || a.unavailable) {
+      door.state = 'blocked';
+      door.why = a.unavailable || 'disabled';
+      groups[p].blocked.push(door);
+    } else if (isCur) {
+      door.state = 'current';
+      groups[p].current.push(door);
+    } else {
+      groups[p].waiting.push(door);
+    }
+  });
+  order.sort(function (a, b) {
+    if (a === 'anthropic') return -1;
+    if (b === 'anthropic') return 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  return order.map(function (p) {
+    var g = groups[p];
+    return {
+      provider: p,
+      doors: g.blocked.concat(g.current, g.waiting),
+      current: g.current.length ? g.current[0].name : null,
+    };
+  });
+}
+
 export function uniqSorted(values) {
   var seen = Object.create(null);
   (values || []).forEach(function (v) { if (v) seen[v] = true; });
@@ -1148,7 +1224,7 @@ export function viewerCan(viewer, action) {
 // as it is, and the card cannot format or judge a cap differently from
 // `teamclaude status` and the router.
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
+  scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
   formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
@@ -1191,7 +1267,11 @@ const DARK_TOKENS = `
     --user-0: #3987E5; --user-1: #D95926; --user-2: #199E70; --user-3: #C98500;
     --user-4: #D55181; --user-5: #9A3FB4; --user-6: #9085E9; --user-7: #E66767; --user-o: #8E8E93;
     --av0: #D6FF4F; --av1: #A98BFF; --av2: #FFB38A; --av3: #F5F5F7; --av4: #8FE3C8; --av5: #FFD66B; --av6: #C9B6FF; --av7: #FF9A88;
-    --scrim: rgba(0,0,0,0.7); --shadow: 0 30px 80px rgba(0,0,0,0.7);`;
+    --scrim: rgba(0,0,0,0.7); --shadow: 0 30px 80px rgba(0,0,0,0.7);
+    --wall-a: #2A2B2E; --wall-b: #1E2420; --floor-a: #2C2A28; --floor-b: #161514; --baseboard: #3A3A3C;
+    --frame: #D1D1D6; --void: #050505; --door: #D9B37E; --door-panel: #C9A26C; --door-edge: #8A6A40; --knob: #C9A227;
+    --blood: #C8161D; --blood-dark: #7A0A0E; --robe: #26262A; --robe-edge: #0E0E10; --bone: #F2EEE4; --pole: #7A5A36;
+    --burst: #FFE9A8;`;
 
 const LIGHT_TOKENS = `
     color-scheme: light;
@@ -1209,7 +1289,11 @@ const LIGHT_TOKENS = `
     --user-0: #2A78D6; --user-1: #EB6834; --user-2: #1BAF7A; --user-3: #EDA100;
     --user-4: #E87BA4; --user-5: #9A3FB4; --user-6: #4A3AA7; --user-7: #E34948; --user-o: #8E8E93;
     --av0: #D6FF4F; --av1: #C9B6FF; --av2: #FFC9A8; --av3: #E5E5EA; --av4: #A8EBD5; --av5: #FFE08F; --av6: #DCD0FF; --av7: #FFB3A6;
-    --scrim: rgba(28,28,30,0.3); --shadow: 0 30px 80px rgba(0,0,0,0.18);`;
+    --scrim: rgba(28,28,30,0.3); --shadow: 0 30px 80px rgba(0,0,0,0.18);
+    --wall-a: #D9DDDA; --wall-b: #B9CDBB; --floor-a: #E4DED6; --floor-b: #CFC7BC; --baseboard: #9C9C9F;
+    --frame: #FFFFFF; --void: #1A1A1A; --door: #F2C98E; --door-panel: #E6BA7C; --door-edge: #A87F4A; --knob: #C9A227;
+    --blood: #E0141B; --blood-dark: #9E0C11; --robe: #2E2E33; --robe-edge: #111114; --bone: #FAF7F0; --pole: #7A5A36;
+    --burst: #FFFFFF;`;
 
 // The settings button's gear, as the design draws it (Feather's "settings").
 const GEAR_PATH = 'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z';
@@ -1231,8 +1315,48 @@ const ICONS = {
   routing: icon('<circle cx="6" cy="6" r="2.5"></circle><circle cx="18" cy="18" r="2.5"></circle><path d="M8.5 6H14a4 4 0 0 1 0 8H10a4 4 0 0 0 0 8"></path>'),
   clients: icon('<circle cx="12" cy="12" r="9.5"></circle><path d="M8 10l2-2 2 2M10 8v8M16 14l-2 2-2-2M14 16V8"></path>'),
   users: icon('<circle cx="9" cy="8" r="3.5"></circle><path d="M2.5 20c.6-3.4 3.2-5.5 6.5-5.5s5.9 2.1 6.5 5.5M16 4.8a3.5 3.5 0 0 1 0 6.4M18.5 14.8c1.7.8 2.7 2.6 3 5.2"></path>'),
+  soundOn: icon('<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"></path><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"></path>', 16, ' class="i-on" stroke-width="1.8"'),
+  soundOff: icon('<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"></path><path d="M16 9.5l5 5M21 9.5l-5 5"></path>', 16, ' class="i-off" stroke-width="1.8"'),
   table: icon('<rect x="3.5" y="4.5" width="17" height="15" rx="3"></rect><path d="M3.5 10h17M9.5 10v9.5"></path>'),
 };
+
+// The Hallway's knocker, drawn once and cloned into each corridor. Its fist
+// lands at (142, 78), which is what the script lines up against a door.
+const REAPER_SVG = `<svg id="reaperArt" width="150" height="200" viewBox="0 0 150 200" aria-hidden="true">
+  <ellipse class="r-shadow" cx="84" cy="192" rx="44" ry="6" fill="rgba(0,0,0,0.35)"></ellipse>
+  <g class="r-body">
+    <path class="r-tail" d="M74 158 C60 168 46 172 32 177 C22 181 16 187 21 191 C26 185 35 185 45 183 C60 180 72 176 84 170 Z" fill="var(--robe)" stroke="var(--robe-edge)" stroke-width="1.2"></path>
+    <path d="M88 30 C104 24 122 34 124 54 C128 76 132 104 132 130 C132 154 122 170 104 176 C94 180 84 178 76 172 C70 150 70 120 72 96 C73 72 74 48 88 30 Z" fill="var(--robe)" stroke="var(--robe-edge)" stroke-width="1.5"></path>
+    <path d="M96 92 C94 120 97 148 92 172 M112 90 C114 120 119 140 116 168 M84 110 C82 130 83 150 82 168" fill="none" stroke="var(--robe-edge)" stroke-width="1.2"></path>
+    <ellipse cx="103" cy="54" rx="15" ry="18" fill="var(--robe-edge)"></ellipse>
+    <ellipse cx="103" cy="53" rx="11" ry="13" fill="var(--bone)"></ellipse>
+    <ellipse cx="98.5" cy="51" rx="3.2" ry="3.8" fill="#111"></ellipse>
+    <ellipse cx="107.5" cy="51" rx="3.2" ry="3.8" fill="#111"></ellipse>
+    <path d="M103 55.5 l-1.6 3 h3.2 z" fill="#111"></path>
+    <rect x="97" y="60" width="12" height="4.5" rx="1" fill="var(--bone)" stroke="#111" stroke-width="0.8"></rect>
+    <path d="M100 60 v4.5 M103 60 v4.5 M106 60 v4.5" stroke="#111" stroke-width="0.7"></path>
+    <line x1="50" y1="18" x2="76" y2="178" stroke="var(--pole)" stroke-width="4" stroke-linecap="round"></line>
+    <path d="M51 21 C30 14 8 30 2 62 C0 76 2 90 6 100 C8 78 18 52 40 38 C46 34 50 30 53 26 Z" fill="var(--bone)" stroke="var(--robe-edge)" stroke-width="1.2"></path>
+    <path d="M2 62 C0 76 2 90 6 100 C7 90 8 80 11 70 C8 68 5 66 2 62 Z M22 40 c-2 3 -1 6 1 6 c2 0 2 -3 -1 -6 Z" fill="var(--blood)"></path>
+    <circle cx="6" cy="108" r="1.7" fill="var(--blood)"></circle>
+    <circle cx="5" cy="118" r="1.2" fill="var(--blood)"></circle>
+    <circle cx="6.5" cy="127" r="0.9" fill="var(--blood)"></circle>
+    <rect x="47" y="17" width="8" height="9" rx="1.5" transform="rotate(-9 51 21)" fill="var(--robe-edge)"></rect>
+    <path d="M78 90 C70 96 63 103 60 112 C66 115 73 112 80 105 Z" fill="var(--robe)" stroke="var(--robe-edge)" stroke-width="1.2"></path>
+    <circle cx="65" cy="110" r="4.5" fill="var(--bone)" stroke="var(--robe-edge)" stroke-width="0.8"></circle>
+    <g class="r-arm">
+      <path d="M118 64 C127 63 135 69 139 75 C141 82 137 91 132 97 C130 89 126 85 119 84 Z" fill="var(--robe)" stroke="var(--robe-edge)" stroke-width="1.2"></path>
+      <circle cx="142" cy="78" r="5.5" fill="var(--bone)" stroke="var(--robe-edge)" stroke-width="0.9"></circle>
+      <path d="M140 74 v8 M143 73.5 v3" stroke="var(--robe-edge)" stroke-width="0.7"></path>
+    </g>
+    <polygon class="r-burst" points="146.0,63.0 148.3,70.9 153.1,68.3 152.1,73.6 160.3,73.4 153.5,78.0 157.4,81.7 152.1,82.4 154.8,90.1 148.3,85.1 146.0,90.0 143.7,85.1 137.2,90.1 139.9,82.4 134.6,81.7 138.5,78.0 131.7,73.4 139.9,73.6 138.9,68.3 143.7,70.9" fill="none" stroke="var(--burst)" stroke-width="1.6" stroke-linejoin="round"></polygon>
+  </g>
+</svg>`;
+
+// The pool spreading from under a blocked door, in its own 152x64 box.
+const BLOOD_SVG = '<path d="M30 2 L124 2 C130 10 122 16 108 19 C126 25 118 37 96 34 C86 47 58 44 52 35 C34 44 6 40 14 29 C0 24 8 13 22 11 C26 7 28 4 30 2 Z"></path>'
+  + '<circle cx="20" cy="46" r="3.2"></circle><circle cx="8" cy="40" r="1.8"></circle><circle cx="72" cy="52" r="2.4"></circle>'
+  + '<circle cx="118" cy="44" r="2.8"></circle><circle cx="136" cy="30" r="1.6"></circle><circle cx="44" cy="56" r="1.4"></circle>';
 
 // The overview's three column slots. They are markup rather than built per
 // poll, so a new window or measure moves the columns (their width and height
@@ -1539,6 +1663,90 @@ const PAGE = `<!doctype html>
   .ticks-bar i.ok { background: var(--violet); } .ticks-bar i.warn { background: var(--lime); } .ticks-bar i.bad { background: var(--coral); } .ticks-bar i.off { background: var(--tick-dim); }
   .acct-note { font-size: 12px; color: var(--dim); }
   .acct-foot { font-size: 12px; color: var(--dim); border-top: 1px solid var(--line); padding-top: 12px; }
+  .sec-tools { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  #hallSound svg { display: none; }
+  #hallSound[data-on="1"] .i-on, #hallSound[data-on="0"] .i-off { display: block; }
+  .legend .door-sw { width: 9px; height: 13px; border-radius: 2px 2px 0 0; flex: none; display: inline-block; background: var(--door); }
+  .legend .door-sw.cur { box-shadow: 0 0 0 2px var(--lime); } .legend .door-sw.open { background: var(--void); box-shadow: inset -3px 0 0 var(--door), 0 3px 0 -1px var(--blood); }
+
+  /* Accounts, as the 3D Hallway (dashboard-hall3d.js): a canvas, and the door
+     names laid over it where the scene projects them. */
+  .hall3d { border-radius: 22px; overflow: hidden; background: var(--card); min-height: 260px; }
+  .h3-stage { position: relative; }
+  .h3-canvas { display: block; }
+  .h3-labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+  .h3-label { position: absolute; left: 0; top: 0; display: flex; flex-direction: column; align-items: center; white-space: nowrap; text-align: center; text-shadow: 0 1px 6px var(--bg); }
+  .h3-label b { font-size: 13px; font-weight: 500; color: var(--text); overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .h3-label span { font-size: 11px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .h3-label.h3-current span { color: var(--lime-text); } .h3-label.h3-blocked span { color: var(--coral-text); }
+  .h3-floor { position: absolute; left: 0; top: 0; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+  @media (max-width: 560px) { .h3-label b { font-size: 11px; } .h3-label span { font-size: 10px; } }
+  .h3-wait { min-height: 260px; display: flex; align-items: center; justify-content: center; font-size: 13px; color: var(--dim); }
+
+  /* Accounts, as the Hallway: a door per account on one long wall. Every
+     position below is set by the script on the same grid (HALL_* there): a
+     door slot is 140px with a 22px gap, and the floor starts 250px down. */
+  .hall { display: flex; flex-direction: column; gap: 14px; }
+  .hall-row { border-radius: 22px; overflow-x: auto; overflow-y: hidden; background: var(--card); scrollbar-width: thin; }
+  .hall-label { position: absolute; top: 14px; left: 18px; font-size: 12px; color: var(--muted); z-index: 3; display: flex; align-items: center; gap: 7px; }
+  .hall-track { position: relative; height: 320px; min-width: 100%;
+    background: linear-gradient(to bottom, var(--wall-a), var(--wall-b) 250px, var(--baseboard) 250px, var(--baseboard) 254px, var(--floor-a) 254px, var(--floor-b)); }
+  .hall-track::after { content: ''; position: absolute; inset: 0; pointer-events: none; background: radial-gradient(ellipse at 50% 30%, transparent 55%, rgba(0,0,0,0.22)); }
+  .door { position: absolute; top: 0; width: 140px; height: 250px; padding: 0; border: none; background: none; cursor: pointer; text-align: center; transition: left .9s cubic-bezier(.45,0,.25,1); }
+  .door:disabled { cursor: default; }
+  .door:focus-visible { outline-offset: -2px; border-radius: 14px; }
+  .door-plaque { position: absolute; top: 12px; left: 4px; right: 4px; display: flex; flex-direction: column; gap: 1px; }
+  .door-name { font-size: 13px; font-weight: 500; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .door-state { font-size: 11px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .door.d-current .door-state { color: var(--lime-text); }
+  .door.d-blocked .door-state { color: var(--coral-text); }
+  .door-frame { position: absolute; left: 15px; bottom: 0; width: 110px; height: 192px; border: 6px solid var(--frame); border-bottom: none; background: var(--void); perspective: 520px; transition: background .9s ease; }
+  .door.d-current .door-frame { box-shadow: 0 0 0 2px var(--lime), 0 0 26px -6px var(--lime); }
+  .door.d-blocked .door-frame { background: linear-gradient(to top, var(--blood-dark), var(--void) 22%); }
+  .door-leaf { position: absolute; inset: 0; background: var(--door); transform-origin: left center; transition: transform 1s cubic-bezier(.5,0,.2,1), filter 1s ease;
+    box-shadow: inset 0 0 0 1px var(--door-edge); }
+  .door-leaf::before, .door-leaf::after { content: ''; position: absolute; left: 13px; right: 13px; border: 1.5px solid var(--door-panel); border-radius: 2px; }
+  .door-leaf::before { top: 12px; height: 62px; }
+  .door-leaf::after { top: 86px; bottom: 14px; }
+  .door-knob { position: absolute; right: 9px; top: 50%; width: 9px; height: 9px; border-radius: 50%; background: var(--knob); box-shadow: 0 1px 0 var(--door-edge); }
+  .door .avatar { position: absolute; left: 50%; top: 27px; width: 30px; height: 30px; margin-left: -15px; font-size: 12px; }
+  .door:hover .door-leaf { filter: brightness(1.06); }
+  .door.d-blocked .door-leaf { transform: rotateY(58deg); filter: brightness(.82); }
+  .door.d-blocked .door-leaf .door-knob { background: var(--blood); }
+  .door-blood { position: absolute; left: -6px; top: 244px; width: 152px; height: 64px; transform-origin: 50% 0; transform: scale(.2, 0); opacity: 0; transition: transform 1.6s cubic-bezier(.2,.7,.2,1) .7s, opacity .4s ease .7s; pointer-events: none; }
+  .door.d-blocked .door-blood { transform: none; opacity: 1; }
+  .door-blood path, .door-blood circle { fill: var(--blood); }
+  .door.knock .door-leaf { animation: tcRattle .62s linear both; }
+  .reaper { position: absolute; top: 106px; width: 150px; height: 200px; z-index: 2; pointer-events: none; transition: left 1.6s cubic-bezier(.45,0,.25,1), opacity .6s ease; }
+  .reaper.idle { opacity: .55; }
+  .reaper svg { overflow: visible; display: block; }
+  .reaper .r-body { animation: tcFloat 3.4s ease-in-out infinite; }
+  .reaper .r-shadow { transform-box: fill-box; transform-origin: center; animation: tcShadow 3.4s ease-in-out infinite; }
+  .reaper .r-tail { transform-box: fill-box; transform-origin: right top; animation: tcSway 2.6s ease-in-out infinite; }
+  .reaper .r-arm { transform-box: fill-box; transform-origin: 0 40%; }
+  .reaper .r-burst { transform-box: fill-box; transform-origin: center; opacity: 0; }
+  .reaper.knock .r-arm { animation: tcKnock .62s linear both; }
+  .reaper.knock .r-burst { animation: tcBurst .62s linear both; }
+  .reaper.idle .r-arm { transform: rotate(38deg); }
+  @keyframes tcFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-7px); } }
+  @keyframes tcShadow { 0%, 100% { transform: scale(1); opacity: .5; } 50% { transform: scale(.86); opacity: .32; } }
+  @keyframes tcSway { 0%, 100% { transform: skewX(0); } 50% { transform: skewX(7deg); } }
+  /* Three raps, landing at 0.1s, 0.3s and 0.5s: where the script plays them. */
+  @keyframes tcKnock {
+    0% { transform: rotate(0); } 8% { transform: rotate(-20deg); } 16% { transform: rotate(1deg); }
+    33% { transform: rotate(-20deg); } 49% { transform: rotate(1deg); }
+    66% { transform: rotate(-20deg); } 82% { transform: rotate(1deg); } 100% { transform: rotate(0); }
+  }
+  @keyframes tcBurst {
+    0%, 15% { opacity: 0; transform: scale(.5); } 17% { opacity: 1; transform: scale(1); } 29% { opacity: 0; transform: scale(1.3); }
+    48% { opacity: 0; transform: scale(.5); } 50% { opacity: 1; transform: scale(1); } 62% { opacity: 0; transform: scale(1.3); }
+    81% { opacity: 0; transform: scale(.5); } 83% { opacity: 1; transform: scale(1.05); } 97%, 100% { opacity: 0; transform: scale(1.4); }
+  }
+  @keyframes tcRattle {
+    0%, 15% { transform: none; } 17% { transform: translateX(1.5px) rotateY(2deg); } 24% { transform: none; }
+    48% { transform: none; } 50% { transform: translateX(1.5px) rotateY(2deg); } 57% { transform: none; }
+    81% { transform: none; } 83% { transform: translateX(2px) rotateY(3deg); } 92%, 100% { transform: none; }
+  }
 
   /* Routing and clients */
   .duo { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 14px; align-items: start; }
@@ -1811,13 +2019,26 @@ const PAGE = `<!doctype html>
     <section class="sec" id="accountsSec">
       <div class="sec-head">
         <div class="sec-title-row"><h2 class="sec-title">Accounts</h2><span class="sec-count" id="acctCount"></span></div>
-        <div class="legend sm" aria-label="Meter colours">
-          <span><i class="sw ok"></i>Under 60%</span>
-          <span><i class="sw warn"></i>60–90%</span>
-          <span><i class="sw bad"></i>Over 90%</span>
+        <div class="sec-tools">
+          <div class="legend sm" id="acctLegend" aria-label="Meter colours">
+            <span><i class="sw ok"></i>Under 60%</span>
+            <span><i class="sw warn"></i>60–90%</span>
+            <span><i class="sw bad"></i>Over 90%</span>
+          </div>
+          <div class="legend sm" id="hallLegend" aria-label="Doors" style="display:none">
+            <span><i class="door-sw cur"></i>Knocked: in use</span>
+            <span><i class="door-sw"></i>Shut: waiting</span>
+            <span><i class="door-sw open"></i>Open: blocked</span>
+          </div>
+          <button id="hallSound" class="icon-btn sm" type="button" data-on="1" style="display:none">${ICONS.soundOn}${ICONS.soundOff}</button>
+          <span class="seg" id="acctViewSeg" role="group" aria-label="Accounts view"></span>
         </div>
       </div>
       <div class="acct-grid" id="accounts"></div>
+      <div class="acct-note" id="hallNote" style="display:none"></div>
+      <div class="hall" id="hall" style="display:none"></div>
+      <div class="hall3d" id="hall3d" style="display:none"></div>
+      <div hidden>${REAPER_SVG}<svg id="bloodArt" class="door-blood" viewBox="0 0 152 64" aria-hidden="true">${BLOOD_SVG}</svg></div>
     </section>
 
     <div class="duo" id="tablesRow" style="display:none">
@@ -2060,6 +2281,39 @@ const PAGE = `<!doctype html>
   var settingsFor = null;
   var settingsBuiltFrom = '';
   var settingsNote = null;
+  // The Accounts section shows its cards or the Hallway: a door per account,
+  // the blocked ones left open, the current one knocked on. Which one, and
+  // whether the knocking is heard, are kept per browser like the theme.
+  var ACCT_VIEWS = [{ key: 'cards', label: 'Cards' }, { key: 'hall', label: 'Hallway' }, { key: '3d', label: '3D' }];
+  var ACCT_VIEW_KEY = 'teamclaude-dashboard-accounts-view';
+  var KNOCK_SOUND_KEY = 'teamclaude-dashboard-knock';
+  var acctView = 'cards';
+  var acctViewButtons = [];
+  var knockSound = true;
+  // The Hallway's corridors by provider, and their doors by provider and
+  // account name. They outlive the poll, so a door that becomes blocked
+  // swings open where it stands and the knocker glides to the next one,
+  // rather than the whole scene being redrawn from scratch every 5s.
+  var hallRows = Object.create(null);
+  var hallDoors = Object.create(null);
+  // The grid the stylesheet's .door and .reaper are drawn for: a 140px slot,
+  // a 22px gap, room on the left for the knocker at the first door, and the
+  // offset that puts its fist on the door's left panel.
+  var HALL_SLOT = 140, HALL_GAP = 22, HALL_PAD = 96, HALL_END = 48, HALL_FIST = 95;
+  // A round of three raps every few seconds, landing where the stylesheet's
+  // tcKnock does.
+  var KNOCK_MS = 4200;
+  var KNOCK_AT = [0.1, 0.3, 0.5];
+  // The 3D Hallway (createHall3d): its controller once three.js and the
+  // models have loaded, the load in flight, and why it failed if it did. A
+  // failure falls back to the flat Hallway for the rest of the page's life.
+  var hall3d = null;
+  var hall3dLoading = false;
+  var hall3dFailed = null;
+  var hall3dOnScreen = true;
+  var knockTimer = null;
+  var audio = null;
+  var noiseBuf = null;
   var AVATARS = 8;
   var TICKS = 30;
   var SVG_NS = 'http://www.w3.org/2000/svg';
@@ -2083,6 +2337,9 @@ const PAGE = `<!doctype html>
 ${SHARED_CONSTS}
 
 ${SHARED_HELPERS}
+
+  var THREE_BASE = ${JSON.stringify(THREE_BASE)};
+${createHall3d.toString()}
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -2392,6 +2649,376 @@ ${SHARED_HELPERS}
       + ' writes · ' + fmtNum(accountTokens(u)) + ' tokens in all';
     card.appendChild(foot);
     return card;
+  }
+
+  // ── Accounts: the Hallway ────────────────────────────────────────────────
+
+  function buildAcctView() {
+    ACCT_VIEWS.forEach(function (v) {
+      var btn = el('button', '', v.label);
+      btn.type = 'button';
+      btn.addEventListener('click', function () {
+        if (acctView === v.key) return;
+        try { localStorage.setItem(ACCT_VIEW_KEY, v.key); } catch (e) { /* the choice lasts for this page only */ }
+        setAcctView(v.key);
+        // A click is what lets a page start sound, so the knocking is ready
+        // by the first round.
+        if (v.key === 'hall' && knockSound) wakeAudio();
+        if (lastStatus) render(lastStatus);
+      });
+      byId('acctViewSeg').appendChild(btn);
+      acctViewButtons.push({ key: v.key, btn: btn });
+    });
+    byId('hallSound').addEventListener('click', function () {
+      knockSound = !knockSound;
+      try { localStorage.setItem(KNOCK_SOUND_KEY, knockSound ? 'on' : 'off'); } catch (e) { /* as above */ }
+      if (knockSound) wakeAudio();
+      markSound();
+    });
+    markSound();
+  }
+
+  function setAcctView(key) {
+    // With the 3D view unable to load, asking for it gets the flat one.
+    if (key === '3d' && hall3dFailed) key = 'hall';
+    acctView = key;
+    markSelected(acctViewButtons, key);
+    var hall = key === 'hall', three = key === '3d', doors = hall || three;
+    byId('accounts').style.display = doors ? 'none' : '';
+    byId('hall').style.display = hall ? '' : 'none';
+    byId('hall3d').style.display = three ? '' : 'none';
+    byId('acctLegend').style.display = doors ? 'none' : '';
+    byId('hallLegend').style.display = doors ? '' : 'none';
+    byId('hallSound').style.display = doors ? '' : 'none';
+    byId('hallNote').style.display = hall && hall3dFailed ? '' : 'none';
+    if (hall3d) hall3d.setActive(three && hall3dOnScreen);
+    if (doors) {
+      byId('accounts').textContent = '';
+      startKnocks();
+    } else {
+      stopKnocks();
+    }
+    if (!hall) {
+      // Left behind, the corridors are dropped: coming back plays the doors
+      // swinging open again instead of showing them already open.
+      byId('hall').textContent = '';
+      hallRows = Object.create(null);
+      hallDoors = Object.create(null);
+    }
+  }
+
+  // The doors the 3D view draws: the corridors hallwayRows gives the flat one,
+  // each door carrying the words its plaque shows.
+  function hall3dRows(s) {
+    var accounts = s.accounts || [];
+    return hallwayRows(s).map(function (r) {
+      return {
+        provider: r.provider,
+        label: providerLabel(r.provider),
+        doors: r.doors.map(function (d) {
+          var stateText = doorStateText(d);
+          var quota = quotaText(accounts[d.index]);
+          return { name: d.name, short: shortName(d.name), state: d.state, stateText: stateText, title: d.name + ' — ' + stateText + (quota ? ' · ' + quota : '') };
+        }),
+      };
+    });
+  }
+
+  function renderHall3d(s) {
+    var canOpen = viewerCan(s.viewer || null, 'switch') || viewerCan(s.viewer || null, 'accounts');
+    if (hall3d) { hall3d.update(hall3dRows(s), canOpen); return; }
+    if (hall3dLoading) return;
+    hall3dLoading = true;
+    var box = byId('hall3d');
+    box.textContent = '';
+    box.appendChild(el('div', 'h3-wait', 'Loading the 3D hallway…'));
+    var reduced = !!(win && win.matchMedia && win.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    var made;
+    try {
+      made = createHall3d({
+        container: box, libBase: THREE_BASE, assetBase: '/teamclaude/dashboard/assets/',
+        reducedMotion: reduced, onOpen: function (name) { openSettings(name); },
+      });
+    } catch (e) {
+      made = Promise.reject(e);
+    }
+    made.then(function (ctrl) {
+      hall3dLoading = false;
+      hall3d = ctrl;
+      watchHall3d();
+      if (lastStatus) hall3d.update(hall3dRows(lastStatus), canOpen);
+      hall3d.setActive(acctView === '3d' && hall3dOnScreen);
+    }, function (e) {
+      hall3dLoading = false;
+      // No WebGL, the CDN out of reach (an air-gapped proxy) or blocked: the
+      // flat Hallway instead, saying why.
+      hall3dFailed = (e && e.message) || String(e) || 'unknown error';
+      byId('hallNote').textContent = '3D view unavailable (' + hall3dFailed + ') — showing the flat hallway.';
+      box.textContent = '';
+      if (acctView === '3d') {
+        setAcctView('hall');
+        if (lastStatus) render(lastStatus);
+      }
+    });
+  }
+
+  // The scene draws only while it is on screen: scrolled away, it stops
+  // rendering rather than spending the GPU on frames nobody sees.
+  function watchHall3d() {
+    if (!win || typeof win.IntersectionObserver !== 'function') return;
+    new win.IntersectionObserver(function (entries) {
+      hall3dOnScreen = entries[entries.length - 1].isIntersecting;
+      if (hall3d) hall3d.setActive(acctView === '3d' && hall3dOnScreen);
+    }).observe(byId('hall3d'));
+  }
+
+  function markSound() {
+    var btn = byId('hallSound');
+    var label = knockSound ? 'Knocking: sound on' : 'Knocking: muted';
+    btn.setAttribute('data-on', knockSound ? '1' : '0');
+    btn.setAttribute('aria-pressed', knockSound ? 'true' : 'false');
+    btn.setAttribute('aria-label', label);
+    btn.title = label;
+  }
+
+  function buildHallRow() {
+    var row = el('div', 'hall-row');
+    var track = el('div', 'hall-track');
+    var label = el('div', 'hall-label');
+    label.appendChild(el('i', 'dot lilac'));
+    var labelText = el('span', '');
+    label.appendChild(labelText);
+    track.appendChild(label);
+    var reaper = el('div', 'reaper');
+    var art = byId('reaperArt').cloneNode(true);
+    art.removeAttribute('id');
+    reaper.appendChild(art);
+    track.appendChild(reaper);
+    row.appendChild(track);
+    return { row: row, track: track, label: label, labelText: labelText, reaper: reaper, reaperCls: 'reaper', knockDoor: null, fresh: true };
+  }
+
+  function buildDoor() {
+    var door = { el: el('button', 'door'), cls: 'door', name: null, row: null };
+    door.el.type = 'button';
+    var plaque = el('div', 'door-plaque');
+    door.nameEl = el('div', 'door-name');
+    door.stateEl = el('div', 'door-state');
+    plaque.appendChild(door.nameEl);
+    plaque.appendChild(door.stateEl);
+    var frame = el('div', 'door-frame');
+    var leaf = el('div', 'door-leaf');
+    door.av = el('div', 'avatar');
+    door.av.setAttribute('aria-hidden', 'true');
+    leaf.appendChild(door.av);
+    leaf.appendChild(el('i', 'door-knob'));
+    frame.appendChild(leaf);
+    var blood = byId('bloodArt').cloneNode(true);
+    blood.removeAttribute('id');
+    door.el.appendChild(plaque);
+    door.el.appendChild(frame);
+    door.el.appendChild(blood);
+    door.el.addEventListener('click', function () { if (door.name) openSettings(door.name); });
+    return door;
+  }
+
+  function doorStateText(d) {
+    if (d.state === 'current') return 'in use';
+    if (d.state === 'blocked') return UNAVAILABLE_TEXT[d.why] || d.why;
+    return 'waiting';
+  }
+
+  function quotaText(a) {
+    var q = (a && a.quota) || {};
+    var pct = function (v) { return Math.round(Math.max(0, Math.min(1, Number(v) || 0)) * 100) + '%'; };
+    if (q.unified5h != null || q.unified7d != null) {
+      return 'session ' + (q.unified5h == null ? '?' : pct(q.unified5h)) + ', weekly ' + (q.unified7d == null ? '?' : pct(q.unified7d));
+    }
+    if (q.tokensLimit != null && q.tokensRemaining != null) return 'tokens ' + pct(1 - q.tokensRemaining / q.tokensLimit);
+    return '';
+  }
+
+  function renderHall(s) {
+    var hall = byId('hall');
+    var accounts = s.accounts || [];
+    var rows = hallwayRows(s);
+    var canOpen = viewerCan(s.viewer || null, 'switch') || viewerCan(s.viewer || null, 'accounts');
+    var seenRows = Object.create(null), seenDoors = Object.create(null);
+    if (!rows.length) {
+      hall.textContent = '';
+      hallRows = Object.create(null);
+      hallDoors = Object.create(null);
+      hall.appendChild(el('div', 'acct-note', 'No accounts yet — an empty hallway.'));
+      return;
+    }
+    rows.forEach(function (r) {
+      seenRows[r.provider] = true;
+      var row = hallRows[r.provider];
+      if (!row) row = hallRows[r.provider] = buildHallRow();
+      // Appending one already in place moves it, which keeps the corridors in
+      // provider order without rebuilding them.
+      hall.appendChild(row.row);
+      row.label.style.display = rows.length > 1 ? '' : 'none';
+      row.labelText.textContent = providerLabel(r.provider);
+      row.knockDoor = null;
+      var curPos = -1;
+      r.doors.forEach(function (d, pos) {
+        var key = r.provider + ':' + d.name;
+        seenDoors[key] = true;
+        var door = hallDoors[key];
+        var fresh = !door;
+        if (fresh) door = hallDoors[key] = buildDoor();
+        if (door.row !== row) { row.track.appendChild(door.el); door.row = row; }
+        door.name = d.name;
+        door.el.style.left = (HALL_PAD + pos * (HALL_SLOT + HALL_GAP)) + 'px';
+        door.nameEl.textContent = shortName(d.name);
+        var stateText = doorStateText(d);
+        door.stateEl.textContent = stateText;
+        door.av.className = 'avatar av' + (d.index % AVATARS);
+        door.av.textContent = initialOf(d.name);
+        var quota = quotaText(accounts[d.index]);
+        door.el.title = d.name + ' — ' + stateText + (quota ? ' · ' + quota : '') + (canOpen ? ' · click for settings' : '');
+        door.el.setAttribute('aria-label', d.name + ', ' + stateText);
+        door.el.disabled = !canOpen;
+        var cls = 'door d-' + d.state;
+        // Only a change is written: the class also carries the knock, which
+        // a poll landing mid-rap would otherwise cut short.
+        if (cls !== door.cls) {
+          door.cls = cls;
+          if (fresh && raf) {
+            // A new door is drawn shut first, so a blocked one is seen to
+            // swing open rather than appearing already open.
+            door.el.className = 'door';
+            raf(function () { raf(function () { door.el.className = door.cls; }); });
+          } else {
+            door.el.className = cls;
+          }
+        }
+        if (d.state === 'current') { curPos = pos; row.knockDoor = door; }
+      });
+      var n = r.doors.length;
+      var end = HALL_PAD + n * (HALL_SLOT + HALL_GAP) - HALL_GAP;
+      // With nothing to knock on, the knocker waits past the last door.
+      var reaperLeft = curPos >= 0 ? HALL_PAD + curPos * (HALL_SLOT + HALL_GAP) - HALL_FIST : end + 24;
+      row.reaper.style.left = reaperLeft + 'px';
+      var reaperCls = curPos >= 0 ? 'reaper' : 'reaper idle';
+      if (reaperCls !== row.reaperCls.replace(' knock', '')) { row.reaperCls = reaperCls; row.reaper.className = reaperCls; }
+      row.track.style.width = Math.max(end + HALL_END, reaperLeft + 150 + HALL_END) + 'px';
+      if (row.fresh) {
+        row.fresh = false;
+        row.row.scrollLeft = Math.max(0, reaperLeft - 24);
+      }
+    });
+    Object.keys(hallDoors).forEach(function (k) {
+      if (!seenDoors[k]) { hallDoors[k].el.remove(); delete hallDoors[k]; }
+    });
+    Object.keys(hallRows).forEach(function (p) {
+      if (!seenRows[p]) { hallRows[p].row.remove(); delete hallRows[p]; }
+    });
+  }
+
+  // The knocking runs on its own clock, not the poll's: a round every
+  // KNOCK_MS while the Hallway is shown, the raps restarted by taking the
+  // class off, forcing a layout, and putting it back.
+  function startKnocks() {
+    if (knockTimer || !win || typeof win.setTimeout !== 'function') return;
+    knockTimer = win.setTimeout(knockRound, 900);
+  }
+
+  function stopKnocks() {
+    if (knockTimer && win) win.clearTimeout(knockTimer);
+    knockTimer = null;
+  }
+
+  function knockRound() {
+    knockTimer = null;
+    if (acctView !== 'hall' && acctView !== '3d') return;
+    var knocked = false;
+    if (acctView === '3d') {
+      knocked = !!(hall3d && lastStatus && hallwayRows(lastStatus).some(function (r) { return r.current; }));
+      if (knocked) hall3d.knock();
+    }
+    Object.keys(hallRows).forEach(function (p) {
+      var r = hallRows[p];
+      if (!r.knockDoor) return;
+      knocked = true;
+      r.reaper.className = 'reaper';
+      void r.reaper.offsetWidth;
+      r.reaperCls = 'reaper knock';
+      r.reaper.className = r.reaperCls;
+      var d = r.knockDoor;
+      d.el.className = d.cls;
+      void d.el.offsetWidth;
+      d.el.className = d.cls + ' knock';
+    });
+    if (knocked && knockHeard()) playKnock();
+    knockTimer = win.setTimeout(knockRound, KNOCK_MS);
+  }
+
+  // Heard only while the Hallway is on screen in a visible tab: knocking
+  // from a section scrolled out of sight, or a background tab, would be a
+  // noise with no door to it.
+  function knockHeard() {
+    if (!knockSound || document.hidden) return false;
+    var hall = byId(acctView === '3d' ? 'hall3d' : 'hall');
+    if (typeof hall.getBoundingClientRect !== 'function') return false;
+    var r = hall.getBoundingClientRect();
+    return r.bottom > 0 && r.top < (win.innerHeight || 800);
+  }
+
+  function wakeAudio() {
+    var AC = win && (win.AudioContext || win.webkitAudioContext);
+    if (!AC) return null;
+    if (!audio) {
+      try { audio = new AC(); } catch (e) { return null; }
+    }
+    if (audio.state === 'suspended' && audio.resume) audio.resume().catch(function () { /* still waiting for a gesture */ });
+    return audio;
+  }
+
+  // A round of raps, synthesized rather than shipped as a sample: the page
+  // fetches nothing. Each is wood under a bony fist, a low thump falling in
+  // pitch beneath a short crack of band-passed noise.
+  function playKnock() {
+    var ac = wakeAudio();
+    // A browser holds sound back until the page has been clicked; until
+    // then the rounds go unheard rather than queueing up to play at once.
+    if (!ac || ac.state !== 'running') return;
+    if (!noiseBuf) {
+      var len = Math.floor(ac.sampleRate * 0.04);
+      noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
+      var data = noiseBuf.getChannelData(0);
+      for (var i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 4);
+    }
+    var t0 = ac.currentTime + 0.02;
+    KNOCK_AT.forEach(function (at, i) {
+      var t = t0 + at;
+      var level = i === KNOCK_AT.length - 1 ? 0.5 : 0.38;
+      var osc = ac.createOscillator();
+      var body = ac.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(180, t);
+      osc.frequency.exponentialRampToValueAtTime(65, t + 0.12);
+      body.gain.setValueAtTime(0.0001, t);
+      body.gain.exponentialRampToValueAtTime(level, t + 0.004);
+      body.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
+      osc.connect(body);
+      body.connect(ac.destination);
+      osc.start(t);
+      osc.stop(t + 0.18);
+      var crack = ac.createBufferSource();
+      var band = ac.createBiquadFilter();
+      var crackGain = ac.createGain();
+      crack.buffer = noiseBuf;
+      band.type = 'bandpass';
+      band.frequency.value = 1300;
+      band.Q.value = 1.4;
+      crackGain.gain.value = level * 0.9;
+      crack.connect(band);
+      band.connect(crackGain);
+      crackGain.connect(ac.destination);
+      crack.start(t);
+    });
   }
 
   // ── Account settings dialog ──────────────────────────────────────────────
@@ -3842,9 +4469,15 @@ ${SHARED_HELPERS}
     // Active as Proxy status counts it: enabled and not blocked.
     var active = accounts.filter(function (a) { return !a.disabled && !a.unavailable; }).length;
     byId('acctCount').textContent = accounts.length ? active + ' of ' + accounts.length + ' active' : '';
-    var acc = byId('accounts');
-    acc.textContent = '';
-    accountDisplayOrder(accounts).forEach(function (i, pos) { acc.appendChild(renderAccount(accounts[i], i, pos, s)); });
+    if (acctView === 'hall') {
+      renderHall(s);
+    } else if (acctView === '3d') {
+      renderHall3d(s);
+    } else {
+      var acc = byId('accounts');
+      acc.textContent = '';
+      accountDisplayOrder(accounts).forEach(function (i, pos) { acc.appendChild(renderAccount(accounts[i], i, pos, s)); });
+    }
     renderProblems(s);
     renderGroups(s);
     renderHistory();
@@ -4176,6 +4809,8 @@ ${SHARED_HELPERS}
     theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
     storeTheme(theme);
     applyTheme(theme);
+    // The 3D scene reads its colours from the theme when it is updated.
+    if (hall3d && lastStatus && acctView === '3d') hall3d.update(hall3dRows(lastStatus), viewerCan(lastStatus.viewer || null, 'switch') || viewerCan(lastStatus.viewer || null, 'accounts'));
   });
 
   byId('reload').addEventListener('click', function () {
@@ -4189,6 +4824,24 @@ ${SHARED_HELPERS}
     if (e.key === 'Enter') byId('thrSet').click();
   });
   buildControls();
+  try {
+    if (localStorage.getItem(KNOCK_SOUND_KEY) === 'off') knockSound = false;
+    var storedView = localStorage.getItem(ACCT_VIEW_KEY);
+    if (storedView === 'hall' || storedView === '3d') acctView = storedView;
+  } catch (e) { /* storage disabled: the cards, and the knocking heard */ }
+  buildAcctView();
+  setAcctView(acctView);
+  // A Hallway restored from storage starts silent: the browser lets its
+  // sound begin at the first click or key on the page.
+  ['pointerdown', 'keydown'].forEach(function (type) {
+    document.addEventListener(type, function () {
+      if (audio && audio.state === 'suspended' && audio.resume) audio.resume().catch(function () { /* as above */ });
+    });
+  });
+  document.addEventListener('visibilitychange', function () {
+    if (acctView !== 'hall') return;
+    if (document.hidden) stopKnocks(); else startKnocks();
+  });
   NAV.forEach(function (n) {
     byId(n[1]).addEventListener('click', function () {
       navPicked = n[0];

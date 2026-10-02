@@ -1,0 +1,10 @@
+The 3D models the dashboard's 3D Hallway view loads are public domain
+(Creative Commons Zero, CC0 1.0):
+https://creativecommons.org/publicdomain/zero/1.0/
+
+  doorway.glb   Furniture Kit by Kenney (www.kenney.nl)
+                https://kenney.nl/assets/furniture-kit
+  skeleton.glb  Skeleton (animated) by Quaternius (quaternius.com)
+                https://poly.pizza/m/DM4QScSmbS
+
+CC0 asks for no credit; it is given here all the same.

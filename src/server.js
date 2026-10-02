@@ -20,7 +20,7 @@ import { createEgressGuard } from './egress-guard.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
-import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
+import { renderDashboardHtml, dashboardCsp, dashboardAsset } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames, usageMixKey, USAGE_SLOT_MS, USAGE_MONTH } from './client-usage.js';
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
@@ -500,6 +500,25 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // page's own script with the key. A browser address bar cannot send
       // x-api-key, so gating the asset would just 401 every remote browser
       // without protecting anything.
+      // The 3D Hallway's models, public for the same reason as the page:
+      // fixed CC0 files (src/dashboard-assets) that carry no status at all.
+      if (req.method === 'GET' && req.url.startsWith('/teamclaude/dashboard/assets/')) {
+        const asset = dashboardAsset(req.url.slice('/teamclaude/dashboard/assets/'.length));
+        if (!asset) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'not found' }));
+          return;
+        }
+        res.writeHead(200, {
+          'Content-Type': asset.type,
+          'Content-Length': asset.body.length,
+          'Cache-Control': 'public, max-age=86400',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        res.end(asset.body);
+        return;
+      }
+
       if (req.method === 'GET' && req.url === '/teamclaude/dashboard') {
         // The page keeps the proxy key in localStorage; the policy is what
         // stops any script but its own from ever running next to it.

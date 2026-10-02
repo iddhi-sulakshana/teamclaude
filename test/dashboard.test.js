@@ -5,9 +5,9 @@ import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
-  renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit,
+  renderDashboardHtml, dashboardCsp, inlineScripts, THREE_BASE, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit,
   accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
-  sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder,
+  sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
@@ -266,6 +266,50 @@ test('blocked and disabled accounts sort after the serving ones, each group in f
   assert.deepEqual(accountDisplayOrder(accounts), [1, 3, 0, 2, 4]);
   assert.deepEqual(accountDisplayOrder([{ name: 'x' }, { name: 'y' }]), [0, 1]);
   assert.deepEqual(accountDisplayOrder(null), []);
+});
+
+test('the hallway walks past the open doors to the knocked one, then the shut ones', () => {
+  const rows = hallwayRows({
+    currentAccount: 'd',
+    accounts: [
+      { name: 'a' },
+      { name: 'b', unavailable: 'quota' },
+      { name: 'c', disabled: true },
+      { name: 'd' },
+      { name: 'e' },
+    ],
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].current, 'd');
+  assert.deepEqual(rows[0].doors.map(d => [d.name, d.state, d.why, d.index]), [
+    ['b', 'blocked', 'quota', 1],
+    ['c', 'blocked', 'disabled', 2],
+    ['d', 'current', null, 3],
+    ['a', 'waiting', null, 0],
+    ['e', 'waiting', null, 4],
+  ]);
+});
+
+test('a mixed fleet gets a corridor per provider, Claude first, each with its own knocked door', () => {
+  const rows = hallwayRows({
+    currentAccounts: { codex: 'x', anthropic: 'b' },
+    accounts: [
+      { name: 'x', provider: 'codex' },
+      { name: 'a', provider: 'anthropic' },
+      { name: 'b', provider: 'anthropic' },
+    ],
+  });
+  assert.deepEqual(rows.map(r => [r.provider, r.current, r.doors.map(d => d.name)]), [
+    ['anthropic', 'b', ['b', 'a']],
+    ['codex', 'x', ['x']],
+  ]);
+});
+
+test('a corridor whose current account is blocked has no door to knock on', () => {
+  const rows = hallwayRows({ currentAccount: 'a', accounts: [{ name: 'a', unavailable: 'throttled' }, { name: 'b', disabled: true }] });
+  assert.equal(rows[0].current, null);
+  assert.deepEqual(rows[0].doors.map(d => d.state), ['blocked', 'blocked']);
+  assert.deepEqual(hallwayRows(null), []);
 });
 
 test('filter options are unique, sorted, and drop the unlabelled', () => {
@@ -829,7 +873,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
+  for (const fn of [hallwayRows, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -841,7 +885,7 @@ test('the page ships the same helper implementations it is tested against', () =
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
 // a fetch the test answers by hand. Elements absorb any method call, so render()
 // runs without a real DOM; only the style and text the startup path sets are read.
-function bootPage({ storedKey = null, storedTheme = null } = {}) {
+function bootPage({ storedKey = null, storedTheme = null, stored = [] } = {}) {
   const els = new Map();
   // Listeners are recorded rather than absorbed, and every element built is
   // kept, so a test can drive a control the page created for itself — the
@@ -869,6 +913,7 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
   const store = new Map([
     ...(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []),
     ...(storedTheme ? [['teamclaude-dashboard-theme', storedTheme]] : []),
+    ...stored,
   ]);
   const localStorage = {
     getItem: k => (store.has(k) ? store.get(k) : null),
@@ -975,6 +1020,56 @@ test('a first poll that fails shows its error instead of a blank page', async ()
   assert.equal(page.byId('err').style.display, 'flex');
   assert.match(page.byId('err').textContent, /status 500/);
   assert.equal(page.byId('app').style.display, '');
+});
+
+const HALL_STATUS = { currentAccount: 'b', accounts: [{ name: 'a', unavailable: 'throttled' }, { name: 'b' }, { name: 'c' }] };
+
+test('the Hallway toggle swaps the cards for a door per account, and is remembered', async () => {
+  const page = bootPage();
+  await page.answer(200, HALL_STATUS);
+  assert.equal(page.byId('hall').style.display, 'none', 'the cards are the default');
+  page.click('Hallway');
+  assert.equal(page.store.get('teamclaude-dashboard-accounts-view'), 'hall');
+  assert.equal(page.byId('accounts').style.display, 'none');
+  assert.equal(page.byId('hall').style.display, '');
+  assert.equal(page.byId('hallSound').style.display, '', 'the mute button comes with it');
+  assert.equal(page.labelled('in use'), 1);
+  assert.equal(page.labelled('waiting'), 1);
+  assert.equal(page.labelled('upstream 429 hold'), 1);
+  page.click('Cards');
+  assert.equal(page.store.get('teamclaude-dashboard-accounts-view'), 'cards');
+  assert.equal(page.byId('hall').style.display, 'none');
+  assert.equal(page.byId('hallSound').style.display, 'none');
+});
+
+test('a Hallway left on last time is drawn from the first status, and so is a muted knock', async () => {
+  const page = bootPage({ stored: [['teamclaude-dashboard-accounts-view', 'hall'], ['teamclaude-dashboard-knock', 'off']] });
+  await page.answer(200, HALL_STATUS);
+  assert.equal(page.byId('hall').style.display, '');
+  assert.equal(page.labelled('in use'), 1);
+  assert.equal(page.byId('hallSound').title, 'Knocking: muted');
+  page.clickTitled('Knocking: muted');
+  assert.equal(page.store.get('teamclaude-dashboard-knock'), 'on');
+  assert.equal(page.byId('hallSound').title, 'Knocking: sound on');
+});
+
+test('the 3D view falls back to the flat Hallway, saying why, when three.js cannot load', async () => {
+  // Under the test runner the CDN import is refused outright (no https:
+  // modules), which is the air-gapped proxy's case too.
+  const page = bootPage();
+  await page.answer(200, HALL_STATUS);
+  page.click('3D');
+  assert.equal(page.store.get('teamclaude-dashboard-accounts-view'), '3d');
+  for (let i = 0; i < 5; i++) await new Promise(r => setImmediate(r));
+  assert.match(page.byId('hallNote').textContent, /^3D view unavailable \(.+\) — showing the flat hallway\.$/);
+  assert.equal(page.byId('hallNote').style.display, '');
+  assert.equal(page.byId('hall').style.display, '');
+  assert.equal(page.byId('hall3d').style.display, 'none');
+  assert.equal(page.labelled('in use'), 1, 'the flat doors are drawn');
+  // Asked for again, it does not retry the load: the flat view it is.
+  page.click('Cards');
+  page.click('3D');
+  assert.equal(page.byId('hall').style.display, '');
 });
 
 test('every id on the page is unique', () => {
@@ -1534,9 +1629,16 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     assert.ok(csp, 'the dashboard must carry a Content-Security-Policy');
     assert.equal(csp, dashboardCsp(html));
     assert.match(csp, /(^|; )default-src 'none'(;|$)/);
-    assert.match(csp, /(^|; )connect-src 'self'(;|$)/);
+    // Fetches stay on this origin; blob: and data: are the 3D view's model
+    // textures, which three.js unpacks in the page.
+    assert.match(csp, /(^|; )connect-src 'self' blob: data:(;|$)/);
     assert.match(csp, /(^|; )frame-ancestors 'none'(;|$)/);
     assert.doesNotMatch(csp, /script-src[^;]*'unsafe-inline'/);
+    // The one script from elsewhere is three.js, at exactly its pinned path:
+    // not the host at large, and nothing else.
+    const scriptSrc = csp.split('; ').find(d => d.startsWith('script-src ')).split(' ').slice(1);
+    assert.deepEqual(scriptSrc.filter(v => !v.startsWith("'sha256-")), [THREE_BASE]);
+    assert.match(THREE_BASE, /^https:\/\/cdn\.jsdelivr\.net\/npm\/three@\d+\.\d+\.\d+\/$/);
     // Every inline script is admitted by hash, not just the first: the theme
     // is applied by a short script in <head>, and a policy covering only the
     // main script would block it and paint the page dark for a light viewer.
@@ -1555,6 +1657,23 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     const post = await fetch(`http://127.0.0.1:${port}/teamclaude/dashboard`, { method: 'POST' });
     assert.equal(post.status, 404);
     assert.match((await post.json()).error, /unknown teamclaude control route/);
+
+    // The 3D view's models are served the same way, without a key, and only
+    // the ones the page names: no other file under src/ is reachable.
+    for (const name of ['doorway.glb', 'skeleton.glb']) {
+      const glb = await fetch(`http://127.0.0.1:${port}/teamclaude/dashboard/assets/${name}`);
+      assert.equal(glb.status, 200, name);
+      assert.equal(glb.headers.get('content-type'), 'model/gltf-binary');
+      assert.equal(Buffer.from(await glb.arrayBuffer()).subarray(0, 4).toString(), 'glTF', `${name} is a binary glTF`);
+    }
+    for (const path of ['LICENSE.txt', 'nope.glb', '%2e%2e%2fdashboard.js', '']) {
+      const miss = await fetch(`http://127.0.0.1:${port}/teamclaude/dashboard/assets/${path}`);
+      assert.equal(miss.status, 404, path || '(empty)');
+      await miss.arrayBuffer();
+    }
+    const postAsset = await fetch(`http://127.0.0.1:${port}/teamclaude/dashboard/assets/skeleton.glb`, { method: 'POST' });
+    assert.equal(postAsset.status, 404);
+    await postAsset.arrayBuffer();
     assert.equal(upstreamHits, 0);
   } finally {
     proxy.close();
