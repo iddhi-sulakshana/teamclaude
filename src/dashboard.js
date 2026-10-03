@@ -706,13 +706,21 @@ export function sortRows(rows, key, dir) {
 
 // The order the account grid draws in, as indices into `accounts`: the ones
 // serving first, then the blocked ones (disabled, or out of rotation for any
-// other reason), each group keeping the fleet's own order. Indices rather than
-// the accounts themselves so a card keeps the avatar colour its place in the
-// fleet gives it, the same one its settings dialog shows.
+// other reason), each group sorted by weekly limit utilization (highest first).
+// Indices rather than the accounts themselves so a card keeps the avatar colour
+// its place in the fleet gives it, the same one its settings dialog shows.
 export function accountDisplayOrder(accounts) {
   var serving = [], blocked = [];
   (accounts || []).forEach(function (a, i) { (a.disabled || a.unavailable ? blocked : serving).push(i); });
-  return serving.concat(blocked);
+  var sortByWeeklyHit = function (indices) {
+    return indices.sort(function (i, j) {
+      var a = accounts[i] || {}, b = accounts[j] || {};
+      var aUtilization = (a.quota || {}).unified7d || 0;
+      var bUtilization = (b.quota || {}).unified7d || 0;
+      return bUtilization - aUtilization;
+    });
+  };
+  return sortByWeeklyHit(serving).concat(sortByWeeklyHit(blocked));
 }
 
 // The Hallway view's corridors: one per provider (a mixed fleet has a current
