@@ -42,7 +42,11 @@ import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
-import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
+import { ClientUsageTracker, UsageDimensionTracker, USAGE_SLOT_MS } from './client-usage.js';
+import { QuotaHistory } from './quota-history.js';
+import { ClientQuotaTracker } from './quota-attribution.js';
+import { buildForecast } from './forecast-payload.js';
+import { ForecastExplainer } from './forecast-explain.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
@@ -334,6 +338,14 @@ async function serverCommand() {
   if (savedState?.clients) clientUsage.restore(savedState.clients);
   const dimensionUsage = new UsageDimensionTracker();
   if (savedState?.usageDimensions) dimensionUsage.restore(savedState.usageDimensions);
+  // The usage forecast's inputs (quota-history.js, quota-attribution.js): two
+  // days of every Claude subscription's quota readings, and a day of each
+  // client's weekly-quota spend. Restored like the rest, so a restart keeps the
+  // burn rate already measured.
+  const quotaHistory = new QuotaHistory();
+  if (savedState?.quotaHistory) quotaHistory.restore(savedState.quotaHistory, Date.now());
+  const clientQuota = new ClientQuotaTracker();
+  if (savedState?.clientQuota) clientQuota.restore(savedState.clientQuota);
 
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
@@ -341,9 +353,17 @@ async function serverCommand() {
 
   // Periodically persist quota (and once more on shutdown) to the state file.
   const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() })
+    saveState({
+      quota: accountManager.exportQuotaState(),
+      clients: clientUsage.exportState(),
+      usageDimensions: dimensionUsage.exportState(),
+      quotaHistory: quotaHistory.exportState(),
+      clientQuota: clientQuota.exportState(),
+    })
       .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
+  /** @type {ReturnType<typeof setInterval>|null} */
+  let historyInterval = null;
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -817,6 +837,19 @@ async function serverCommand() {
     },
   });
   hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config) });
+  // The forecast (GET /teamclaude/forecast), its Explain, and the spend
+  // attribution forwardRequest books after every Claude response.
+  hooks.recordQuotaUse = (/** @type {string|null} */ client, /** @type {number} */ amount) => clientQuota.record(client, amount);
+  hooks.getForecast = () => buildForecast({
+    accounts: accountManager.accounts,
+    thresholdFor: (bucket, account) => accountManager.thresholdFor(bucket, account),
+    mode: accountManager.distributionMode,
+    history: quotaHistory,
+    attribution: clientQuota,
+    now: Date.now(),
+  });
+  const explainer = new ForecastExplainer({ port, fallbackKey: () => config.proxy?.apiKey || null });
+  hooks.explainForecast = (/** @type {{ key: string|null }} */ { key }) => explainer.explain(hooks.getForecast(), key);
 
   const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost });
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
@@ -881,6 +914,12 @@ async function serverCommand() {
   quotaSaveInterval = setInterval(persistQuotaState, 60_000);
   quotaSaveInterval.unref?.();
 
+  // A quota reading per account every 15 minutes for the forecast, and one now
+  // so a fresh start has a first point to measure from.
+  quotaHistory.sample(accountManager.accounts, Date.now());
+  historyInterval = setInterval(() => quotaHistory.sample(accountManager.accounts, Date.now()), USAGE_SLOT_MS);
+  historyInterval.unref?.();
+
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
   prober = new Prober(accountManager, {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
@@ -935,6 +974,7 @@ async function serverCommand() {
     warmer?.stop();
     eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
+    if (historyInterval) clearInterval(historyInterval);
     await persistQuotaState();
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a
