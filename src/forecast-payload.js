@@ -39,7 +39,7 @@ const SCOPED = [{ field: 'unified7dFable', bucket: 'fable' }, { field: 'unified7
  * @property {number} share
  * @property {number|null} fairShareX
  * @property {boolean} heavy
- * @property {number|null} [withoutThemDryAt]  present only when the fleet is overusing; null = would not run dry
+ * @property {number|null} [withoutThemDryAt]  present only when the pool runs dry; null = would not without them
  */
 
 /**
@@ -155,7 +155,8 @@ export function buildForecast({ accounts, thresholdFor, mode, history, attributi
 
   /** @type {ForecastUser[]} */
   const users = userShares(attribution.window()).map(u => {
-    if (verdict !== 'overusing' || u.name === NO_CLIENT) return u;
+    // Only a dry spell has a time for one client's absence to move.
+    if (sim.poolDryAt == null || u.name === NO_CLIENT) return u;
     const without = simulate({ accounts: weekly, burnRate: burnRate * (1 - u.share), strategy, now });
     return { ...u, withoutThemDryAt: without.poolDryAt };
   });

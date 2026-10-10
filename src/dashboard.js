@@ -380,42 +380,6 @@ export function meterTone(ratio) {
   return ratio >= 0.9 ? 'bad' : ratio >= 0.6 ? 'warn' : 'ok';
 }
 
-// The overview's columns: the two busiest clients on the shown window and
-// measure, a column each, and everyone else folded into a third — what a glance
-// takes in, where the Clients list further down carries every row. Three
-// clients or fewer are each their own column, since a fold of one would only
-// hide a name. `share` is of the whole; `lift` is how high a column's figure
-// stands against the tallest column; `grow` is its width, square-rooted so a
-// client with a sliver of the traffic still has room for its label.
-// `averageLift` puts the dashed average-per-client line on the same scale as
-// `lift`. A client with nothing on the window takes no column and does not
-// pull the average down.
-/** @param {Array<{ name: string, value: number }>|null|undefined} ranking */
-export function clientGroups(ranking) {
-  var active = (ranking || []).filter(function (r) { return r.value > 0; });
-  var total = 0;
-  active.forEach(function (r) { total += r.value; });
-  /** @type {Array<{ name: string, value: number, members: string[], others: boolean, share: number, lift: number, grow: number }>} */
-  var groups = (active.length <= 3 ? active : active.slice(0, 2)).map(function (r) {
-    return { name: r.name, value: r.value, members: [r.name], others: false, share: 0, lift: 0, grow: 1 };
-  });
-  if (active.length > 3) {
-    var rest = active.slice(2);
-    var sum = 0;
-    rest.forEach(function (r) { sum += r.value; });
-    groups.push({ name: 'others', value: sum, members: rest.map(function (r) { return r.name; }), others: true, share: 0, lift: 0, grow: 1 });
-  }
-  var max = 0;
-  groups.forEach(function (g) { if (g.value > max) max = g.value; });
-  groups.forEach(function (g) {
-    g.share = total ? g.value / total : 0;
-    g.lift = max ? g.value / max : 0;
-    g.grow = 1 + 2 * Math.sqrt(g.share);
-  });
-  var average = active.length ? total / active.length : 0;
-  return { groups: groups, total: total, average: average, averageLift: max ? average / max : 0, clients: active.length };
-}
-
 // Usage over time, from GET /teamclaude/usage/series: one point per hour of
 // the window shown — the last five for `5h`, the day for `24h` and for `total`,
 // which has no series of its own (the tracker keeps a day, not a lifetime).
@@ -596,7 +560,9 @@ export function verdictChip(f) {
 export function forecastTag(f, clock, span) {
   if (!f || !f.verdict) return '';
   if (f.poolDryAt != null) return 'Dry ' + clock(f.poolDryAt) + (f.dryForMs != null ? ' · ' + span(f.dryForMs) + ' before refill' : '');
-  return '~' + Math.round(f.unusedPct || 0) + '% resets unused';
+  // Nothing dry and nothing left over: the chip already says all there is.
+  var unused = Math.round(f.unusedPct || 0);
+  return unused > 0 ? '~' + unused + '% resets unused' : '';
 }
 
 // A line under the chip when the numbers deserve a caveat.
@@ -666,7 +632,9 @@ export function forecastPopup(f, clock, span) {
     word(f.verdict) + ' at ' + (f.pace || 0).toFixed(1) + '× — the fleet spends ' + perDay + '% of its weekly capacity a day (on pace is about 14%).',
     f.poolDryAt != null
       ? 'At this rate every account is spent by ' + clock(f.poolDryAt) + (f.dryForMs != null ? ', ' + span(f.dryForMs) + ' before the next refill.' : '.')
-      : 'About ' + Math.round(f.unusedPct || 0) + "% of a week's capacity resets unused.",
+      : Math.round(f.unusedPct || 0) > 0
+        ? 'About ' + Math.round(f.unusedPct || 0) + "% of a week's capacity resets unused."
+        : 'At this rate the pool does not run dry, but next to nothing is left at the resets.',
     f.confidence === 'low'
       ? 'Low confidence: ' + f.spanHours + "h of history, so the rate is each account's average since its last reset."
       : 'Rate measured over the last ' + f.spanHours + 'h (' + f.confidence + ' confidence).',
@@ -1439,7 +1407,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows, hallLayout,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
-  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
+  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
   forecastGeometry, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -1574,15 +1542,6 @@ const BLOOD_SVG = '<path d="M30 2 L124 2 C130 10 122 16 108 19 C126 25 118 37 96
 // The overview's three column slots. They are markup rather than built per
 // poll, so a new window or measure moves the columns (their width and height
 // transition) instead of replacing them.
-const GROUP_SLOTS = [0, 1, 2].map(i => `
-          <div class="grp" id="grp${i}" style="display:none">
-            <div class="grp-val" id="grp${i}Val"></div>
-            <div class="grp-foot">
-              <div class="grp-lbl"><b id="grp${i}Pct"></b><span id="grp${i}Name"></span></div>
-              <div class="grp-bars" id="grp${i}Bars" aria-hidden="true"></div>
-            </div>
-          </div>`).join('');
-
 const PAGE = `<!doctype html>
 <html lang="en">
 <head>
@@ -1612,14 +1571,12 @@ const PAGE = `<!doctype html>
   @keyframes tcFade { from { opacity: 0; } to { opacity: 1; } }
   @keyframes tcPop { from { opacity: 0; transform: translateY(12px) scale(.97); } to { opacity: 1; transform: none; } }
   @keyframes tcUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
-  @keyframes tcGrow { from { transform: scaleY(0); } to { transform: scaleY(1); } }
   .wrap { max-width: 1240px; margin: 0 auto; padding: 28px 28px 56px; }
   #app { display: flex; flex-direction: column; gap: 36px; }
   #overview, #accountsSec, #routesWrap, #clientsWrap { scroll-margin-top: 20px; }
   /* The entrance plays once, on the first status: the poll rebuilds the cards
      every few seconds, and an animation keyed to the element would replay. */
   .intro .rise { animation: tcUp .6s cubic-bezier(.2,.8,.2,1) both; }
-  .intro .grp-bars i { animation: tcGrow .7s cubic-bezier(.2,.8,.2,1) both; }
   .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; display: inline-block; background: var(--dim); }
   .dot.lime { background: var(--lime); } .dot.violet { background: var(--violet); } .dot.lilac { background: var(--lilac); }
   .dot.coral { background: var(--coral); } .dot.amber { background: var(--amber); } .dot.gray { background: var(--faint); }
@@ -1703,23 +1660,46 @@ const PAGE = `<!doctype html>
   .routing-to b { color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 100%; }
   .routing-to .prov { color: var(--dim); }
   .hero-btns { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .groups-wrap { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-  .groups { position: relative; display: flex; height: 190px; }
-  .avg-line { position: absolute; left: 0; right: 0; top: 72px; border-top: 1px dashed var(--dash); pointer-events: none; transition: top .6s cubic-bezier(.2,.8,.2,1); }
-  .avg-pill { position: absolute; right: 18%; top: 72px; height: 22px; padding: 0 10px; border-radius: 999px; background: var(--bg-pill); color: var(--text); font-size: 11px; display: flex; align-items: center; transform: translateY(-50%); transition: top .6s cubic-bezier(.2,.8,.2,1); }
-  .grp { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; justify-content: space-between; border-left: 1px solid var(--col-line); padding: 6px 16px 0 14px; transition: flex-grow .6s cubic-bezier(.2,.8,.2,1), padding-top .6s cubic-bezier(.2,.8,.2,1); }
-  .grp-val { font-size: 16px; font-weight: 500; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .grp-foot { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-  .grp-lbl { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .grp-lbl b { color: var(--text); font-weight: 500; margin-right: 7px; }
-  .grp-bars { height: 44px; display: flex; gap: 6px; overflow: hidden; }
-  .grp-bars i { display: block; height: 100%; border-radius: 4px; transform-origin: bottom; transition: filter .2s ease; }
-  .grp-bars i:hover { filter: brightness(1.35); }
-  .grp-bars i.solid { flex: 1; min-width: 40px; background: var(--violet); }
-  .grp-bars i.thin { flex: none; width: 7px; }
-  .grp-bars i.dark { background: var(--bar-dark); }
-  .groups-empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; font-size: 13px; color: var(--dim); border-left: 1px solid var(--col-line); }
-  .range { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+  .fc-wrap { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .fc-head { display: flex; align-items: center; gap: 10px; min-height: 28px; }
+  .fc-chip { height: 24px; padding: 0 10px; border-radius: 999px; background: var(--bg-pill); color: var(--text); font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; white-space: nowrap; }
+  .fc-chip.bad { background: var(--coral-soft); color: var(--coral-text); }
+  .fc-chip.warn { color: var(--amber); }
+  .fc-cap { flex: 1; min-width: 0; font-size: 12px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .fc-head .icon-btn { margin-left: auto; font-weight: 600; }
+  .fc-plot { position: relative; height: 190px; }
+  .fc-plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+  .fc-plot path { transition: d .6s cubic-bezier(.2,.8,.2,1); }
+  #fcPast { fill: none; stroke: var(--area); stroke-width: 2; }
+  #fcProj { fill: none; stroke: var(--area); stroke-width: 2; stroke-dasharray: 5 5; opacity: .75; }
+  .fc-dry { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--coral); pointer-events: none; }
+  .fc-dry span { position: absolute; right: 0; top: -18px; font-size: 11px; color: var(--coral-text); }
+  .fc-now { position: absolute; top: 0; bottom: 0; border-left: 1px solid var(--col-line); pointer-events: none; }
+  .fc-resets i { position: absolute; bottom: 0; width: 1px; height: 8px; background: var(--dash-2); }
+  .fc-tag { position: absolute; transform: translate(8px, -50%); pointer-events: none; }
+  .fc-tag.flip { transform: translate(calc(-100% - 8px), -50%); }
+  .fc-range { position: relative; height: 18px; font-size: 12px; color: var(--muted); }
+  .fc-range span { position: absolute; top: 0; white-space: nowrap; }
+  #fcStart { left: 0; } #fcEnd { right: 0; } #fcNowLbl { transform: translateX(-50%); }
+  .fc-card { font-size: 12px; color: var(--muted); margin-top: -6px; }
+  .fc-dlg { max-width: 640px; }
+  .fc-body { display: flex; flex-direction: column; gap: 18px; }
+  .fc-sec { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .fc-sec-title { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .fc-lead { font-size: 15px; color: var(--text); }
+  .fc-line { font-size: 13px; line-height: 1.5; color: var(--text-2); }
+  .fc-line.dim { color: var(--dim); } .fc-line.err { color: var(--coral-text); }
+  .fc-tbl { min-width: 0; font-size: 13px; }
+  .fc-tbl th, .fc-tbl td { padding: 8px 10px 8px 0; white-space: normal; }
+  .fc-tbl th:first-child, .fc-tbl td:first-child { padding-left: 0; overflow-wrap: anywhere; }
+  .fc-tbl th:last-child, .fc-tbl td:last-child { padding-right: 0; }
+  .fc-user { display: grid; grid-template-columns: minmax(0, 1fr) 90px 44px 44px 40px; gap: 10px; align-items: center; font-size: 13px; }
+  .fc-uname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fc-track { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+  .fc-track i { display: block; height: 100%; background: var(--area); }
+  .fc-heavy { font-size: 11px; color: var(--coral-text); }
+  .fc-explain { font-size: 14px; line-height: 1.6; color: var(--text); }
+  @media (max-width: 520px) { .fc-user { grid-template-columns: minmax(0, 1fr) 44px 44px 40px; } .fc-track { display: none; } }
 
   /* Cards */
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 14px; }
@@ -2095,7 +2075,6 @@ const PAGE = `<!doctype html>
     .nav a { padding: 0 14px; }
     .rt-row { grid-template-columns: 1fr; gap: 8px; }
     .rt-can { align-items: flex-start; text-align: left; }
-    .avg-pill { right: 8%; }
   }
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
@@ -2165,13 +2144,26 @@ const PAGE = `<!doctype html>
             <button id="probe" class="pill-btn" type="button"><span id="probeText">Probe quotas</span> <span class="glyph" aria-hidden="true">↻</span></button>
           </div>
         </div>
-        <div class="groups-wrap" id="clientChartWrap" style="display:none">
-          <div class="groups" id="clientChart">
-            <div class="avg-line" id="avgLine" style="display:none"></div>
-            <div class="avg-pill" id="avgPill" style="display:none">Average</div>
-            <div class="groups-empty" id="groupsEmpty"></div>${GROUP_SLOTS}
+        <div class="fc-wrap" id="forecastWrap">
+          <div class="fc-head">
+            <span class="fc-chip" id="fcChip" style="display:none"></span>
+            <span class="fc-cap" id="fcCaption"></span>
+            <button id="fcHelp" class="icon-btn sm" type="button" title="How this forecast is worked out" aria-label="Forecast breakdown" style="display:none">?</button>
           </div>
-          <div class="range"><span id="rangeStart">All time</span><span>now</span></div>
+          <div class="fc-plot" id="fcPlot">
+            <svg viewBox="0 0 400 190" preserveAspectRatio="none" aria-hidden="true">
+              <defs><linearGradient id="fcArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="ga"></stop><stop offset="1" class="gb"></stop></linearGradient></defs>
+              <path id="fcPastArea" fill="url(#fcArea)" d=""></path>
+              <path id="fcPast" vector-effect="non-scaling-stroke" d=""></path>
+              <path id="fcProj" vector-effect="non-scaling-stroke" d=""></path>
+            </svg>
+            <div class="fc-dry" id="fcDry" style="display:none"><span>dry</span></div>
+            <div class="fc-now" id="fcNow" style="display:none"></div>
+            <div class="fc-resets" id="fcResets" aria-hidden="true"></div>
+            <div class="tag fc-tag" id="fcTag" style="display:none"></div>
+            <div class="plot-empty" id="fcEmpty" style="display:flex">Loading forecast…</div>
+          </div>
+          <div class="fc-range"><span id="fcStart">−24h</span><span id="fcNowLbl">now</span><span id="fcEnd"></span></div>
         </div>
       </div>
     </section>
@@ -2419,6 +2411,16 @@ const PAGE = `<!doctype html>
     </section>
   </div>
 
+  <div id="fcWrap" class="scrim" style="display:none">
+    <section class="dialog fc-dlg" role="dialog" aria-modal="true" aria-labelledby="fcTitle">
+      <div class="dlg-head">
+        <div class="dlg-title" id="fcTitle">Weekly forecast</div>
+        <button id="fcClose" class="icon-btn sm" type="button" title="Close" aria-label="Close">×</button>
+      </div>
+      <div id="fcBody" class="fc-body"></div>
+    </section>
+  </div>
+
   <div id="settingsWrap" class="scrim" style="display:none">
     <section class="dialog set" id="settingsDialog" role="dialog" aria-modal="true" aria-labelledby="setName"></section>
   </div>
@@ -2491,6 +2493,18 @@ const PAGE = `<!doctype html>
   // once and now asks to be confirmed.
   var keyDialogOpen = false;
   var keyConfirm = false;
+  // The forecast (GET /teamclaude/forecast): the last one fetched, why the last
+  // fetch failed, whether one is in flight and when it was sent — it is asked
+  // for at most once a minute, since it moves with quota readings taken every
+  // 15 minutes, not with every status poll. And the ? dialog: whether it is
+  // open, and Explain's state ({ busy } while asking, then { text, at, cached }
+  // or { error }).
+  var lastForecast = null;
+  var forecastError = null;
+  var forecastInFlight = false;
+  var forecastAt = 0;
+  var forecastOpen = false;
+  var explainState = null;
   // The account whose settings dialog is open, by name, and what its rows were
   // last built from: the poll rebuilds the dialog only when that changes, so a
   // focused control is not pulled out from under the keyboard every 5s.
@@ -2844,6 +2858,10 @@ ${createHall3d.toString()}
     if (q.unified5h != null || q.unified7d != null) {
       meters.appendChild(quotaMeter('Session', q.unified5h, q.unified5hReset));
       meters.appendChild(quotaMeter('Weekly', q.unified7d, q.unified7dReset));
+      // Where the forecast has this account heading (forecastRow is by name).
+      cardForecastLines(forecastRow(a), isCur, Date.now(), fcClock, fcSpan).forEach(function (line) {
+        meters.appendChild(el('div', 'fc-card', line));
+      });
       // Model-scoped weekly buckets are learned from the usage endpoint rather
       // than declared, so hard-coding the two families that have dedicated
       // fields drew an incomplete picture the moment upstream metered a third.
@@ -3747,22 +3765,6 @@ ${createHall3d.toString()}
       userMetricButtons.push({ key: m.key, btn: btn });
     });
     markSelected(userMetricButtons, userMetric);
-    // The first column one solid block, the second a run of strokes shading
-    // darker, the third fainter strokes: the columns tell clients apart by
-    // their pattern as well as their place.
-    byId('grp0Bars').appendChild(el('i', 'solid'));
-    var i, bar;
-    for (i = 0; i < 18; i++) {
-      bar = el('i', 'thin');
-      bar.style.background = 'oklch(' + (0.62 - i * 0.012).toFixed(3) + ' ' + (0.2 - i * 0.004).toFixed(3) + ' 290)';
-      bar.style.animationDelay = (0.12 + i * 0.025).toFixed(3) + 's';
-      byId('grp1Bars').appendChild(bar);
-    }
-    for (i = 0; i < 6; i++) {
-      bar = el('i', 'thin dark');
-      bar.style.animationDelay = (0.24 + i * 0.025).toFixed(3) + 's';
-      byId('grp2Bars').appendChild(bar);
-    }
   }
 
   function markSelected(buttons, key) {
@@ -3789,15 +3791,6 @@ ${createHall3d.toString()}
   function viewLabel() {
     var view = USAGE_VIEWS.filter(function (v) { return v.key === usageView; })[0];
     return view ? view.label : '';
-  }
-
-  // Where the overview's span starts, under its columns.
-  function rangeStartText() {
-    if (usageView === 'total') return 'All time';
-    if (usageView === 'month') return 'The 1st';
-    var n = parseInt(usageView, 10);
-    var unit = usageView.slice(-1) === 'd' ? ' day' : ' hour';
-    return n + unit + (n === 1 ? '' : 's') + ' ago';
   }
 
   // The overview's big figure: every client key's traffic on the shown window
@@ -3900,60 +3893,176 @@ ${createHall3d.toString()}
     d.style.display = '';
   }
 
-  // The overview's columns: the two busiest clients and everyone else, each
-  // figure standing as high as its share against the tallest, read against a
-  // dashed line at the average client.
-  function renderGroups(s) {
-    var wrap = byId('clientChartWrap');
-    if (!hasClients(s)) { wrap.style.display = 'none'; return; }
-    wrap.style.display = '';
-    byId('rangeStart').textContent = rangeStartText();
-    var ranking = clientRanking(s.clients, usageView, chartMetric);
-    var g = clientGroups(ranking);
-    var usageOf = {};
-    ranking.forEach(function (r) { usageOf[r.name] = r.usage; });
-    var groupSides = function (members) {
-      if (chartMetric === 'requests') return '';
-      var sum = { input: 0, cache: 0, output: 0 };
-      members.forEach(function (name) {
-        var sd = usageTokenSplit(usageOf[name]);
-        sum.input += sd.input;
-        sum.cache += sd.cache;
-        sum.output += sd.output;
+  // ── Forecast ─────────────────────────────────────────────────────────────
+
+  function fcClock(t) { return fmtClock(t); }
+  function fcSpan(ms) { return fmtIn(ms / 1000); }
+
+  function pollForecast() {
+    if (forecastInFlight || Date.now() - forecastAt < 60000) return;
+    forecastInFlight = true;
+    forecastAt = Date.now();
+    fetch('/teamclaude/forecast', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        if (!res.ok) throw new Error('status ' + res.status);
+        return res.json();
+      })
+      .then(function (json) { lastForecast = json; forecastError = null; })
+      .catch(function (e) { forecastError = e.message; })
+      .then(function () {
+        forecastInFlight = false;
+        // The account cards carry forecast lines too, so the whole page is
+        // drawn again from the last status rather than only the chart.
+        if (lastStatus) render(lastStatus);
+        else renderForecast();
       });
-      return ' (' + sidesText(sum) + ')';
+  }
+
+  function forecastRow(a) {
+    var rows = lastForecast && lastForecast.accounts ? lastForecast.accounts : [];
+    return rows.filter(function (r) { return r.name === a.name; })[0] || null;
+  }
+
+  // The hero's right-hand side: the verdict chip, the chart and its one label.
+  function renderForecast() {
+    var f = lastForecast;
+    byId('forecastWrap').style.display = '';
+    var chip = verdictChip(f);
+    var chipEl = byId('fcChip');
+    chipEl.textContent = chip ? chip.text : '';
+    chipEl.className = 'fc-chip' + (chip && chip.tone ? ' ' + chip.tone : '');
+    chipEl.style.display = chip ? '' : 'none';
+    byId('fcCaption').textContent = forecastCaption(f);
+    byId('fcHelp').style.display = f && f.verdict ? '' : 'none';
+    var g = f && f.verdict ? forecastGeometry(f) : null;
+    var empty = byId('fcEmpty');
+    empty.textContent = g ? '' : forecastEmptyText(f, forecastError);
+    empty.style.display = g ? 'none' : 'flex';
+    byId('fcPast').setAttribute('d', g ? g.past : '');
+    byId('fcPastArea').setAttribute('d', g ? g.pastArea : '');
+    byId('fcProj').setAttribute('d', g ? g.projected : '');
+    var dry = byId('fcDry');
+    if (g && g.dryPct != null) { dry.style.top = g.dryPct + '%'; dry.style.display = ''; } else dry.style.display = 'none';
+    var nowEl = byId('fcNow');
+    if (g) { nowEl.style.left = g.nowPct + '%'; nowEl.style.display = ''; } else nowEl.style.display = 'none';
+    var resets = byId('fcResets');
+    resets.textContent = '';
+    if (g) g.resets.forEach(function (x) { var tick = el('i'); tick.style.left = x + '%'; resets.appendChild(tick); });
+    var tag = byId('fcTag');
+    var text = g ? forecastTag(f, fcClock, fcSpan) : '';
+    if (text) {
+      var left = g.tagPct ? g.tagPct.left : 100;
+      tag.textContent = text;
+      tag.style.left = left + '%';
+      tag.style.top = (g.tagPct ? g.tagPct.top : 12) + '%';
+      tag.className = 'tag fc-tag' + (left > 60 ? ' flip' : '');
+      tag.style.display = '';
+    } else tag.style.display = 'none';
+    byId('fcNowLbl').style.left = g ? g.nowPct + '%' : '0';
+    byId('fcNowLbl').style.display = g ? '' : 'none';
+    byId('fcEnd').textContent = g ? fcClock(g.end) : '';
+    if (forecastOpen) buildForecastPopup();
+  }
+
+  function openForecast() {
+    if (!lastForecast || !lastForecast.verdict) return;
+    forecastOpen = true;
+    buildForecastPopup();
+    byId('fcWrap').style.display = '';
+  }
+
+  function closeForecast() {
+    forecastOpen = false;
+    byId('fcWrap').style.display = 'none';
+  }
+
+  // The ? dialog, laid out from forecastPopup's text.
+  function buildForecastPopup() {
+    var p = forecastPopup(lastForecast, fcClock, fcSpan);
+    var body = byId('fcBody');
+    body.textContent = '';
+    if (!p) { closeForecast(); return; }
+    var section = function (title) {
+      var s = el('div', 'fc-sec');
+      if (title) s.appendChild(el('div', 'fc-sec-title', title));
+      body.appendChild(s);
+      return s;
     };
-    var empty = byId('groupsEmpty');
-    if (g.groups.length) empty.style.display = 'none';
-    else {
-      empty.textContent = usageView === 'total' ? 'No client-key traffic yet' : 'No client-key traffic in the ' + viewLabel().toLowerCase();
-      empty.style.display = 'flex';
+    var head = section(null);
+    p.verdict.forEach(function (line, i) { head.appendChild(el('p', i ? 'fc-line' : 'fc-lead', line)); });
+    var how = section('How this is worked out');
+    p.how.forEach(function (line) { how.appendChild(el('p', 'fc-line', line)); });
+    if (p.accounts.length || p.notForecast.length) {
+      var acc = section('Accounts');
+      var table = el('table', 'fc-tbl');
+      var hr = el('tr');
+      ['Account', 'Plan', 'Weekly', 'Resets', 'Outlook'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+      table.appendChild(hr);
+      p.accounts.forEach(function (r) {
+        var tr = el('tr');
+        [r.name, r.tier, r.weekly, r.resets, r.outlook].forEach(function (c) { tr.appendChild(el('td', '', c)); });
+        table.appendChild(tr);
+      });
+      var wrap = el('div', 'tbl-wrap');
+      wrap.appendChild(table);
+      acc.appendChild(wrap);
+      p.notForecast.forEach(function (line) { acc.appendChild(el('p', 'fc-line dim', line)); });
     }
-    var lift = function (x) { return Math.round(6 + (1 - x) * 90); };
-    for (var i = 0; i < 3; i++) {
-      var slot = byId('grp' + i), grp = g.groups[i];
-      if (!grp) { slot.style.display = 'none'; continue; }
-      slot.style.display = '';
-      slot.style.flexGrow = String(grp.grow);
-      slot.style.paddingTop = lift(grp.lift) + 'px';
-      slot.title = (grp.others ? grp.members.join(', ') : grp.name) + ' · ' + metricText(grp.value) + groupSides(grp.members) + ' · ' + fmtShare(grp.share);
-      byId('grp' + i + 'Val').textContent = metricText(grp.value);
-      byId('grp' + i + 'Pct').textContent = fmtShare(grp.share);
-      byId('grp' + i + 'Name').textContent = grp.others ? grp.members.length + ' others' : grp.name;
+    if (p.users.length) {
+      var us = section('Users · last 24h');
+      us.appendChild(el('p', 'fc-line dim', 'Each one\\'s share of the weekly quota spent, and that share against an even split.'));
+      p.users.forEach(function (u) {
+        var row = el('div', 'fc-user');
+        row.appendChild(el('span', 'fc-uname', u.name));
+        var track = el('span', 'fc-track');
+        var fill = el('i');
+        fill.style.width = Math.round(u.share * 100) + '%';
+        track.appendChild(fill);
+        row.appendChild(track);
+        row.appendChild(el('span', '', u.shareText));
+        row.appendChild(el('span', '', u.fairText));
+        row.appendChild(el('span', 'fc-heavy', u.heavy ? 'heavy' : ''));
+        us.appendChild(row);
+        if (u.without) us.appendChild(el('p', 'fc-line dim', u.without));
+      });
     }
-    var line = byId('avgLine'), pill = byId('avgPill');
-    if (g.clients > 1) {
-      // Through the middle of a figure standing at the average client.
-      var y = lift(g.averageLift) + 10;
-      line.style.top = y + 'px';
-      pill.style.top = y + 'px';
-      pill.title = 'Average per client: ' + metricText(g.average);
-      line.style.display = '';
-      pill.style.display = '';
-    } else {
-      line.style.display = 'none';
-      pill.style.display = 'none';
+    if (p.scoped.length) {
+      var sc = section('Model caps');
+      p.scoped.forEach(function (line) { sc.appendChild(el('p', 'fc-line', line)); });
     }
+    if (viewerCan(lastStatus && lastStatus.viewer, 'explain')) buildExplain(section('Explain'));
+  }
+
+  function buildExplain(sec) {
+    var st = explainState || {};
+    if (st.text) {
+      sec.appendChild(el('p', 'fc-explain', st.text));
+      sec.appendChild(el('p', 'fc-line dim', 'Claude Haiku · ' + fmtAgo(st.at) + (st.cached ? ' · cached' : '')));
+    }
+    if (st.error) sec.appendChild(el('p', 'fc-line err', st.error));
+    var fresh = !!st.text && Date.now() - st.at < 15 * 60000;
+    var btn = el('button', 'pill-btn md', st.busy ? 'Asking Claude…' : st.text ? 'Ask again' : 'Explain ✦');
+    btn.type = 'button';
+    btn.disabled = !!st.busy || fresh;
+    if (fresh) btn.title = 'An answer is kept for 15 minutes';
+    btn.addEventListener('click', askExplain);
+    sec.appendChild(btn);
+    if (!st.text && !st.busy) sec.appendChild(el('p', 'fc-line dim', 'Sends this forecast to Claude Haiku through the proxy. Each answer spends a little quota.'));
+  }
+
+  function askExplain() {
+    if (explainState && explainState.busy) return;
+    var prev = explainState || {};
+    explainState = { busy: true, text: prev.text, at: prev.at, cached: prev.cached };
+    buildForecastPopup();
+    var r = explainRequest(localStorage.getItem(KEY) || '');
+    fetch(r.url, r.init)
+      .then(function (res) {
+        return res.json().catch(function () { return null; }).then(function (body) { return { ok: res.ok, status: res.status, body: body }; });
+      })
+      .then(function (out) { explainState = explainOutcome(out); })
+      .catch(function (e) { explainState = { error: 'Cannot reach the proxy: ' + e.message }; })
+      .then(function () { if (forecastOpen) buildForecastPopup(); });
   }
 
   // ── Charts ───────────────────────────────────────────────────────────────
@@ -4709,7 +4818,7 @@ ${createHall3d.toString()}
       accountDisplayOrder(accounts).forEach(function (i, pos) { acc.appendChild(renderAccount(accounts[i], i, pos, s)); });
     }
     renderProblems(s);
-    renderGroups(s);
+    renderForecast();
     renderHistory();
     var hasRoutes = renderRoutes(s);
     var hasClientList = renderClients(s.clients);
@@ -4975,6 +5084,7 @@ ${createHall3d.toString()}
         // The charts' history is only worth asking for when there is a client
         // to chart; the Clients list is what says so.
         if (hasClients(s)) pollSeries();
+        pollForecast();
       })
       .catch(function (e) {
         var err = byId('err');
@@ -5133,12 +5243,16 @@ ${createHall3d.toString()}
   // A click on the dimmed backdrop closes a dialog; one inside it does not.
   byId('loginWrap').addEventListener('click', function (e) { if (e && e.target === this) closeLogin(); });
   byId('settingsWrap').addEventListener('click', function (e) { if (e && e.target === this) closeSettings(); });
+  byId('fcHelp').addEventListener('click', openForecast);
+  byId('fcClose').addEventListener('click', closeForecast);
+  byId('fcWrap').addEventListener('click', function (e) { if (e && e.target === this) closeForecast(); });
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
     if (settingsFor) closeSettings();
     else if (loginState) closeLogin();
     else if (userDialogOpen && !showingUserKey()) closeAddUser();
     else if (keyDialogOpen && !showingNewKey()) closeKey();
+    else if (forecastOpen) closeForecast();
   });
 
   ['fProject', 'fClient'].forEach(function (id) {

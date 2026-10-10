@@ -6,7 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, inlineScripts, THREE_BASE, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit,
-  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
+  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
   sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows, hallLayout,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
@@ -916,7 +916,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [hallwayRows, hallLayout, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest, forecastGeometry, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome]) {
+  for (const fn of [hallwayRows, hallLayout, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest, forecastGeometry, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -983,23 +983,26 @@ function bootPage({ storedKey = null, storedTheme = null, stored = [] } = {}) {
   const script = inlineScripts(html).at(-1);
   new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', script)(
     document, localStorage, fetch, () => 1, () => {});
-  // The chart's history is its own fetch, sent after a status that shows a
-  // client. `answer` resolves the oldest request that is NOT that one, so a
-  // test about the controls reads the same whether or not a chart is on the
-  // page; `answerSeries` resolves it.
+  // The chart's history and the forecast are fetches of their own, sent after
+  // a status. `answer` resolves the oldest request that is NEITHER, so a test
+  // about the controls reads the same whether or not a chart is on the page;
+  // `answerSeries`, `answerMonth` and `answerForecast` resolve them.
   const isSeries = r => r.url.startsWith('/teamclaude/usage/series');
   const isMonth = r => r.url === '/teamclaude/usage/series?span=month';
+  const isForecast = r => r.url === '/teamclaude/forecast';
+  const isAux = r => isSeries(r) || isForecast(r);
   const settle = async (index, status, body) => {
     assert.notEqual(index, -1, 'no such request pending');
     const [req] = requests.splice(index, 1);
     req.resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
     await new Promise(r => setImmediate(r));
   };
-  const answer = (status, body = {}) => settle(requests.findIndex(r => !isSeries(r)), status, body);
+  const answer = (status, body = {}) => settle(requests.findIndex(r => !isAux(r)), status, body);
+  const answerForecast = (body, status = 200) => settle(requests.findIndex(isForecast), status, body);
   const answerSeries = (body, status = 200) => settle(requests.findIndex(r => isSeries(r) && !isMonth(r)), status, body);
   const answerMonth = (body, status = 200) => settle(requests.findIndex(isMonth), status, body);
   const monthRequests = () => requests.filter(isMonth);
-  const pending = () => requests.filter(r => !isSeries(r));
+  const pending = () => requests.filter(r => !isAux(r));
   // Click the control carrying this label, whoever built it. A render replaces
   // a table by building new elements rather than mutating the old ones, so the
   // mark is what keeps `labelled` counting what is on the page now instead of
@@ -1031,7 +1034,9 @@ function bootPage({ storedKey = null, storedTheme = null, stored = [] } = {}) {
   const titled = title => built.slice(mark).filter(e => e.title === title).length;
   // A field the page filled, such as a revealed key, found by its value.
   const valued = value => built.slice(mark).filter(e => e.value === value).length;
-  return { byId, store, requests, pending, answer, answerSeries, answerMonth, monthRequests, rootAttrs, click, clickNth, clickTitled, titled, labelled, valued, keydown };
+  // The text of what the page built with this class, since the last click.
+  const classed = cls => built.slice(mark).filter(e => e.className === cls).map(e => e.textContent);
+  return { byId, store, requests, pending, answer, answerSeries, answerMonth, answerForecast, monthRequests, rootAttrs, click, clickNth, clickTitled, titled, labelled, valued, classed, keydown };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
@@ -1134,31 +1139,21 @@ test('Proxy status counts the accounts a request could go to, and names the bloc
   assert.equal(page.byId('statServing').title, 'Blocked: b (upstream 429 hold), c (disabled by operator)');
 });
 
-test('the overview draws a column per client and switches measure without polling', async () => {
+test('the overview shows every client\'s traffic and switches measure without polling', async () => {
   const page = bootPage();
   await page.answer(200, { accounts: [], clients: {
     alice: { requests: 3, inputTokens: 10, outputTokens: 90 },
     bob: { requests: 9, inputTokens: 5, outputTokens: 5 },
   } });
-  assert.equal(page.byId('clientChartWrap').style.display, '');
   // The busiest client leads, its figure and share on its own column.
-  assert.equal(page.byId('grp0Name').textContent, 'alice');
-  assert.equal(page.byId('grp0Val').textContent, '100 tok');
-  assert.equal(page.byId('grp0Pct').textContent, '91%');
-  assert.equal(page.byId('grp1Name').textContent, 'bob');
-  assert.equal(page.byId('grp2').style.display, 'none', 'two clients, two columns');
   // The big figure is every client's traffic on the window.
   assert.equal(page.byId('heroMain').textContent, '110');
   assert.equal(page.byId('heroLabel').textContent, 'Tokens used');
   assert.equal(page.byId('heroSplit').textContent, '15 in · 0 cache · 95 out', 'and under it, the two sides');
-  assert.ok(page.byId('grp0').title.includes('(10 in · 0 cache · 90 out)'), "a column's tooltip splits its figure too");
-  // Named by its column, its Clients row, and its Usage by user row and legend.
-  assert.equal(page.labelled('alice'), 4);
+  // Named by its Clients row, and its Usage by user row and legend.
+  assert.equal(page.labelled('alice'), 3);
   page.click('Requests');
   assert.equal(page.pending().length, 0, 'the measure re-renders the last status rather than fetching');
-  assert.equal(page.byId('grp0Name').textContent, 'bob');
-  assert.equal(page.byId('grp0Val').textContent, '9 req');
-  assert.equal(page.byId('grp0Pct').textContent, '75%');
   assert.equal(page.byId('heroMain').textContent, '12');
   assert.equal(page.byId('heroLabel').textContent, 'Requests served');
   assert.equal(page.byId('heroSplit').style.display, 'none', 'requests have no sides');
@@ -1629,12 +1624,6 @@ test('the shared key has no key of its own, so the avatar opens nothing', async 
   assert.notEqual(page.byId('keyWrap').style.display, '');
 });
 
-test('the Most used chart stays hidden until a client key has been used', async () => {
-  const page = bootPage();
-  await page.answer(200, { accounts: [] });
-  assert.equal(page.byId('clientChartWrap').style.display, 'none');
-});
-
 test('dashboard page is self-contained: no external resources', () => {
   const html = renderDashboardHtml();
   assert.match(html, /^<!doctype html>/);
@@ -1920,11 +1909,9 @@ test('selecting a window relabels every table it governs', async () => {
   assert.equal(page.labelled('Project · last 24h'), 1, 'the dimension table names the window too');
   assert.equal(page.labelled('Last used (all time)'), 1, 'and the one lifetime column says so');
   assert.equal(page.labelled('Last used'), 0);
-  assert.equal(page.byId('rangeStart').textContent, '24 hours ago', 'the overview names where its span starts');
 
   page.click('Total');
   assert.equal(page.byId('clientsHeading').textContent, 'Clients', 'and back again');
-  assert.equal(page.byId('rangeStart').textContent, 'All time');
 });
 
 // ── Usage over time ─────────────────────────────────────────
@@ -2046,38 +2033,6 @@ test('smoothPath passes through every point and never dips below the floor', () 
   assert.ok(ys.every(y => y <= 165), 'no control point below the baseline');
   assert.equal(smoothPath([]), '');
   assert.equal(smoothPath([[5, 5]]), 'M5,5');
-});
-
-test('clientGroups gives the two busiest a column each and folds the rest', () => {
-  const ranking = [
-    { name: 'a', value: 600 }, { name: 'b', value: 200 }, { name: 'c', value: 100 },
-    { name: 'd', value: 100 }, { name: 'idle', value: 0 },
-  ];
-  const g = clientGroups(ranking);
-  assert.deepEqual(g.groups.map(x => [x.name, x.value]), [['a', 600], ['b', 200], ['others', 200]]);
-  assert.deepEqual(g.groups[2].members, ['c', 'd']);
-  assert.equal(g.groups[2].others, true);
-  assert.equal(g.total, 1000);
-  assert.equal(g.groups[0].share, 0.6);
-  assert.equal(g.groups[0].lift, 1);
-  assert.equal(g.groups[1].lift, 200 / 600);
-  assert.ok(g.groups[0].grow > g.groups[1].grow, 'a bigger share, a wider column');
-  // The idle client neither takes a column nor pulls the average down.
-  assert.equal(g.clients, 4);
-  assert.equal(g.average, 250);
-  assert.equal(g.averageLift, 250 / 600);
-});
-
-test('clientGroups never folds a single client', () => {
-  // Three clients are three columns: an "others" of one would only hide a name.
-  const three = clientGroups([{ name: 'a', value: 3 }, { name: 'b', value: 2 }, { name: 'c', value: 1 }]);
-  assert.deepEqual(three.groups.map(x => x.name), ['a', 'b', 'c']);
-  assert.ok(three.groups.every(x => !x.others));
-  const none = clientGroups([{ name: 'a', value: 0 }]);
-  assert.deepEqual(none.groups, []);
-  assert.equal(none.average, 0);
-  assert.equal(none.averageLift, 0);
-  assert.deepEqual(clientGroups(null).groups, []);
 });
 
 test('heatGrid lays clients against four-hour stretches of the day', () => {
@@ -2205,12 +2160,12 @@ test('userMix keeps a hostile model name as a plain row, and puts an unknown lev
 test('the chart helpers run inside the serialized bundle', () => {
   const script = inlineScripts(renderDashboardHtml()).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
-  const isolated = new Function(`${bundle}; return { clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, meterTone, userMix };`)();
+  const isolated = new Function(`${bundle}; return { forecastGeometry, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, meterTone, userMix };`)();
   assert.deepEqual(isolated.userMix(MIXED, '5h', 'tokens'), userMix(MIXED, '5h', 'tokens'));
   assert.deepEqual(isolated.seriesLines(SERIES, '5h', 'requests', ['alice']), seriesLines(SERIES, '5h', 'requests', ['alice']));
   assert.deepEqual(isolated.userLineNames([{ name: 'a' }]), ['a']);
   assert.deepEqual(isolated.heatGrid(SERIES, '24h', 'tokens'), heatGrid(SERIES, '24h', 'tokens'));
-  assert.deepEqual(isolated.clientGroups([{ name: 'a', value: 2 }]), clientGroups([{ name: 'a', value: 2 }]));
+  assert.deepEqual(isolated.forecastGeometry(FORECAST), forecastGeometry(FORECAST));
   assert.equal(isolated.smoothPath([[0, 1], [2, 3]], 5), smoothPath([[0, 1], [2, 3]], 5));
   assert.deepEqual(isolated.seriesTicks(24 * HOUR, END), seriesTicks(24 * HOUR, END));
   assert.deepEqual(isolated.userSlots(['b', 'a']), { a: 0, b: 1 });
@@ -2257,8 +2212,8 @@ test('Usage by user ranks every client and draws their lines in the same colours
     bob: { requests: 6, inputTokens: 10, outputTokens: 30 },
   } });
   assert.equal(page.byId('usersSec').style.display, '');
-  // alice's row, agreeing with her overview column while both are on Total.
-  assert.equal(page.labelled('170 tok'), 2);
+  // alice's row (the overview no longer has a column per client to agree with).
+  assert.equal(page.labelled('170 tok'), 1);
   assert.equal(page.labelled(' · 81%'), 1, 'and her share');
   assert.equal(page.labelled('150 in · 0 cache · 20 out'), 1, 'and the three sides of it');
   assert.equal(page.byId('userEmpty').textContent, 'Loading usage history…');
@@ -2393,7 +2348,6 @@ test('This month shows the month, and fetches its days only once it is chosen', 
   assert.equal(page.byId('heroMain').textContent, '530', "the figures are the month's window");
   assert.equal(page.byId('heroSplit').textContent, '50 in · 400 cache · 80 out', 'the month carries its cache too');
   assert.equal(page.byId('clientsHeading').textContent, 'Clients · this month');
-  assert.equal(page.byId('rangeStart').textContent, 'The 1st');
   assert.equal(page.byId('seriesEmpty').textContent, 'Loading usage history…', 'the chart waits for the days');
 
   await page.answerMonth(MONTH);
@@ -2424,7 +2378,6 @@ test('no client, no chart and no series fetch', async () => {
   await page.answer(200, { accounts: [] });
   assert.equal(page.byId('seriesWrap').style.display, 'none');
   assert.equal(page.byId('heatWrap').style.display, 'none');
-  assert.equal(page.byId('clientChartWrap').style.display, 'none');
   assert.equal(page.byId('usersSec').style.display, 'none');
   assert.equal(page.requests.some(r => r.url === '/teamclaude/usage/series'), false);
 });
@@ -2516,4 +2469,78 @@ test('viewerCan offers Explain to the operator only', () => {
   assert.equal(viewerCan({ role: 'operator' }, 'explain'), true);
   assert.equal(viewerCan({ role: 'tenant' }, 'explain'), false);
   assert.equal(viewerCan({ role: 'readonly' }, 'explain'), false);
+});
+
+test('the hero asks for the forecast after the first status and draws it', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  const req = page.requests.find(r => r.url === '/teamclaude/forecast');
+  assert.ok(req, 'the forecast is fetched');
+  assert.equal(req.init.headers['x-api-key'], '', 'with the same key as the status poll');
+  assert.equal(page.byId('fcEmpty').textContent, 'Loading forecast…');
+  await page.answerForecast(FORECAST);
+  assert.equal(page.byId('forecastWrap').style.display, '');
+  assert.equal(page.byId('fcChip').textContent, 'Overusing 1.4×');
+  assert.equal(page.byId('fcChip').className, 'fc-chip bad');
+  assert.equal(page.byId('fcEmpty').style.display, 'none');
+  assert.ok(page.byId('fcTag').textContent.startsWith('Dry '));
+  assert.equal(page.byId('fcHelp').style.display, '');
+});
+
+test('the forecast says why it is empty', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  await page.answerForecast({ verdict: null, reason: 'no-quota', series: { past: [], projected: [] } });
+  assert.equal(page.byId('fcEmpty').textContent, 'No weekly quota seen yet — probe quotas');
+  assert.equal(page.byId('fcHelp').style.display, 'none', 'nothing to break down');
+
+  const failed = bootPage();
+  await failed.answer(200, { accounts: [] });
+  await failed.answerForecast({}, 500);
+  assert.equal(failed.byId('fcEmpty').textContent, 'Forecast unavailable: status 500');
+});
+
+test('the ? opens the breakdown, and Explain posts with the page key for an operator', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], viewer: { client: null, role: 'operator' } });
+  await page.answerForecast(FORECAST);
+  page.byId('fcHelp').fire('click');
+  assert.equal(page.byId('fcWrap').style.display, '');
+  assert.equal(page.labelled('How this is worked out'), 1);
+  assert.equal(page.labelled('a@x'), 1, 'the accounts table');
+  assert.equal(page.labelled('Without alice: no dry spell this week'), 1);
+  page.click('Explain ✦');
+  const req = page.pending().find(r => r.url === '/teamclaude/forecast/explain');
+  assert.ok(req, 'Explain posts');
+  assert.equal(req.init.method, 'POST');
+  assert.equal(page.labelled('Asking Claude…'), 1);
+  await page.answer(200, { ok: true, text: 'The pool runs out on Thursday.', generatedAt: Date.now(), cached: false });
+  assert.equal(page.labelled('The pool runs out on Thursday.'), 1);
+  page.keydown('Escape');
+  assert.equal(page.byId('fcWrap').style.display, 'none');
+});
+
+test('a tenant sees the breakdown but no Explain', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], viewer: { client: 'alice', role: 'tenant' } });
+  await page.answerForecast(FORECAST);
+  page.byId('fcHelp').fire('click');
+  assert.equal(page.labelled('How this is worked out'), 1);
+  assert.equal(page.labelled('Explain ✦'), 0);
+});
+
+test('an account card says when it drains once the forecast lands', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a@x', provider: 'anthropic', quota: { unified5h: 0.1, unified7d: 0.71, unified7dReset: FC_NOW + 71 * FC_HOUR } }] });
+  await page.answerForecast({ ...FORECAST, generatedAt: Date.now(), accounts: [{ ...FORECAST.accounts[0], drainsAt: Date.now() + 31 * FC_HOUR, reset: Date.now() + 71 * FC_HOUR }] });
+  const lines = page.classed('fc-card');
+  assert.equal(lines.length, 1, String(lines));
+  assert.ok(lines[0].startsWith('↳ drains ~'), lines[0]);
+});
+
+test('overusing without a dry spell gets no "0% unused" label, and the popup says what happens instead', () => {
+  const tight = { ...FORECAST, poolDryAt: null, dryForMs: null, unusedPct: 0.3 };
+  assert.equal(forecastTag(tight, tClock, tSpan), '', 'nothing worth labelling: the chip already says overusing');
+  assert.equal(forecastPopup(tight, tClock, tSpan).verdict[1], 'At this rate the pool does not run dry, but next to nothing is left at the resets.');
+  assert.equal(forecastTag({ ...tight, verdict: 'on-pace', unusedPct: 12 }, tClock, tSpan), '~12% resets unused');
 });

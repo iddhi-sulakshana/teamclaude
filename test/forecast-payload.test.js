@@ -128,3 +128,13 @@ test('a weekly reading without a reset still forecasts', () => {
   assert.equal(f.reason, null);
   assert.ok(f.series.projected.every(([t, v]) => Number.isFinite(t) && Number.isFinite(v)));
 });
+
+test('overusing with no dry spell carries no counterfactual: there is no dry time to move', () => {
+  const p = pro('p', { unified7dReset: NOW + 10 * HOUR });
+  const attribution = new ClientQuotaTracker({ now: () => NOW });
+  attribution.record('alice', 0.1);
+  const f = build([p], { history: risingDay(p), attribution });
+  assert.equal(f.verdict, 'overusing', 'pace 1.68');
+  assert.equal(f.poolDryAt, null, 'the reset comes first');
+  assert.equal('withoutThemDryAt' in f.users[0], false);
+});
