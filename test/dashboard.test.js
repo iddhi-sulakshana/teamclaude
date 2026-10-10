@@ -11,7 +11,7 @@ import {
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
-  forecastGeometry, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome,
+  forecastGeometry, forecastTicks, forecastHover, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome,
 } from '../src/dashboard.js';
 import { USAGE_WINDOW_LABELS } from '../src/client-usage.js';
 import { normalizeSpend } from '../src/oauth.js';
@@ -2160,12 +2160,14 @@ test('userMix keeps a hostile model name as a plain row, and puts an unknown lev
 test('the chart helpers run inside the serialized bundle', () => {
   const script = inlineScripts(renderDashboardHtml()).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
-  const isolated = new Function(`${bundle}; return { forecastGeometry, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, meterTone, userMix };`)();
+  const isolated = new Function(`${bundle}; return { forecastGeometry, forecastTicks, forecastHover, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, meterTone, userMix };`)();
   assert.deepEqual(isolated.userMix(MIXED, '5h', 'tokens'), userMix(MIXED, '5h', 'tokens'));
   assert.deepEqual(isolated.seriesLines(SERIES, '5h', 'requests', ['alice']), seriesLines(SERIES, '5h', 'requests', ['alice']));
   assert.deepEqual(isolated.userLineNames([{ name: 'a' }]), ['a']);
   assert.deepEqual(isolated.heatGrid(SERIES, '24h', 'tokens'), heatGrid(SERIES, '24h', 'tokens'));
   assert.deepEqual(isolated.forecastGeometry(FORECAST), forecastGeometry(FORECAST));
+  assert.deepEqual(isolated.forecastTicks(FC_NOW, FC_NOW + 72 * FC_HOUR), forecastTicks(FC_NOW, FC_NOW + 72 * FC_HOUR));
+  assert.deepEqual(isolated.forecastHover(FORECAST, forecastGeometry(FORECAST), 70, 1, tClock), forecastHover(FORECAST, forecastGeometry(FORECAST), 70, 1, tClock));
   assert.equal(isolated.smoothPath([[0, 1], [2, 3]], 5), smoothPath([[0, 1], [2, 3]], 5));
   assert.deepEqual(isolated.seriesTicks(24 * HOUR, END), seriesTicks(24 * HOUR, END));
   assert.deepEqual(isolated.userSlots(['b', 'a']), { a: 0, b: 1 });
@@ -2398,13 +2400,78 @@ test('forecastGeometry lays both curves on one time axis', () => {
   assert.equal(g.end, FC_NOW + 72 * FC_HOUR);
   assert.equal(g.nowPct, 25, 'a day of past in a four-day chart');
   assert.equal(g.past, 'M0,131 L100,97');
-  assert.equal(g.pastArea, 'M0,131 L100,97 L100,190 L0,190 Z');
+  assert.equal(g.pastArea, 'M0,131 L100,97 L100,182 L0,182 Z', 'the area stops at the 0% line');
   assert.ok(g.projected.startsWith('M100,97 '));
-  assert.deepEqual(g.resets, [45.83], 'the vertical drop at hour 20');
+  assert.deepEqual(g.resets, [{ at: FC_NOW + 20 * FC_HOUR, pct: 45.83, from: 0.8, to: 0.65, names: ['b@x'] }], 'the vertical drop at hour 20, and whose reset it is');
+  assert.deepEqual(g.grid, [
+    { value: 0, pct: 95.79 }, { value: 0.25, pct: 73.42 }, { value: 0.5, pct: 51.05 }, { value: 0.75, pct: 28.68 }, { value: 1, pct: 6.32 },
+  ], 'the gridlines, 0% to 100%');
   assert.equal(g.dryPct, 8.11);
   assert.deepEqual(g.tagPct, { left: 67.71, top: 8.11 });
   assert.equal(forecastGeometry({ ...FORECAST, series: { past: [], projected: [] } }), null);
   assert.equal(forecastGeometry(null), null);
+});
+
+test('forecastGeometry names every account that refills at a drop, and none from earlier steps', () => {
+  const t = h => FC_NOW + h * FC_HOUR;
+  const f = {
+    ...FORECAST,
+    accounts: [
+      { name: 'early', reset: t(1) },
+      { name: 'a', reset: t(9.9) },
+      { name: 'b', reset: t(10) },
+      { name: 'never', reset: null },
+    ],
+    series: { past: [], projected: [[t(0), 0.2], [t(1), 0.3], [t(1), 0.25], [t(9.75), 0.5], [t(10), 0.55], [t(10), 0.1], [t(72), 0.4]] },
+  };
+  assert.deepEqual(forecastGeometry(f).resets.map(r => r.names), [['early'], ['a', 'b']]);
+});
+
+// Local midnights, so the expectations hold in whatever zone the tests run.
+const localAt = (d, h = 0, m = 0) => new Date(2026, 9, d, h, m).getTime();
+
+test('forecastTicks marks each midnight across a week-long forecast', () => {
+  const start = localAt(9, 15, 30), end = localAt(17, 3, 29);
+  const ticks = forecastTicks(start, end);
+  assert.deepEqual(ticks.map(x => x.at), [10, 11, 12, 13, 14, 15, 16, 17].map(d => localAt(d)));
+  assert.ok(ticks.every(x => x.day), 'every tick starts a day');
+  assert.equal(ticks[0].pct, Math.round((localAt(10) - start) / (end - start) * 10000) / 100);
+});
+
+test('forecastTicks steps by hours when every account refills within a day or so', () => {
+  const start = localAt(9, 15, 30), end = localAt(10, 23, 0);
+  const ticks = forecastTicks(start, end);
+  assert.deepEqual(ticks.map(x => x.at), [localAt(9, 18), localAt(10, 0), localAt(10, 6), localAt(10, 12), localAt(10, 18)]);
+  assert.deepEqual(ticks.map(x => x.day), [false, true, false, false, false]);
+  assert.deepEqual(forecastTicks(5, 5), [], 'no span, no ticks');
+});
+
+test('forecastHover reads the measured line, the projection and the dry spell', () => {
+  const g = forecastGeometry(FORECAST);
+  // 12.5% across a 96h chart is 12h into the day of history: halfway from 30% to 50%.
+  assert.deepEqual(forecastHover(FORECAST, g, 12.5, 1, tClock), { left: 12.5, top: forecastGeometry({ ...FORECAST, threshold: 0.4 }).dryPct, title: 'T+-12h', text: '40% used' });
+  // 37.5% is 12h ahead: 30% of the way from 50% to the 80% before the reset.
+  const ahead = forecastHover(FORECAST, g, 37.5, 1, tClock);
+  assert.equal(ahead.title, 'T+12h');
+  assert.equal(ahead.text, '68% used · projected');
+  // The pool is dry wherever the curve sits on the dry line — every account at
+  // its threshold — which a second dry spell later in the week is too.
+  assert.equal(forecastHover(FORECAST, g, 100, 1, tClock).text, '98% used · projected · pool dry');
+  assert.equal(forecastHover(FORECAST, g, 80, 1, tClock).text, '86% used · projected', 'under the dry line there is room');
+});
+
+test('forecastHover snaps to a reset near the pointer and names it', () => {
+  const g = forecastGeometry(FORECAST);
+  assert.deepEqual(forecastHover(FORECAST, g, 45, 1, tClock), {
+    left: 45.83, top: forecastGeometry({ ...FORECAST, threshold: 0.65 }).dryPct, title: 'T+20h', text: 'b@x resets · 80% → 65%',
+  });
+  assert.equal(forecastHover(FORECAST, g, 43, 1, tClock).text.endsWith('projected'), true, 'out of reach, it is a point on the line');
+});
+
+test('forecastHover says where there is no history yet', () => {
+  const thin = { ...FORECAST, series: { ...FORECAST.series, past: [[FC_NOW - 3 * FC_HOUR, 0.4], [FC_NOW, 0.5]] } };
+  assert.deepEqual(forecastHover(thin, forecastGeometry(thin), 5, 1, tClock), { left: 5, top: null, title: 'T+-19h', text: 'No samples yet' });
+  assert.equal(forecastHover(null, null, 5, 1, tClock), null);
 });
 
 test('verdictChip names the verdict and its pace', () => {
@@ -2485,6 +2552,10 @@ test('the hero asks for the forecast after the first status and draws it', async
   assert.equal(page.byId('fcEmpty').style.display, 'none');
   assert.ok(page.byId('fcTag').textContent.startsWith('Dry '));
   assert.equal(page.byId('fcHelp').style.display, '');
+  for (const label of ['0%', '25%', '50%', '75%', '100%']) assert.equal(page.labelled(label), 1, `the ${label} gridline is labelled`);
+  assert.equal(page.byId('fcDryLbl').textContent, 'dry · 98%', 'the dry line says where it is');
+  assert.equal(page.byId('fcLegend').style.display, '');
+  assert.ok(page.byId('fcHit').listens('pointermove'), 'the plot answers a hover');
 });
 
 test('the forecast says why it is empty', async () => {

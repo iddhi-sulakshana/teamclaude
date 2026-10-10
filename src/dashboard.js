@@ -497,9 +497,12 @@ export function smoothPath(pts, floor) {
 // refilled once, on one linear time axis across the chart's 400×190 box — used
 // fraction 0 at the bottom (y 182), 1 at the top (y 12). Straight segments, not
 // smoothPath: a reset is a vertical drop, and a curve would round it off.
+// Each drop carries the accounts that refill there: those whose reset falls
+// after the step before it, as the simulation refills at the first step on or
+// past a reset.
 /**
  * @param {any} f  the forecast payload
- * @returns {null|{ start: number, end: number, now: number, past: string, pastArea: string, projected: string, nowPct: number, dryPct: number|null, resets: number[], tagPct: { left: number, top: number }|null }}
+ * @returns {null|{ start: number, end: number, now: number, past: string, pastArea: string, projected: string, nowPct: number, dryPct: number|null, grid: Array<{ value: number, pct: number }>, resets: Array<{ at: number, pct: number, from: number, to: number, names: string[] }>, tagPct: { left: number, top: number }|null }}
  */
 export function forecastGeometry(f) {
   if (!f || !f.series) return null;
@@ -519,10 +522,15 @@ export function forecastGeometry(f) {
     return pts.map(function (p, i) { return (i ? 'L' : 'M') + r(X(p[0])) + ',' + r(Y(p[1])); }).join(' ');
   };
   var pastD = line(past);
-  /** @type {number[]} */
+  /** @type {Array<{ at: number, pct: number, from: number, to: number, names: string[] }>} */
   var resets = [];
   for (var i = 1; i < proj.length; i++) {
-    if (proj[i][0] === proj[i - 1][0] && proj[i][1] < proj[i - 1][1]) resets.push(r(X(proj[i][0]) / 4));
+    if (proj[i][0] !== proj[i - 1][0] || !(proj[i][1] < proj[i - 1][1])) continue;
+    var at = proj[i][0], after = i > 1 ? proj[i - 2][0] : -Infinity;
+    var names = (f.accounts || [])
+      .filter(function (/** @type {any} */ a) { return a.reset != null && a.reset > after && a.reset <= at; })
+      .map(function (/** @type {any} */ a) { return String(a.name); });
+    resets.push({ at: at, pct: r(X(at) / 4), from: proj[i - 1][1], to: proj[i][1], names: names });
   }
   var dryPct = f.threshold != null ? r(Y(f.threshold) / 190 * 100) : null;
   return {
@@ -530,13 +538,96 @@ export function forecastGeometry(f) {
     end: end,
     now: now,
     past: pastD,
-    pastArea: past.length > 1 ? pastD + ' L' + r(X(past[past.length - 1][0])) + ',190 L' + r(X(past[0][0])) + ',190 Z' : '',
+    pastArea: past.length > 1 ? pastD + ' L' + r(X(past[past.length - 1][0])) + ',182 L' + r(X(past[0][0])) + ',182 Z' : '',
     projected: line(proj),
     nowPct: r(X(now) / 4),
     dryPct: dryPct,
+    grid: [0, 0.25, 0.5, 0.75, 1].map(function (v) { return { value: v, pct: r(Y(v) / 190 * 100) }; }),
     resets: resets,
     tagPct: f.poolDryAt != null ? { left: r(X(f.poolDryAt) / 4), top: dryPct != null ? dryPct : 0 } : null,
   };
+}
+
+// The forecast's time axis: every local midnight across a forecast that runs
+// for days, and every few hours across one that ends within a day or so — the
+// smallest of 1, 2, 3, 6 and 12 hours that keeps it to eight ticks. `day`
+// marks a midnight, which the page labels with the date rather than the hour.
+/**
+ * @param {number} start
+ * @param {number} end
+ * @returns {Array<{ at: number, pct: number, day: boolean }>}
+ */
+export function forecastTicks(start, end) {
+  if (!(end > start)) return [];
+  var hours = (end - start) / 3600000;
+  var step = [1, 2, 3, 6, 12].filter(function (h) { return hours / h <= 8; })[0] || 24;
+  var d = new Date(start);
+  d.setMinutes(0, 0, 0);
+  d.setHours(Math.ceil(d.getHours() / step) * step);
+  var out = [];
+  // setHours, not adding milliseconds: a tick stays on the clock's hour across
+  // a daylight-saving change.
+  for (; d.getTime() <= end; d.setHours(d.getHours() + step)) {
+    var t = d.getTime();
+    if (t >= start) out.push({ at: t, pct: Math.round((t - start) / (end - start) * 10000) / 100, day: d.getHours() === 0 });
+  }
+  return out;
+}
+
+// What the forecast chart says under the pointer, `pct` of the way across it:
+// the instant and the fleet's used fraction there — measured or projected, and
+// whether the pool is dry then — or, within `near` (also %) of a reset, which
+// accounts refill there and how far the fleet drops. `top` is where the line
+// is, as % down the plot; null before the history starts.
+/**
+ * @param {any} f
+ * @param {any} g  forecastGeometry(f)
+ * @param {number} pct
+ * @param {number} near
+ * @param {(t: number) => string} when
+ * @returns {null|{ left: number, top: number|null, title: string, text: string }}
+ */
+export function forecastHover(f, g, pct, near, when) {
+  if (!f || !g) return null;
+  var r = function (/** @type {number} */ v) { return Math.round(v * 100) / 100; };
+  var top = function (/** @type {number} */ v) { return r((182 - Math.max(0, Math.min(1, v)) * 170) / 190 * 100); };
+  var share = function (/** @type {number} */ v) { return Math.round(v * 100) + '%'; };
+  var x = Math.max(0, Math.min(100, pct));
+  /** @type {any} */
+  var hit = null;
+  g.resets.forEach(function (/** @type {any} */ z) {
+    if (Math.abs(z.pct - x) <= near && (!hit || Math.abs(z.pct - x) < Math.abs(hit.pct - x))) hit = z;
+  });
+  if (hit) {
+    var who = hit.names.length ? hit.names.join(', ') + (hit.names.length > 1 ? ' reset' : ' resets') : 'An account resets';
+    return { left: hit.pct, top: top(hit.to), title: when(hit.at), text: who + ' · ' + share(hit.from) + ' → ' + share(hit.to) };
+  }
+  var t = g.start + x / 100 * (g.end - g.start);
+  // The last sample can be a few minutes old and the projection starts now:
+  // one list bridges the two.
+  /** @type {Array<[number, number]>} */
+  var pts = (f.series.past || []).concat(f.series.projected || []);
+  /** @type {number|null} */
+  var v = null;
+  if (pts.length && t >= pts[0][0] && t <= pts[pts.length - 1][0]) {
+    // The last segment starting at or before t, so a drop reads after it.
+    for (var i = pts.length - 1; i > 0; i--) {
+      var a = pts[i - 1], b = pts[i];
+      if (a[0] > t) continue;
+      v = b[0] === a[0] ? b[1] : a[1] + (b[1] - a[1]) * (t - a[0]) / (b[0] - a[0]);
+      break;
+    }
+    if (v == null) v = pts[0][1];
+  }
+  if (v == null) return { left: r(x), top: null, title: when(t), text: 'No samples yet' };
+  var text = share(v) + ' used';
+  if (t > g.now) {
+    text += ' · projected';
+    // On the dry line every account is at its threshold: poolDryAt is only
+    // the first such spell, and the week can hold another.
+    if (f.threshold != null && v >= f.threshold - 1e-4) text += ' · pool dry';
+  }
+  return { left: r(x), top: top(v), title: when(t), text: text };
 }
 
 // The forecast's verdict as the chip above the chart: coral when the fleet is
@@ -1408,7 +1499,7 @@ const SHARED_HELPERS = [
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
   formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
-  forecastGeometry, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome,
+  forecastGeometry, forecastTicks, forecastHover, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1667,20 +1758,44 @@ const PAGE = `<!doctype html>
   .fc-chip.warn { color: var(--amber); }
   .fc-cap { flex: 1; min-width: 0; font-size: 12px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .fc-head .icon-btn { margin-left: auto; font-weight: 600; }
+  /* The plot with a percent axis on its left and a time axis under it. The
+     gridlines and labels are placed in % of the plot, as the curves are. */
+  .fc-chart { display: grid; grid-template-columns: 30px minmax(0, 1fr); column-gap: 8px; row-gap: 6px; }
+  .fc-yax { position: relative; }
+  .fc-yax span { position: absolute; right: 0; transform: translateY(-50%); font-size: 11px; line-height: 1; color: var(--muted); }
   .fc-plot { position: relative; height: 190px; }
   .fc-plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
   .fc-plot path { transition: d .6s cubic-bezier(.2,.8,.2,1); }
+  .fc-grid i { position: absolute; left: 0; right: 0; border-top: 1px solid var(--line); }
+  .fc-grid i.edge { border-top-color: var(--col-line); }
+  /* A time gridline runs from the 100% line (6.32%) down to the 0% one. */
+  .fc-grid b { position: absolute; top: 6.32%; bottom: 4.21%; border-left: 1px solid var(--line); }
   #fcPast { fill: none; stroke: var(--area); stroke-width: 2; }
   #fcProj { fill: none; stroke: var(--area); stroke-width: 2; stroke-dasharray: 5 5; opacity: .75; }
   .fc-dry { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--coral); pointer-events: none; }
-  .fc-dry span { position: absolute; right: 0; top: -18px; font-size: 11px; color: var(--coral-text); }
+  .fc-dry span { position: absolute; right: 0; top: -17px; padding-left: 6px; background: var(--bg); font-size: 11px; line-height: 16px; color: var(--coral-text); white-space: nowrap; }
   .fc-now { position: absolute; top: 0; bottom: 0; border-left: 1px solid var(--col-line); pointer-events: none; }
-  .fc-resets i { position: absolute; bottom: 0; width: 1px; height: 8px; background: var(--dash-2); }
+  .fc-resets i, .fc-key.reset { position: absolute; bottom: 0; width: 9px; height: 6px; margin-left: -4.5px; background: var(--muted); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
   .fc-tag { position: absolute; transform: translate(8px, -50%); pointer-events: none; }
   .fc-tag.flip { transform: translate(calc(-100% - 8px), -50%); }
-  .fc-range { position: relative; height: 18px; font-size: 12px; color: var(--muted); }
-  .fc-range span { position: absolute; top: 0; white-space: nowrap; }
-  #fcStart { left: 0; } #fcEnd { right: 0; } #fcNowLbl { transform: translateX(-50%); }
+  .fc-tag.under { transform: translate(calc(-100% - 4px), 8px); }
+  .fc-cross { position: absolute; top: 0; bottom: 0; border-left: 1px solid var(--dash-2); pointer-events: none; }
+  .fc-cross i { position: absolute; left: -5px; width: 9px; height: 9px; margin-top: -4.5px; border-radius: 50%; background: var(--area); box-shadow: 0 0 0 2px var(--bg); }
+  .fc-tip { --tx: 10px; --ty: 10px; position: absolute; z-index: 2; transform: translate(var(--tx), var(--ty)); max-width: 240px; padding: 6px 10px; border-radius: 10px; background: var(--raised); box-shadow: 0 6px 20px rgba(0,0,0,.25); display: flex; flex-direction: column; gap: 1px; font-size: 12px; line-height: 1.35; pointer-events: none; }
+  .fc-tip.left { --tx: calc(-100% - 10px); }
+  .fc-tip.up { --ty: calc(-100% - 10px); }
+  .fc-tip b { font-weight: 500; color: var(--text); white-space: nowrap; }
+  .fc-tip span { color: var(--muted); overflow-wrap: anywhere; }
+  .fc-hit { position: absolute; inset: 0; cursor: crosshair; }
+  .fc-axis { grid-column: 2; position: relative; height: 16px; font-size: 11px; line-height: 16px; color: var(--muted); }
+  .fc-axis span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+  .fc-axis span.now { color: var(--text); font-weight: 500; }
+  /* A day's label starts at its midnight, heading the day rather than the line. */
+  .fc-axis span.day { transform: translateX(4px); }
+  .fc-legend { padding-left: 38px; }
+  .fc-key { position: relative; width: 16px; height: 0; border-top: 2px solid var(--area); flex: none; display: inline-block; }
+  .fc-key.proj { border-top-style: dashed; opacity: .75; }
+  .fc-key.reset { position: relative; bottom: auto; margin-left: 0; border: none; }
   .fc-card { font-size: 12px; color: var(--muted); margin-top: -6px; }
   .fc-dlg { max-width: 640px; }
   .fc-body { display: flex; flex-direction: column; gap: 18px; }
@@ -2150,20 +2265,32 @@ const PAGE = `<!doctype html>
             <span class="fc-cap" id="fcCaption"></span>
             <button id="fcHelp" class="icon-btn sm" type="button" title="How this forecast is worked out" aria-label="Forecast breakdown" style="display:none">?</button>
           </div>
-          <div class="fc-plot" id="fcPlot">
-            <svg viewBox="0 0 400 190" preserveAspectRatio="none" aria-hidden="true">
-              <defs><linearGradient id="fcArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="ga"></stop><stop offset="1" class="gb"></stop></linearGradient></defs>
-              <path id="fcPastArea" fill="url(#fcArea)" d=""></path>
-              <path id="fcPast" vector-effect="non-scaling-stroke" d=""></path>
-              <path id="fcProj" vector-effect="non-scaling-stroke" d=""></path>
-            </svg>
-            <div class="fc-dry" id="fcDry" style="display:none"><span>dry</span></div>
-            <div class="fc-now" id="fcNow" style="display:none"></div>
-            <div class="fc-resets" id="fcResets" aria-hidden="true"></div>
-            <div class="tag fc-tag" id="fcTag" style="display:none"></div>
-            <div class="plot-empty" id="fcEmpty" style="display:flex">Loading forecast…</div>
+          <div class="fc-chart">
+            <div class="fc-yax" id="fcYAxis" aria-hidden="true"></div>
+            <div class="fc-plot" id="fcPlot">
+              <div class="fc-grid" id="fcGrid" aria-hidden="true"></div>
+              <svg viewBox="0 0 400 190" preserveAspectRatio="none" aria-hidden="true">
+                <defs><linearGradient id="fcArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="ga"></stop><stop offset="1" class="gb"></stop></linearGradient></defs>
+                <path id="fcPastArea" fill="url(#fcArea)" d=""></path>
+                <path id="fcPast" vector-effect="non-scaling-stroke" d=""></path>
+                <path id="fcProj" vector-effect="non-scaling-stroke" d=""></path>
+              </svg>
+              <div class="fc-dry" id="fcDry" style="display:none"><span id="fcDryLbl">dry</span></div>
+              <div class="fc-now" id="fcNow" style="display:none"></div>
+              <div class="fc-resets" id="fcResets" aria-hidden="true"></div>
+              <div class="tag fc-tag" id="fcTag" style="display:none"></div>
+              <div class="fc-cross" id="fcCross" style="display:none" aria-hidden="true"><i id="fcDot"></i></div>
+              <div class="fc-tip" id="fcTip" style="display:none" aria-hidden="true"><b id="fcTipTitle"></b><span id="fcTipText"></span></div>
+              <div class="plot-empty" id="fcEmpty" style="display:flex">Loading forecast…</div>
+              <div class="fc-hit" id="fcHit"></div>
+            </div>
+            <div class="fc-axis" id="fcAxis" aria-hidden="true"></div>
           </div>
-          <div class="fc-range"><span id="fcStart">−24h</span><span id="fcNowLbl">now</span><span id="fcEnd"></span></div>
+          <div class="legend sm fc-legend" id="fcLegend" style="display:none">
+            <span><i class="fc-key"></i>Measured</span>
+            <span><i class="fc-key proj"></i>Projected</span>
+            <span><i class="fc-key reset"></i>Account reset</span>
+          </div>
         </div>
       </div>
     </section>
@@ -2504,6 +2631,8 @@ const PAGE = `<!doctype html>
   var forecastInFlight = false;
   var forecastAt = 0;
   var forecastOpen = false;
+  // The chart's geometry as last drawn, which the hover reads.
+  var fcGeom = null;
   // The forecast the open dialog was built from: a status poll redraws the
   // page every 5s, and the dialog is rebuilt only when this changes, so a
   // focused Explain button is not pulled out from under the keyboard.
@@ -3901,6 +4030,10 @@ ${createHall3d.toString()}
 
   function fcClock(t) { return fmtClock(t); }
   function fcSpan(ms) { return fmtIn(ms / 1000); }
+  // "Sun 11", a day on the forecast's axis; with the time, an instant in its
+  // hover. The axis runs past a week, so the weekday alone could repeat.
+  function fcDay(t) { var d = new Date(t); return d.toLocaleDateString([], { weekday: 'short' }) + ' ' + d.getDate(); }
+  function fcWhen(t) { return fcDay(t) + ' ' + fmtHM(t); }
 
   function pollForecast() {
     if (forecastInFlight || Date.now() - forecastAt < 60000) return;
@@ -3946,26 +4079,101 @@ ${createHall3d.toString()}
     byId('fcPastArea').setAttribute('d', g ? g.pastArea : '');
     byId('fcProj').setAttribute('d', g ? g.projected : '');
     var dry = byId('fcDry');
-    if (g && g.dryPct != null) { dry.style.top = g.dryPct + '%'; dry.style.display = ''; } else dry.style.display = 'none';
+    if (g && g.dryPct != null) {
+      dry.style.top = g.dryPct + '%';
+      byId('fcDryLbl').textContent = 'dry · ' + Math.round(f.threshold * 100) + '%';
+      dry.style.display = '';
+    } else dry.style.display = 'none';
     var nowEl = byId('fcNow');
     if (g) { nowEl.style.left = g.nowPct + '%'; nowEl.style.display = ''; } else nowEl.style.display = 'none';
     var resets = byId('fcResets');
     resets.textContent = '';
-    if (g) g.resets.forEach(function (x) { var tick = el('i'); tick.style.left = x + '%'; resets.appendChild(tick); });
+    if (g) g.resets.forEach(function (x) { var tick = el('i'); tick.style.left = x.pct + '%'; resets.appendChild(tick); });
     var tag = byId('fcTag');
     var text = g ? forecastTag(f, fcClock, fcSpan) : '';
     if (text) {
-      var left = g.tagPct ? g.tagPct.left : 100;
+      // A dry spell is labelled where it starts; what resets unused belongs to
+      // no one instant, so it sits in the corner, under the dry line.
       tag.textContent = text;
-      tag.style.left = left + '%';
-      tag.style.top = (g.tagPct ? g.tagPct.top : 12) + '%';
-      tag.className = 'tag fc-tag' + (left > 60 ? ' flip' : '');
+      tag.style.left = (g.tagPct ? g.tagPct.left : 100) + '%';
+      tag.style.top = (g.tagPct ? g.tagPct.top : g.dryPct != null ? g.dryPct : 6.32) + '%';
+      tag.className = 'tag fc-tag' + (!g.tagPct ? ' under' : g.tagPct.left > 60 ? ' flip' : '');
       tag.style.display = '';
     } else tag.style.display = 'none';
-    byId('fcNowLbl').style.left = g ? g.nowPct + '%' : '0';
-    byId('fcNowLbl').style.display = g ? '' : 'none';
-    byId('fcEnd').textContent = g ? fcClock(g.end) : '';
+    drawForecastAxes(g);
+    byId('fcLegend').style.display = g ? '' : 'none';
+    fcGeom = g;
+    if (!g) hideForecastHover();
     if (forecastOpen && popupFor !== f) buildForecastPopup();
+  }
+
+  // The forecast's gridlines with their percentages, and its time axis: a line
+  // and a label per tick, and "now". Labels that would collide are hidden,
+  // "now" kept first and the rest in time order.
+  function drawForecastAxes(g) {
+    var grid = byId('fcGrid'), yax = byId('fcYAxis'), axis = byId('fcAxis');
+    grid.textContent = '';
+    yax.textContent = '';
+    axis.textContent = '';
+    if (!g) return;
+    g.grid.forEach(function (l) {
+      var line = el('i', l.value === 0 || l.value === 1 ? 'edge' : '');
+      line.style.top = l.pct + '%';
+      grid.appendChild(line);
+      var label = el('span', '', Math.round(l.value * 100) + '%');
+      label.style.top = l.pct + '%';
+      yax.appendChild(label);
+    });
+    var now = el('span', 'now', 'now');
+    now.style.left = g.nowPct + '%';
+    axis.appendChild(now);
+    var labels = [now];
+    forecastTicks(g.start, g.end).forEach(function (k) {
+      var line = el('b');
+      line.style.left = k.pct + '%';
+      grid.appendChild(line);
+      var label = el('span', k.day ? 'day' : '', k.day ? fcDay(k.at) : fmtHour(k.at));
+      label.style.left = k.pct + '%';
+      axis.appendChild(label);
+      labels.push(label);
+    });
+    if (typeof axis.getBoundingClientRect !== 'function') return;
+    var box = axis.getBoundingClientRect();
+    var kept = [];
+    labels.forEach(function (label) {
+      var r = label.getBoundingClientRect();
+      // Past the left end a label sits under the percent axis, which is
+      // empty there; past the right it would leave the page.
+      var clash = r.left < box.left - 30 || r.right > box.right
+        || kept.some(function (k) { return r.left < k.right + 8 && r.right > k.left - 8; });
+      if (clash) label.style.visibility = 'hidden';
+      else kept.push(r);
+    });
+  }
+
+  // The forecast's hover: a guide line, a dot on the curve and what it reads
+  // there, snapping to a reset marker within 6px of the pointer.
+  function forecastHoverAt(e) {
+    var hit = byId('fcHit');
+    var box = fcGeom && typeof hit.getBoundingClientRect === 'function' ? hit.getBoundingClientRect() : null;
+    var h = box && box.width > 0 ? forecastHover(lastForecast, fcGeom, (e.clientX - box.left) / box.width * 100, 600 / box.width, fcWhen) : null;
+    if (!h) { hideForecastHover(); return; }
+    var cross = byId('fcCross'), dot = byId('fcDot'), tip = byId('fcTip');
+    cross.style.left = h.left + '%';
+    cross.style.display = '';
+    if (h.top != null) { dot.style.top = h.top + '%'; dot.style.display = ''; } else dot.style.display = 'none';
+    byId('fcTipTitle').textContent = h.title;
+    byId('fcTipText').textContent = h.text;
+    tip.style.left = h.left + '%';
+    tip.style.top = (h.top != null ? h.top : 50) + '%';
+    // Away from the edge it would run off, and above a dot in the lower half.
+    tip.className = 'fc-tip' + (h.left > 60 ? ' left' : '') + (h.top != null && h.top > 50 ? ' up' : '');
+    tip.style.display = '';
+  }
+
+  function hideForecastHover() {
+    byId('fcCross').style.display = 'none';
+    byId('fcTip').style.display = 'none';
   }
 
   function openForecast() {
@@ -5249,6 +5457,8 @@ ${createHall3d.toString()}
   byId('loginWrap').addEventListener('click', function (e) { if (e && e.target === this) closeLogin(); });
   byId('settingsWrap').addEventListener('click', function (e) { if (e && e.target === this) closeSettings(); });
   byId('fcHelp').addEventListener('click', openForecast);
+  byId('fcHit').addEventListener('pointermove', forecastHoverAt);
+  byId('fcHit').addEventListener('pointerleave', hideForecastHover);
   byId('fcClose').addEventListener('click', closeForecast);
   byId('fcWrap').addEventListener('click', function (e) { if (e && e.target === this) closeForecast(); });
   document.addEventListener('keydown', function (e) {

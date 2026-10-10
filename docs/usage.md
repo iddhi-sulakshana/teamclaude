@@ -274,7 +274,7 @@ The page is a static asset and loads without a key; the data does not — its sc
 
 ### Forecast
 
-The chart on the right of the overview answers "at this rate, when do we run out — or how much are we leaving unused?" for the shared weekly bucket of every enabled Claude subscription (Codex, API-key and third-party accounts are not forecast). The solid line is the fleet's weekly utilization over the last day; the dashed line is the projection until every account has refilled once, stepping down at each account's reset; the dashed coral line is the auto-switch threshold, where the pool is dry.
+The chart on the right of the overview answers "at this rate, when do we run out — or how much are we leaving unused?" for the shared weekly bucket of every enabled Claude subscription (Codex, API-key and third-party accounts are not forecast). Up the side is how much of the fleet's combined weekly quota is used, 0% to 100%, with accounts weighed by plan (see **Unit** below); along the bottom is time, a gridline per local midnight (every few hours when the projection is short), from a day ago to the last refill. The solid line is the fleet's weekly utilization over the last day; the dashed line is the projection until every account has refilled once, dropping at each account's reset (a ▲ under the axis); the dashed coral line, labelled with its value, is the auto-switch threshold (98% by default), where the pool is dry. Hovering the chart reads off the time and the used share there, and over a ▲ which accounts reset and how far the fleet drops.
 
 How it is worked out:
 
