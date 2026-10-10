@@ -118,8 +118,9 @@ rateLimitHeaders, ctx.model)` runs:
     `max(0, new − old) × weight`;
   - reset instant changed → credit `new × weight` (burn since the reset);
   - no previous value → credit nothing;
-- the credit goes to the request's client via `clientUsage.record(client, {
-  quotaUsed })`.
+- the credit goes to the request's client through a `recordQuotaUse(client,
+  proWeeks)` hook; spend sent without a client key (the shared key, or a
+  key-less loopback caller) is booked as `(no client key)`.
 
 Because the delta is between consecutive observations, concurrent requests on
 one account never double-count. At 1% precision a single request usually
@@ -127,10 +128,17 @@ credits 0 and occasionally 0.01 × weight; in expectation the attribution is
 proportional to cost, and it reflects model cost (a Fable request moves the
 bucket more than a Haiku one).
 
-`ClientUsageTracker` gains a `quotaUsed` counter alongside `inputTokens` etc.:
-recorded into lifetime totals, slots and days, rolled up into every window,
-exported and persisted. Only the per-client tracker is credited; dimension
-and mix trackers are not, and only the Anthropic path (not Codex) is hooked.
+The spend lives in its own small tracker, `ClientQuotaTracker`
+(`src/quota-attribution.js`): per client, 15-minute slots kept for a day,
+exported to and restored from the state file. It is deliberately not a new
+counter inside `ClientUsageTracker`: that tracker's counter fields are
+spelled out in about eight places and asserted by exact shape in some thirty
+tests, and the forecast needs only the one-day window. Only the Anthropic
+path (not Codex) is hooked.
+
+In the per-user table, `(no client key)` is shown as a row but is left out of
+the even split behind `fairShareX`, is never marked heavy, and gets no
+counterfactual — it is nobody in particular.
 
 ### 2. Forecast engine — `src/forecast.js` (new, pure)
 
@@ -328,8 +336,9 @@ the page by `dashboardCsp`, so they follow the change automatically.
 - `test/quota-history.test.js` — sampling; 48h retention; reset between
   samples; gap handling; confidence levels and the since-reset fallback;
   `pastSeries`; export/restore round-trip; future samples refused.
-- `test/client-usage.test.js` additions — `quotaUsed` in totals, slots, days,
-  every window, export and restore.
+- `test/quota-attribution.test.js` — `quotaMark`, `quotaCredit` (rise, reset,
+  jitter, no weight), the tracker's day window, `(no client key)`, export and
+  restore.
 - Server tests — `/teamclaude/forecast` gate and payload shape; attribution
   next to `updateQuota` (same window, reset in between, no previous value);
   `/teamclaude/forecast/explain` operator gate; Explain with a stubbed spawn
