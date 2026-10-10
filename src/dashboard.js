@@ -528,6 +528,194 @@ export function smoothPath(pts, floor) {
   return d;
 }
 
+// The usage forecast in the hero (GET /teamclaude/forecast): the fleet's weekly
+// meter over the last day, then the projection until every account has
+// refilled once, on one linear time axis across the chart's 400×190 box — used
+// fraction 0 at the bottom (y 182), 1 at the top (y 12). Straight segments, not
+// smoothPath: a reset is a vertical drop, and a curve would round it off.
+/**
+ * @param {any} f  the forecast payload
+ * @returns {null|{ start: number, end: number, now: number, past: string, pastArea: string, projected: string, nowPct: number, dryPct: number|null, resets: number[], tagPct: { left: number, top: number }|null }}
+ */
+export function forecastGeometry(f) {
+  if (!f || !f.series) return null;
+  /** @type {Array<[number, number]>} */
+  var past = f.series.past || [];
+  /** @type {Array<[number, number]>} */
+  var proj = f.series.projected || [];
+  if (!past.length && !proj.length) return null;
+  var now = f.generatedAt;
+  var start = now - 86400000;
+  var end = proj.length ? proj[proj.length - 1][0] : now;
+  if (end <= start) end = start + 1;
+  var r = function (/** @type {number} */ v) { return Math.round(v * 100) / 100; };
+  var X = function (/** @type {number} */ t) { return (t - start) / (end - start) * 400; };
+  var Y = function (/** @type {number} */ v) { return 182 - Math.max(0, Math.min(1, v)) * 170; };
+  var line = function (/** @type {Array<[number, number]>} */ pts) {
+    return pts.map(function (p, i) { return (i ? 'L' : 'M') + r(X(p[0])) + ',' + r(Y(p[1])); }).join(' ');
+  };
+  var pastD = line(past);
+  /** @type {number[]} */
+  var resets = [];
+  for (var i = 1; i < proj.length; i++) {
+    if (proj[i][0] === proj[i - 1][0] && proj[i][1] < proj[i - 1][1]) resets.push(r(X(proj[i][0]) / 4));
+  }
+  var dryPct = f.threshold != null ? r(Y(f.threshold) / 190 * 100) : null;
+  return {
+    start: start,
+    end: end,
+    now: now,
+    past: pastD,
+    pastArea: past.length > 1 ? pastD + ' L' + r(X(past[past.length - 1][0])) + ',190 L' + r(X(past[0][0])) + ',190 Z' : '',
+    projected: line(proj),
+    nowPct: r(X(now) / 4),
+    dryPct: dryPct,
+    resets: resets,
+    tagPct: f.poolDryAt != null ? { left: r(X(f.poolDryAt) / 4), top: dryPct != null ? dryPct : 0 } : null,
+  };
+}
+
+// The forecast's verdict as the chip above the chart: coral when the fleet is
+// running out, amber when it is paying for capacity it leaves unused.
+/** @param {any} f @returns {{ text: string, tone: string }|null} */
+export function verdictChip(f) {
+  if (!f || !f.verdict) return null;
+  var pace = (f.pace || 0).toFixed(1) + '×';
+  if (f.verdict === 'overusing') return { text: 'Overusing ' + pace, tone: 'bad' };
+  if (f.verdict === 'underusing') return { text: 'Underusing ' + pace, tone: 'warn' };
+  return { text: 'On pace ' + pace, tone: '' };
+}
+
+// The chart's one label. `clock` formats an instant and `span` a duration in
+// ms — passed in, so the wording is tested without the browser's locale.
+/**
+ * @param {any} f
+ * @param {(t: number) => string} clock
+ * @param {(ms: number) => string} span
+ */
+export function forecastTag(f, clock, span) {
+  if (!f || !f.verdict) return '';
+  if (f.poolDryAt != null) return 'Dry ' + clock(f.poolDryAt) + (f.dryForMs != null ? ' · ' + span(f.dryForMs) + ' before refill' : '');
+  return '~' + Math.round(f.unusedPct || 0) + '% resets unused';
+}
+
+// A line under the chip when the numbers deserve a caveat.
+/** @param {any} f */
+export function forecastCaption(f) {
+  if (!f || !f.verdict) return '';
+  if (f.confidence === 'low') return 'Low confidence · ' + f.spanHours + 'h of history';
+  if (!(f.burnRate > 0)) return 'No burn in the last ' + f.spanHours + 'h';
+  return '';
+}
+
+// Why the chart is empty.
+/** @param {any} f @param {string|null} error */
+export function forecastEmptyText(f, error) {
+  if (error) return 'Forecast unavailable: ' + error;
+  if (!f) return 'Loading forecast…';
+  if (f.reason === 'no-capacity') return 'No Claude subscription to forecast';
+  if (f.reason === 'no-quota') return 'No weekly quota seen yet — probe quotas';
+  return '';
+}
+
+// The lines under an account card's Weekly meter, from its row in the
+// forecast: when it drains, or what it leaves at its reset — and, for the
+// account taking traffic now, when its session runs out.
+/**
+ * @param {any} row  a forecast.accounts entry
+ * @param {boolean} serving
+ * @param {number} now
+ * @param {(t: number) => string} clock
+ * @param {(ms: number) => string} span
+ * @returns {string[]}
+ */
+export function cardForecastLines(row, serving, now, clock, span) {
+  /** @type {string[]} */
+  var out = [];
+  if (!row) return out;
+  if (row.drainsAt != null && (row.reset == null || row.drainsAt < row.reset)) {
+    out.push(row.drainsAt <= now ? '↳ spent until ' + (row.reset != null ? clock(row.reset) : 'its reset') : '↳ drains ~' + clock(row.drainsAt));
+  } else if (row.unusedAtReset != null && row.unusedAtReset >= 0.01) {
+    out.push('↳ resets with ' + Math.round(row.unusedAtReset * 100) + '% unused');
+  }
+  if (serving && row.sessionHitsAt != null && row.sessionHitsAt > now) out.push('↳ session hits in ~' + span(row.sessionHitsAt - now));
+  return out;
+}
+
+// The ? dialog's text, section by section, so the page only lays it out and
+// the wording is tested here. Null when there is no forecast to break down.
+/**
+ * @param {any} f
+ * @param {(t: number) => string} clock
+ * @param {(ms: number) => string} span
+ * @returns {null|{ verdict: string[], how: string[], accounts: Array<{ name: string, tier: string, weekly: string, resets: string, outlook: string }>, notForecast: string[], users: Array<{ name: string, share: number, shareText: string, fairText: string, heavy: boolean, without: string }>, scoped: string[] }}
+ */
+export function forecastPopup(f, clock, span) {
+  if (!f || !f.verdict) return null;
+  var pct = function (/** @type {number} */ v) { return Math.round(v * 100) + '%'; };
+  var tier = function (/** @type {number} */ w) { return w >= 20 ? 'Max 20x' : w >= 5 ? 'Max 5x' : w === 1 ? 'Pro' : w + '×'; };
+  var word = function (/** @type {string} */ v) { return v === 'overusing' ? 'Overusing' : v === 'underusing' ? 'Underusing' : 'On pace'; };
+  /** @type {Record<string, string>} */
+  var orders = {
+    'soonest-reset': 'the account whose week resets soonest goes first, as the router picks',
+    'least-remaining': 'the account with the least left goes first (adaptive distribution)',
+    'proportional': 'accounts of one priority share it by plan size (distributed sessions)',
+  };
+  var perDay = f.fleetCapacity > 0 ? Math.round(f.burnRate * 24 / f.fleetCapacity * 1000) / 10 : 0;
+  var verdict = [
+    word(f.verdict) + ' at ' + (f.pace || 0).toFixed(1) + '× — the fleet spends ' + perDay + '% of its weekly capacity a day (on pace is about 14%).',
+    f.poolDryAt != null
+      ? 'At this rate every account is spent by ' + clock(f.poolDryAt) + (f.dryForMs != null ? ', ' + span(f.dryForMs) + ' before the next refill.' : '.')
+      : 'About ' + Math.round(f.unusedPct || 0) + "% of a week's capacity resets unused.",
+    f.confidence === 'low'
+      ? 'Low confidence: ' + f.spanHours + "h of history, so the rate is each account's average since its last reset."
+      : 'Rate measured over the last ' + f.spanHours + 'h (' + f.confidence + ' confidence).',
+  ];
+  var how = [
+    "Burn rate: how far every account's weekly meter rose over that window, weighted by plan (Pro 1, Max 5x 5, Max 20x 20).",
+    'Drain order: ' + (orders[f.strategy] || f.strategy) + '; an account at its auto-switch threshold is skipped.',
+    'Each account refills at its weekly reset, and whatever it had left then counts as unused.',
+  ];
+  var accounts = (f.accounts || []).map(function (/** @type {any} */ a) {
+    var outlook = '—';
+    if (a.drainsAt != null && (a.reset == null || a.drainsAt < a.reset)) outlook = a.drainsAt <= f.generatedAt ? 'spent until reset' : 'drains ' + clock(a.drainsAt);
+    else if (a.unusedAtReset != null) outlook = pct(a.unusedAtReset) + ' unused at reset';
+    return { name: a.name, tier: tier(a.weight), weekly: pct(a.u || 0), resets: a.reset != null ? clock(a.reset) : '—', outlook: outlook };
+  });
+  var notForecast = (f.notForecast || []).map(function (/** @type {any} */ n) { return n.name + ' — not forecast (' + n.reason + ')'; });
+  var users = (f.users || []).map(function (/** @type {any} */ u) {
+    var without = '';
+    if ('withoutThemDryAt' in u) without = 'Without ' + u.name + ': ' + (u.withoutThemDryAt == null ? 'no dry spell this week' : 'dry ' + clock(u.withoutThemDryAt));
+    return { name: u.name, share: u.share, shareText: pct(u.share), fairText: u.fairShareX == null ? '—' : u.fairShareX.toFixed(1) + '×', heavy: !!u.heavy, without: without };
+  });
+  var scoped = (f.scoped || []).map(function (/** @type {any} */ s) {
+    var name = String(s.bucket).charAt(0).toUpperCase() + String(s.bucket).slice(1);
+    return name + ' weekly: ' + word(s.verdict) + ' ' + (s.pace || 0).toFixed(1) + '× — '
+      + (s.poolDryAt != null ? 'dry ' + clock(s.poolDryAt) : 'about ' + Math.round(s.unusedPct || 0) + '% resets unused');
+  });
+  return { verdict: verdict, how: how, accounts: accounts, notForecast: notForecast, users: users, scoped: scoped };
+}
+
+// Explain's request: POST /teamclaude/forecast/explain with the page's key,
+// which the server hands to the claude CLI so the spend is booked to whoever
+// asked.
+/** @param {string|null|undefined} key */
+export function explainRequest(key) {
+  return { url: '/teamclaude/forecast/explain', init: { method: 'POST', headers: { 'x-api-key': key || '' } } };
+}
+
+// What Explain shows: the answer, or why there is none.
+/**
+ * @param {{ ok: boolean, status: number, body: any }} res
+ * @returns {{ text?: string, at?: number, cached?: boolean, error?: string }}
+ */
+export function explainOutcome(res) {
+  var b = res && res.body;
+  if (res && res.ok && b && b.ok && b.text) return { text: String(b.text), at: Number(b.generatedAt) || Date.now(), cached: !!b.cached };
+  if (res && res.status === 403) return { error: 'Only an operator can ask for an explanation.' };
+  return { error: b && b.error ? String(b.error) : 'Explain failed (status ' + (res ? res.status : '?') + ')' };
+}
+
 // Traffic by time, for the heatmap: a row per client that spent anything on
 // the span shown, busiest first —
 // and a column per stretch of that span: four hours each across the day, one
@@ -1229,8 +1417,8 @@ export function userOutcome(op, res) {
 // Whether the caller the status payload names may use one of the page's
 // controls, mirroring the server's gates (controlRole in server.js) so a button
 // is offered only where it would be honoured. `action` is 'switch', 'reload',
-// 'probe', 'accounts' (enable/disable and priority), 'threshold', 'users' or
-// 'rotate'. A server older than `viewer` sends none, and every control shows
+// 'probe', 'accounts' (enable/disable and priority), 'threshold', 'users',
+// 'rotate' or 'explain' (operator only: it spends quota). A server older than `viewer` sends none, and every control shows
 // as it always did — the server's 403 still has the final word either way.
 // Rotating is the exception: it is by name rather than role, since only a
 // named client key has a key of its own, whatever its role.
@@ -1252,6 +1440,7 @@ const SHARED_HELPERS = [
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
   formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
+  forecastGeometry, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and

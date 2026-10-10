@@ -11,6 +11,7 @@ import {
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
+  forecastGeometry, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome,
 } from '../src/dashboard.js';
 import { USAGE_WINDOW_LABELS } from '../src/client-usage.js';
 import { normalizeSpend } from '../src/oauth.js';
@@ -18,6 +19,32 @@ import { normalizeSpend } from '../src/oauth.js';
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
+
+// A forecast payload as GET /teamclaude/forecast serves it, for the forecast
+// helper and page tests. tClock and tSpan stand in for the page's locale-
+// dependent formatters.
+const FC_NOW = Date.UTC(2026, 9, 10, 12, 0, 0);
+const FC_HOUR = 3600_000;
+const FORECAST = {
+  generatedAt: FC_NOW, bucket: 'weekly', confidence: 'high', spanHours: 24, strategy: 'soonest-reset', notForecast: [{ name: 'k@x', reason: 'unknown tier' }],
+  reason: null, burnRate: 1 / 6, pace: 1.4, verdict: 'overusing', threshold: 0.98, fleetCapacity: 20,
+  poolDryAt: FC_NOW + 41 * FC_HOUR, dryForMs: 30 * FC_HOUR, unusedPct: 0,
+  accounts: [
+    { name: 'a@x', weight: 20, u: 0.71, reset: FC_NOW + 71 * FC_HOUR, drainsAt: FC_NOW + 31 * FC_HOUR, unusedAtReset: null, sessionHitsAt: FC_NOW + 47 * 60_000 },
+    { name: 'b@x', weight: 5, u: 0.2, reset: FC_NOW + 20 * FC_HOUR, drainsAt: null, unusedAtReset: 0.38, sessionHitsAt: null },
+  ],
+  users: [
+    { name: 'alice', spent: 1, share: 0.48, fairShareX: 2.1, heavy: true, withoutThemDryAt: null },
+    { name: 'bob', spent: 0.5, share: 0.22, fairShareX: 0.9, heavy: false, withoutThemDryAt: FC_NOW + 50 * FC_HOUR },
+  ],
+  scoped: [{ bucket: 'fable', verdict: 'on-pace', pace: 0.6, poolDryAt: null, unusedPct: 12 }],
+  series: {
+    past: [[FC_NOW - 24 * FC_HOUR, 0.3], [FC_NOW, 0.5]],
+    projected: [[FC_NOW, 0.5], [FC_NOW + 20 * FC_HOUR, 0.8], [FC_NOW + 20 * FC_HOUR, 0.65], [FC_NOW + 72 * FC_HOUR, 0.98]],
+  },
+};
+const tClock = t => 'T+' + Math.round((t - FC_NOW) / FC_HOUR) + 'h';
+const tSpan = ms => Math.round(ms / FC_HOUR) + 'h';
 
 // The page's pure logic is exported and serialized into the script, so these
 // exercise the same functions the browser runs.
@@ -889,7 +916,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [hallwayRows, hallLayout, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest]) {
+  for (const fn of [hallwayRows, hallLayout, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, thresholdBadgeText, accountBadges, extraUsageText, extraUsageBar, meterTone, clientGroups, seriesLines, userLineNames, smoothPath, heatGrid, seriesTicks, dayTicks, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest, forecastGeometry, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -2408,4 +2435,85 @@ test('the page embeds its fonts, and the policy admits only those', () => {
   assert.match(html, /@font-face \{ font-family: 'DM Mono'; src: url\(data:font\/woff2;base64,/);
   assert.doesNotMatch(html, /fonts\.googleapis|fonts\.gstatic/);
   assert.match(dashboardCsp(), /(^|; )font-src data:(;|$)/);
+});
+
+// ── the usage forecast ───────────────────────────────────────
+
+test('forecastGeometry lays both curves on one time axis', () => {
+  const g = forecastGeometry(FORECAST);
+  assert.equal(g.start, FC_NOW - 24 * FC_HOUR);
+  assert.equal(g.end, FC_NOW + 72 * FC_HOUR);
+  assert.equal(g.nowPct, 25, 'a day of past in a four-day chart');
+  assert.equal(g.past, 'M0,131 L100,97');
+  assert.equal(g.pastArea, 'M0,131 L100,97 L100,190 L0,190 Z');
+  assert.ok(g.projected.startsWith('M100,97 '));
+  assert.deepEqual(g.resets, [45.83], 'the vertical drop at hour 20');
+  assert.equal(g.dryPct, 8.11);
+  assert.deepEqual(g.tagPct, { left: 67.71, top: 8.11 });
+  assert.equal(forecastGeometry({ ...FORECAST, series: { past: [], projected: [] } }), null);
+  assert.equal(forecastGeometry(null), null);
+});
+
+test('verdictChip names the verdict and its pace', () => {
+  assert.deepEqual(verdictChip(FORECAST), { text: 'Overusing 1.4×', tone: 'bad' });
+  assert.deepEqual(verdictChip({ verdict: 'underusing', pace: 0.5 }), { text: 'Underusing 0.5×', tone: 'warn' });
+  assert.deepEqual(verdictChip({ verdict: 'on-pace', pace: 0.94 }), { text: 'On pace 0.9×', tone: '' });
+  assert.equal(verdictChip({ verdict: null }), null);
+});
+
+test('forecastTag says when the pool runs dry, or how much resets unused', () => {
+  assert.equal(forecastTag(FORECAST, tClock, tSpan), 'Dry T+41h · 30h before refill');
+  assert.equal(forecastTag({ ...FORECAST, poolDryAt: null, unusedPct: 38.4 }, tClock, tSpan), '~38% resets unused');
+  assert.equal(forecastTag({ verdict: null }, tClock, tSpan), '');
+});
+
+test('forecastCaption flags thin history and an idle fleet', () => {
+  assert.equal(forecastCaption(FORECAST), '');
+  assert.equal(forecastCaption({ ...FORECAST, confidence: 'low', spanHours: 3 }), 'Low confidence · 3h of history');
+  assert.equal(forecastCaption({ ...FORECAST, burnRate: 0, pace: 0 }), 'No burn in the last 24h');
+});
+
+test('forecastEmptyText says why there is no chart', () => {
+  assert.equal(forecastEmptyText(null, null), 'Loading forecast…');
+  assert.equal(forecastEmptyText(null, 'status 500'), 'Forecast unavailable: status 500');
+  assert.equal(forecastEmptyText({ verdict: null, reason: 'no-quota' }, null), 'No weekly quota seen yet — probe quotas');
+  assert.equal(forecastEmptyText({ verdict: null, reason: 'no-capacity' }, null), 'No Claude subscription to forecast');
+});
+
+test('cardForecastLines: drains, resets unused, and the session for a serving account', () => {
+  assert.deepEqual(cardForecastLines(FORECAST.accounts[0], true, FC_NOW, tClock, tSpan), ['↳ drains ~T+31h', '↳ session hits in ~1h']);
+  assert.deepEqual(cardForecastLines(FORECAST.accounts[0], false, FC_NOW, tClock, tSpan), ['↳ drains ~T+31h']);
+  assert.deepEqual(cardForecastLines(FORECAST.accounts[1], true, FC_NOW, tClock, tSpan), ['↳ resets with 38% unused']);
+  assert.deepEqual(cardForecastLines({ ...FORECAST.accounts[0], drainsAt: FC_NOW }, false, FC_NOW, tClock, tSpan), ['↳ spent until T+71h']);
+  assert.deepEqual(cardForecastLines(null, true, FC_NOW, tClock, tSpan), []);
+});
+
+test('forecastPopup writes every section', () => {
+  const p = forecastPopup(FORECAST, tClock, tSpan);
+  assert.equal(p.verdict[0], 'Overusing at 1.4× — the fleet spends 20% of its weekly capacity a day (on pace is about 14%).');
+  assert.equal(p.verdict[1], 'At this rate every account is spent by T+41h, 30h before the next refill.');
+  assert.equal(p.verdict[2], 'Rate measured over the last 24h (high confidence).');
+  assert.equal(p.how.length, 3);
+  assert.ok(p.how[1].includes('resets soonest'));
+  assert.deepEqual(p.accounts[0], { name: 'a@x', tier: 'Max 20x', weekly: '71%', resets: 'T+71h', outlook: 'drains T+31h' });
+  assert.deepEqual(p.accounts[1], { name: 'b@x', tier: 'Max 5x', weekly: '20%', resets: 'T+20h', outlook: '38% unused at reset' });
+  assert.deepEqual(p.notForecast, ['k@x — not forecast (unknown tier)']);
+  assert.deepEqual(p.users[0], { name: 'alice', share: 0.48, shareText: '48%', fairText: '2.1×', heavy: true, without: 'Without alice: no dry spell this week' });
+  assert.equal(p.users[1].without, 'Without bob: dry T+50h');
+  assert.deepEqual(p.scoped, ['Fable weekly: On pace 0.6× — about 12% resets unused']);
+  assert.equal(forecastPopup({ verdict: null }, tClock, tSpan), null);
+});
+
+test('explainRequest posts with the page key; explainOutcome reads the answer or the refusal', () => {
+  assert.deepEqual(explainRequest('tc-k'), { url: '/teamclaude/forecast/explain', init: { method: 'POST', headers: { 'x-api-key': 'tc-k' } } });
+  assert.deepEqual(explainOutcome({ ok: true, status: 200, body: { ok: true, text: 'Because.', generatedAt: 5, cached: true } }), { text: 'Because.', at: 5, cached: true });
+  assert.deepEqual(explainOutcome({ ok: false, status: 403, body: { ok: false, error: 'a client key cannot ask for a forecast explanation' } }), { error: 'Only an operator can ask for an explanation.' });
+  assert.deepEqual(explainOutcome({ ok: false, status: 503, body: { ok: false, error: 'Claude Code CLI not found on the server' } }), { error: 'Claude Code CLI not found on the server' });
+  assert.deepEqual(explainOutcome({ ok: false, status: 502, body: null }), { error: 'Explain failed (status 502)' });
+});
+
+test('viewerCan offers Explain to the operator only', () => {
+  assert.equal(viewerCan({ role: 'operator' }, 'explain'), true);
+  assert.equal(viewerCan({ role: 'tenant' }, 'explain'), false);
+  assert.equal(viewerCan({ role: 'readonly' }, 'explain'), false);
 });
