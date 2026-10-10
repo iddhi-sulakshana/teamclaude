@@ -22,6 +22,9 @@ import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { renderDashboardHtml, dashboardCsp, dashboardAsset } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames, usageMixKey, USAGE_SLOT_MS, USAGE_MONTH } from './client-usage.js';
+import { quotaMark, quotaCredit } from './quota-attribution.js';
+import { isForecastAccount } from './quota-history.js';
+import { quotaTier } from './quota-summary.js';
 import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from './responses-usage.js';
 import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
@@ -414,6 +417,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/users/role', 'a client key cannot change users'],
   // A write in no file, but it answers other users' credentials.
   ['/teamclaude/users/key', "a client key cannot see users' keys"],
+  // Every answer spends the fleet's quota on the operator's behalf.
+  ['/teamclaude/forecast/explain', 'a client key cannot ask for a forecast explanation'],
 ]);
 
 // The one control-plane write every named client key may make, read-only
@@ -688,6 +693,50 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           : clientUsage
             ? clientUsage.series()
             : { slotMs: USAGE_SLOT_MS, bucketMs: 4 * USAGE_SLOT_MS, buckets: 0, end: Date.now(), clients: {} }));
+        return;
+      }
+
+      // The usage forecast: where the fleet's weekly quota is heading at the
+      // current rate (forecast-payload.js). The same readers as status, behind
+      // the same gate. Its own endpoint because it is computed on request — a
+      // few hundred simulation steps — and the TUI and status line, which poll
+      // status every second, have no use for it.
+      if (req.method === 'GET' && req.url === '/teamclaude/forecast') {
+        if (!hooks.getForecast) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'forecast not supported' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(hooks.getForecast()));
+        return;
+      }
+
+      // The forecast in a few sentences: Haiku, through the genuine claude CLI
+      // and this proxy (forecast-explain.js). The operator's alone — a client
+      // key is refused above (CLIENT_KEY_REFUSED_PATHS), read-only by the POST
+      // gate — because every answer spends quota. The caller's own key goes to
+      // the CLI, so the spend is booked to whoever asked.
+      if (req.method === 'POST' && req.url === '/teamclaude/forecast/explain') {
+        if (!hooks.explainForecast) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'explain not supported' }));
+          return;
+        }
+        try {
+          const key = auth.ok && typeof clientKey === 'string' && clientKey ? clientKey : null;
+          const result = await hooks.explainForecast({ key });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+        } catch (err) {
+          // An ExplainError carries a status and a message written for the
+          // page; anything else may name paths, so it is logged, not returned.
+          const e = /** @type {any} */ (err);
+          const known = e && Number.isInteger(e.status);
+          if (!known) console.error(`[TeamClaude] Forecast explain failed: ${e && e.message ? e.message : String(err)}`);
+          res.writeHead(known ? e.status : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: known ? String(e.message) : 'explain failed' }));
+        }
         return;
       }
 
@@ -3492,7 +3541,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         rateLimitHeaders[key] = value;
       }
     }
+    // Book the weekly quota this response spent to the client that sent it
+    // (quota-attribution.js): the reading before updateQuota against the one
+    // the response brought. Claude subscriptions only — the forecast's scope.
+    const quotaBefore = quotaMark(account);
     accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
+    if (hooks.recordQuotaUse && isForecastAccount(account)) {
+      const credit = quotaCredit(quotaBefore, quotaMark(account), quotaTier(account).weight);
+      if (credit > 0) hooks.recordQuotaUse(ctx.client ?? null, credit);
+    }
 
     // Any response at all came back through the account's routing proxy.
     accountManager.clearRoutingFailed(account.index);
