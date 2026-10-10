@@ -170,7 +170,10 @@ export function simulate({ accounts, burnRate, strategy, now, stepMs = STEP_MS }
   if (!live.length) return result;
 
   const used = () => round(live.reduce((sum, a) => sum + a.weight * a.u, 0) / capacity);
-  const horizon = Math.max(...live.map(a => a.reset));
+  // A week at most: every weekly window turns over within one, and a reset
+  // reported further out would otherwise stretch the run, and the curve it
+  // returns, without bound.
+  const horizon = Math.min(now + WEEK_MS, Math.max(...live.map(a => a.reset)));
   let unused = 0;
   /** @param {number} at */
   const refill = at => {

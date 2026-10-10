@@ -2504,6 +2504,10 @@ const PAGE = `<!doctype html>
   var forecastInFlight = false;
   var forecastAt = 0;
   var forecastOpen = false;
+  // The forecast the open dialog was built from: a status poll redraws the
+  // page every 5s, and the dialog is rebuilt only when this changes, so a
+  // focused Explain button is not pulled out from under the keyboard.
+  var popupFor = null;
   var explainState = null;
   // The account whose settings dialog is open, by name, and what its rows were
   // last built from: the poll rebuilds the dialog only when that changes, so a
@@ -3961,7 +3965,7 @@ ${createHall3d.toString()}
     byId('fcNowLbl').style.left = g ? g.nowPct + '%' : '0';
     byId('fcNowLbl').style.display = g ? '' : 'none';
     byId('fcEnd').textContent = g ? fcClock(g.end) : '';
-    if (forecastOpen) buildForecastPopup();
+    if (forecastOpen && popupFor !== f) buildForecastPopup();
   }
 
   function openForecast() {
@@ -3979,6 +3983,7 @@ ${createHall3d.toString()}
   // The ? dialog, laid out from forecastPopup's text.
   function buildForecastPopup() {
     var p = forecastPopup(lastForecast, fcClock, fcSpan);
+    popupFor = lastForecast;
     var body = byId('fcBody');
     body.textContent = '';
     if (!p) { closeForecast(); return; }

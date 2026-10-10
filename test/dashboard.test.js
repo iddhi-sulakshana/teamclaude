@@ -2544,3 +2544,12 @@ test('overusing without a dry spell gets no "0% unused" label, and the popup say
   assert.equal(forecastPopup(tight, tClock, tSpan).verdict[1], 'At this rate the pool does not run dry, but next to nothing is left at the resets.');
   assert.equal(forecastTag({ ...tight, verdict: 'on-pace', unusedPct: 12 }, tClock, tSpan), '~12% resets unused');
 });
+
+test('an open breakdown is not rebuilt by a re-render with the same forecast', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], viewer: { client: null, role: 'operator' }, clients: { alice: { requests: 1, inputTokens: 5, outputTokens: 5 } } });
+  await page.answerForecast(FORECAST);
+  page.byId('fcHelp').fire('click');
+  page.click('Last 24h');   // re-renders the last status, as every poll does
+  assert.equal(page.labelled('How this is worked out'), 0, 'the dialog keeps its elements, and the focus in them');
+});

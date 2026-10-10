@@ -121,3 +121,10 @@ test('userShares ranks spend, compares with an even split, and leaves NO_CLIENT 
   assert.deepEqual(userShares({ alice: 2 }), [{ name: 'alice', spent: 2, share: 1, fairShareX: 1, heavy: false }], 'alone is never heavy');
   assert.deepEqual(userShares({}), []);
 });
+
+test('the projection stops at a week even when a reset claims to be later', () => {
+  const sim = simulate({ accounts: [acct('far', { u: 0.2, reset: NOW + 30 * DAY })], burnRate: 0, strategy: 'soonest-reset', now: NOW });
+  assert.equal(sim.projected.at(-1)[0], NOW + WEEK_MS, 'a week of projection, not a month');
+  assert.equal(sim.projected.length, 7 * 96 + 1);
+  assert.equal(sim.accounts[0].unusedAtReset, null, 'its reset is past the horizon');
+});
