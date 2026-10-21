@@ -13,6 +13,7 @@ import {
   removeRoute,
   setBlockedModels,
   setBucketThresholds,
+  setClientKeyDisabled,
   setClientKeyRole,
   setDefaultClientMode,
   setDistribution,
@@ -377,6 +378,28 @@ test('setClientKeyRole refuses the caller demoting themselves, but not re-affirm
   refused(() => setClientKeyRole(config, 'alice', 'tenant', { actor: 'alice' }), /cannot take admin/);
   assert.equal(config.proxy.clientKeys[0].role, 'admin');
   assert.deepEqual(setClientKeyRole(config, 'alice', 'admin', { actor: 'alice' }), { name: 'alice', role: 'admin' });
+});
+
+test('setClientKeyDisabled marks every entry of the name, and enabling deletes the flag', () => {
+  const config = userConfig();
+  assert.deepEqual(setClientKeyDisabled(config, ' ci ', true), { name: 'ci', disabled: true });
+  assert.deepEqual(config.proxy.clientKeys.map(e => e.disabled), [undefined, undefined, true, true]);
+  assert.deepEqual(config.proxy.clientKeys.slice(2).map(e => [e.key, e.role]), [['tc-ci-1', 'readonly'], ['tc-ci-2', 'readonly']],
+    'the keys and the role stay, so enabling brings the same ones back');
+  assert.deepEqual(setClientKeyDisabled(config, 'ci', false), { name: 'ci', disabled: false });
+  assert.ok(config.proxy.clientKeys.every(e => !('disabled' in e)), 'enabling removes the flag rather than writing false');
+});
+
+test('setClientKeyDisabled refuses the caller disabling themselves, an unknown name, and a non-boolean', () => {
+  const config = userConfig();
+  refused(() => setClientKeyDisabled(config, 'alice', true, { actor: 'alice' }), /cannot disable the key you are signed in with/);
+  refused(() => setClientKeyDisabled(config, 'zed', true), /no user named "zed"/);
+  refused(() => setClientKeyDisabled(config, '', true), /name a user/);
+  refused(() => setClientKeyDisabled(config, 'bob', 'yes'), /disabled must be true or false/);
+  assert.ok(config.proxy.clientKeys.every(e => !('disabled' in e)), 'a refused change writes nothing');
+  // Someone else may disable an admin; the shared key has no name at all.
+  assert.deepEqual(setClientKeyDisabled(config, 'alice', true, { actor: 'bob' }), { name: 'alice', disabled: true });
+  assert.deepEqual(setClientKeyDisabled(config, 'bob', true, { actor: null }), { name: 'bob', disabled: true });
 });
 
 test('rotateClientKey replaces only the entry holding the presented key', () => {

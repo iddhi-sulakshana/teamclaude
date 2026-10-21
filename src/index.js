@@ -74,6 +74,7 @@ import {
   addClientKey,
   removeClientKey,
   rotateClientKey,
+  setClientKeyDisabled,
   setClientKeyRole,
 } from './config-ops.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -715,11 +716,11 @@ async function serverCommand() {
     return result;
   };
 
-  // The dashboard's Users card (POST /teamclaude/users/{add,remove,role}), the
+  // The dashboard's Users card (POST /teamclaude/users/{add,remove,role,disable}), the
   // same way: the op under the config lock, the reload left to the endpoint.
   // The reload copies proxy.clientKeys into the running config, which both
-  // auth gates read per request, so a new key works and a removed one stops
-  // working as soon as the call returns.
+  // auth gates read per request, so a new key works and a removed or disabled
+  // one stops working as soon as the call returns.
   hooks.addUser = async (/** @type {any} */ spec) => {
     /** @type {{ name: string, role: string, key: string }|undefined} */
     let result;
@@ -736,6 +737,12 @@ async function serverCommand() {
     /** @type {{ name: string, role: string }|undefined} */
     let result;
     await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setClientKeyRole(diskConfig, name, role, spec); });
+    return result;
+  };
+  hooks.setUserDisabled = async (/** @type {string} */ name, /** @type {unknown} */ disabled, /** @type {any} */ spec) => {
+    /** @type {{ name: string, disabled: boolean }|undefined} */
+    let result;
+    await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setClientKeyDisabled(diskConfig, name, disabled, spec); });
     return result;
   };
   // A user rotating their own key (POST /teamclaude/me/rotate): the same lock

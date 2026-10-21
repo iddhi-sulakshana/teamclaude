@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { addClientKey, removeClientKey, rotateClientKey, setClientKeyRole } from '../src/config-ops.js';
+import { addClientKey, removeClientKey, rotateClientKey, setClientKeyDisabled, setClientKeyRole } from '../src/config-ops.js';
 
 // POST /teamclaude/users/add, /users/remove and /users/role are what the
 // dashboard's Users card calls. Like the account controls, the write is the
@@ -35,11 +35,12 @@ const freshConfig = () => ({
 // on the live object, which stands in for the write to disk and the reload
 // that copies proxy.clientKeys back into the running server.
 function liveHooks(config) {
-  const calls = { add: [], remove: [], role: [], rotate: [], reload: 0 };
+  const calls = { add: [], remove: [], role: [], disable: [], rotate: [], reload: 0 };
   const hooks = {
     addUser: async (spec) => { calls.add.push(spec); return addClientKey(config, spec); },
     removeUser: async (name, spec) => { calls.remove.push([name, spec]); return removeClientKey(config, name, spec); },
     setUserRole: async (name, role, spec) => { calls.role.push([name, role, spec]); return setClientKeyRole(config, name, role, spec); },
+    setUserDisabled: async (name, disabled, spec) => { calls.disable.push([name, disabled, spec]); return setClientKeyDisabled(config, name, disabled, spec); },
     rotateOwnKey: async (spec) => { calls.rotate.push(spec); return rotateClientKey(config, spec); },
     reload: async () => { calls.reload++; return 0; },
   };
@@ -171,6 +172,7 @@ test('a tenant or read-only key cannot change users', async () => {
       ['/teamclaude/users/add', { name: 'eve', role: 'admin' }],
       ['/teamclaude/users/remove', { name: 'alice' }],
       ['/teamclaude/users/role', { name: 'bob', role: 'admin' }],
+      ['/teamclaude/users/disable', { name: 'alice', disabled: true }],
     ]) {
       const tenant = await post(port, path, body, { 'x-api-key': TENANT_KEY });
       assert.equal(tenant.status, 403, path);
@@ -178,7 +180,7 @@ test('a tenant or read-only key cannot change users', async () => {
       const ro = await post(port, path, body, { 'x-api-key': READONLY_KEY });
       assert.equal(ro.status, 403, path);
     }
-    assert.equal(calls.add.length + calls.remove.length + calls.role.length + calls.reload, 0);
+    assert.equal(calls.add.length + calls.remove.length + calls.role.length + calls.disable.length + calls.reload, 0);
   });
 });
 
@@ -205,7 +207,7 @@ test('bad input is a 400 that reaches no hook; a refused op is a 400 with its re
   const config = freshConfig();
   const { hooks, calls } = liveHooks(config);
   await withServer(config, hooks, async (port) => {
-    for (const path of ['/teamclaude/users/add', '/teamclaude/users/remove', '/teamclaude/users/role']) {
+    for (const path of ['/teamclaude/users/add', '/teamclaude/users/remove', '/teamclaude/users/role', '/teamclaude/users/disable']) {
       for (const body of [{}, { name: '' }, { name: 42 }, 'null']) {
         const res = await post(port, path, body);
         assert.equal(res.status, 400, `${path} ${JSON.stringify(body)}`);
@@ -215,7 +217,7 @@ test('bad input is a 400 that reaches no hook; a refused op is a 400 with its re
       assert.equal(bad.status, 400);
       assert.deepEqual(await bad.json(), { ok: false, error: 'invalid request body' });
     }
-    assert.equal(calls.add.length + calls.remove.length + calls.role.length, 0);
+    assert.equal(calls.add.length + calls.remove.length + calls.role.length + calls.disable.length, 0);
 
     const dup = await post(port, '/teamclaude/users/add', { name: 'bob' });
     assert.equal(dup.status, 400);
@@ -257,6 +259,99 @@ test('a server without the user hooks or a reload answers 501 before any write',
     const res = await post(port, '/teamclaude/users/role', { name: 'bob', role: 'admin' });
     assert.equal(res.status, 501);
     assert.match((await res.json()).error, /not supported/);
+  });
+});
+
+// The refusal a disabled key meets: Anthropic's error shape, so Claude Code
+// shows the reason rather than a bare status.
+async function assertDisabledRefusal(res, what) {
+  assert.equal(res.status, 403, what);
+  const body = await res.json();
+  assert.equal(body.type, 'error', what);
+  assert.equal(body.error.type, 'permission_error', what);
+  assert.match(body.error.message, /disabled/, what);
+}
+
+test('disabling a user refuses their key at once with the reason, and enabling lets the same key back in', async () => {
+  const config = freshConfig();
+  const { hooks, calls } = liveHooks(config);
+  await withServer(config, hooks, async (port) => {
+    await capturingLogs(async (lines) => {
+      const res = await post(port, '/teamclaude/users/disable', { name: 'bob', disabled: true }, { 'x-api-key': ADMIN_KEY });
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { ok: true, name: 'bob', disabled: true });
+      assert.deepEqual(calls.disable, [['bob', true, { actor: 'alice' }]]);
+      assert.equal(calls.reload, 1);
+      assert.ok(lines.some(l => /Disabled user "bob" \(dashboard, by alice\)/.test(l)), 'the change is logged with who made it');
+    });
+    await assertDisabledRefusal(await statusAs(port, TENANT_KEY), 'status');
+
+    await capturingLogs(async (lines) => {
+      const res = await post(port, '/teamclaude/users/disable', { name: 'bob', disabled: false }, { 'x-api-key': PROXY_KEY });
+      assert.deepEqual(await res.json(), { ok: true, name: 'bob', disabled: false });
+      assert.ok(lines.some(l => /Enabled user "bob" \(dashboard\)/.test(l)));
+    });
+    const back = await statusAs(port, TENANT_KEY);
+    assert.equal(back.status, 200, 'the same key works again');
+    assert.deepEqual((await back.json()).viewer, { client: 'bob', role: 'tenant' }, 'with the role it had');
+  });
+});
+
+test('a disabled key is refused on the API and MCP paths, and from loopback, which needs no key', async () => {
+  const config = freshConfig();
+  config.proxy.clientKeys[1].disabled = true;
+  await withServer(config, {}, async (port) => {
+    // No forwarding header: loopback, where the gate would let a key-less
+    // caller through. Naming a disabled key is not the same as naming none.
+    const local = (path, init = {}) => fetch(`http://127.0.0.1:${port}${path}`, init);
+    await assertDisabledRefusal(await local('/teamclaude/status', { headers: { 'x-api-key': TENANT_KEY } }), 'loopback status');
+    await assertDisabledRefusal(await local('/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': TENANT_KEY, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-5-5', max_tokens: 1, messages: [] }),
+    }), 'messages');
+    await assertDisabledRefusal(await local('/teamclaude/mcp', {
+      method: 'POST',
+      headers: { 'x-api-key': TENANT_KEY, 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    }), 'mcp');
+    await assertDisabledRefusal(await post(port, '/teamclaude/me/rotate', '', { 'x-api-key': TENANT_KEY }), 'rotating its own key');
+
+    assert.equal((await local('/teamclaude/status')).status, 200, 'loopback without a key is still exempt');
+    assert.equal((await statusAs(port, ADMIN_KEY)).status, 200, 'the other users are untouched');
+  });
+});
+
+test('an admin cannot disable themselves, and a non-boolean is refused', async () => {
+  const config = freshConfig();
+  const { hooks, calls } = liveHooks(config);
+  await withServer(config, hooks, async (port) => {
+    const self = await post(port, '/teamclaude/users/disable', { name: 'alice', disabled: true }, { 'x-api-key': ADMIN_KEY });
+    assert.equal(self.status, 400);
+    assert.match((await self.json()).error, /cannot disable the key you are signed in with/);
+    const bad = await post(port, '/teamclaude/users/disable', { name: 'bob', disabled: 'yes' });
+    assert.equal(bad.status, 400);
+    assert.match((await bad.json()).error, /true or false/);
+    assert.equal(calls.reload, 0, 'a refused change has nothing to reload');
+    assert.equal((await statusAs(port, ADMIN_KEY)).status, 200);
+  });
+});
+
+test("status marks a disabled user, and an operator can still see that user's key", async () => {
+  const config = freshConfig();
+  config.proxy.clientKeys[1].disabled = true;
+  // A name with one key left on is not disabled: that key still works.
+  config.proxy.clientKeys.push({ name: 'carol', key: 'tc-carol-2', role: 'readonly', disabled: true });
+  const { hooks } = liveHooks(config);
+  await withServer(config, hooks, async (port) => {
+    const op = await (await statusAs(port, PROXY_KEY)).json();
+    assert.deepEqual(op.users, [
+      { name: 'alice', role: 'admin' },
+      { name: 'bob', role: 'tenant', disabled: true },
+      { name: 'carol', role: 'readonly' },
+    ]);
+    const key = await post(port, '/teamclaude/users/key', { name: 'bob' }, { 'x-api-key': PROXY_KEY });
+    assert.deepEqual(await key.json(), { ok: true, name: 'bob', keys: [TENANT_KEY] });
   });
 });
 

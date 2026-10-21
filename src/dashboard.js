@@ -1432,14 +1432,16 @@ export function loginOutcome(res) {
   return { kind: 'ok', text: (res.action === 'updated' ? 'signed in again as ' : 'added account ') + res.name };
 }
 
-// The requests the Users card sends: add, remove, role, and key (Show key).
-// Each carries only the fields its endpoint reads, so a remove never ships a
-// role it would ignore. The name is trimmed here because it is typed.
-/** @param {'add'|'remove'|'role'|'key'} op @param {{ name: string, role?: string }} spec @param {string|null} key */
+// The requests the Users card sends: add, remove, role, disable (both ways),
+// and key (Show key). Each carries only the fields its endpoint reads, so a
+// remove never ships a role it would ignore. The name is trimmed here because
+// it is typed.
+/** @param {'add'|'remove'|'role'|'disable'|'key'} op @param {{ name: string, role?: string, disabled?: boolean }} spec @param {string|null} key */
 export function userRequest(op, spec, key) {
   /** @type {Record<string, unknown>} */
   var body = { name: String(spec.name || '').trim() };
   if (op === 'add' || op === 'role') body.role = spec.role;
+  if (op === 'disable') body.disabled = spec.disabled === true;
   return {
     url: '/teamclaude/users/' + op,
     init: {
@@ -1457,15 +1459,16 @@ export function rotateKeyRequest(key) {
 }
 // The note after a user change. Built from the name and role only: the
 // replies to add, key and rotate carry keys, and the note must never repeat one.
-/** @param {'add'|'remove'|'role'|'key'|'rotate'} op @param {any} res */
+/** @param {'add'|'remove'|'role'|'disable'|'key'|'rotate'} op @param {any} res */
 export function userOutcome(op, res) {
   var failed = {
     add: 'adding the user failed', remove: 'removing the user failed', role: 'changing the role failed',
-    key: 'showing the key failed', rotate: 'rotating the key failed',
+    disable: 'disabling or enabling the user failed', key: 'showing the key failed', rotate: 'rotating the key failed',
   };
   if (!res || !res.ok) return { kind: 'error', text: failed[op] + (res && res.error ? ': ' + res.error : '') };
   if (op === 'add') return { kind: 'ok', text: 'added user ' + res.name };
   if (op === 'remove') return { kind: 'ok', text: 'removed user ' + res.name };
+  if (op === 'disable') return { kind: 'ok', text: (res.disabled ? 'disabled user ' : 'enabled user ') + res.name };
   if (op === 'key') return { kind: 'ok', text: 'showing the key of ' + res.name };
   if (op === 'rotate') return { kind: 'ok', text: 'rotated your key' };
   /** @type {Record<string, string>} */
@@ -2095,6 +2098,8 @@ const PAGE = `<!doctype html>
   .us-row { display: grid; grid-template-columns: minmax(0,1fr) auto auto; gap: 12px; align-items: center; padding: 8px 10px; margin: 0 -10px; border-radius: 14px; font-size: 13px; }
   .us-row:hover { background: var(--row-hover); }
   .us-row .you { color: var(--dim); font-weight: 400; margin-left: 6px; }
+  .us-row .us-off { color: var(--dim); font-weight: 400; margin-left: 6px; }
+  .us-row.off > .cl-name, .us-row.off > .seg { opacity: .5; }
   #userRoleSeg { align-self: flex-start; }
   #userNote { font-size: 12px; color: var(--dim); line-height: 1.5; }
   #userNote.ok { color: var(--lime-text); } #userNote.error { color: var(--coral-text); }
@@ -2175,6 +2180,8 @@ const PAGE = `<!doctype html>
   #keybox { display: none; max-width: 400px; margin: 12vh auto 0; }
   .keycard { border-radius: 26px; background: var(--card); box-shadow: var(--shadow); padding: 28px; display: flex; flex-direction: column; gap: 16px; animation: tcPop .35s cubic-bezier(.2,.9,.25,1.1) both; }
   .keycard p { color: var(--muted); font-size: 13px; }
+  .keycard #keyboxNote { color: var(--coral-text); }
+  .keycard #keyboxNote:empty { display: none; }
   #key { width: 100%; height: 42px; border-radius: 999px; border: 1px solid transparent; background: var(--raised); color: var(--text); padding: 0 16px; font-size: 13px; outline: none; }
   #key:focus { border-color: var(--violet); }
 
@@ -2211,6 +2218,7 @@ const PAGE = `<!doctype html>
     <div class="keycard">
       <div class="brand"><div class="logo" aria-hidden="true"></div><div class="title">TeamClaude</div></div>
       <p>Enter your proxy key to view status.</p>
+      <p id="keyboxNote" role="status"></p>
       <input id="key" type="password" placeholder="tc-..." autocomplete="off">
       <button id="go" class="pill-btn" type="button">Connect</button>
     </div>
@@ -3552,10 +3560,11 @@ ${createHall3d.toString()}
       return;
     }
     users.forEach(function (u) {
-      var row = el('div', 'us-row');
+      var row = el('div', u.disabled ? 'us-row off' : 'us-row');
       var nm = el('span', 'cl-name', u.name);
       nm.title = u.name;
       if (u.name === me) nm.appendChild(el('span', 'you', 'you'));
+      if (u.disabled) nm.appendChild(el('span', 'us-off', 'disabled'));
       row.appendChild(nm);
       var seg = el('span', 'seg on-bg');
       seg.setAttribute('role', 'group');
@@ -3583,6 +3592,12 @@ ${createHall3d.toString()}
       });
       acts.appendChild(sk);
       if (u.name !== me) {
+        // No second press, unlike Remove: Enable undoes it with the same key.
+        var dis = el('button', 'pill-btn xs quiet', u.disabled ? 'Enable' : 'Disable');
+        dis.type = 'button';
+        dis.title = (u.disabled ? 'Enable ' : 'Disable ') + u.name;
+        dis.addEventListener('click', function () { doUserChange('disable', { name: u.name, disabled: !u.disabled }, dis); });
+        acts.appendChild(dis);
         var confirming = userConfirm === u.name;
         var rm = el('button', 'pill-btn xs ' + (confirming ? 'violet' : 'quiet'), confirming ? 'Confirm' : 'Remove');
         rm.type = 'button';
@@ -5283,13 +5298,26 @@ ${createHall3d.toString()}
         // 403 is the loopback exemption refusing a key-less request (a Host
         // that does not name this machine, e.g. behind a local reverse proxy
         // that adds no forwarding headers). A valid key clears that gate too.
-        if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        // A disabled key is a 403 too, one that says so; the prompt shows why
+        // rather than reading as a wrong key.
+        if (res.status === 401 || res.status === 403) {
+          localStorage.removeItem(KEY);
+          showKeybox();
+          if (res.status === 403) {
+            res.json().then(function (j) {
+              var e = j && j.error;
+              if (e && e.type === 'permission_error' && typeof e.message === 'string') byId('keyboxNote').textContent = e.message;
+            }, function () {});
+          }
+          return null;
+        }
         if (!res.ok) throw new Error('status ' + res.status);
         return res.json();
       })
       .then(function (s) {
         if (!s) return;
         byId('keybox').style.display = 'none';
+        byId('keyboxNote').textContent = '';
         showApp();
         byId('err').style.display = 'none';
         setLive(true);

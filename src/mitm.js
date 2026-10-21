@@ -20,7 +20,7 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders } from './server.js';
+import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders, userDisabled } from './server.js';
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
@@ -230,7 +230,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
   // client), for the same reason. The map is bounded by accounts × client keys,
   // both operator-controlled.
   const serverPromises = new Map();
-  const getServer = (pin = '', client = null) => {
+  const getServer = (pin = '', /** @type {string|null} */ client = null) => {
     const mapKey = `${pin}\u0000${client || ''}`;
     let p = serverPromises.get(mapKey);
     if (p) return p;
@@ -273,6 +273,14 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // throw here exits the process (#340).
     srv.on('upgrade', (req, socket, head) => {
       try {
+        // The request listener refuses a user disabled since the CONNECT on
+        // each request; a WebSocket never reaches it, so it asks here.
+        if (client && userDisabled(/** @type {any} */ (config).proxy, client)) {
+          log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for disabled user ${JSON.stringify(safeLine(client, 64))}`);
+          try { socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+          socket.destroy();
+          return;
+        }
         const target = upgradeUpstreamFor(req.headers.host, config, upstream);
         if (!target) {
           log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
@@ -326,6 +334,12 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     // for remote clients. config.proxy is read per CONNECT so a reload that
     // edits clientKeys applies to a running server, matching the HTTP gate.
     const auth = resolveConnectAuth(req, clientSocket, config.proxy);
+    // A disabled user's key is refused outright: a 407 would only ask the
+    // client for the credential it already sent.
+    if (auth.disabled) {
+      refuseRaw(clientSocket, '403 Forbidden');
+      return;
+    }
     if (!auth.ok) {
       try {
         clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="teamclaude"\r\nConnection: close\r\n\r\n');
@@ -507,12 +521,14 @@ function redactToken(token) {
  * otherwise the proxy apiKey or a clientKeys entry must be presented via
  * `Proxy-Authorization` (Bearer <key>, or Basic where the key is the username
  * or password — so `--proxy http://<key>@host:port` works).
- * Returns { ok, client }.
+ * Returns { ok, client }, plus `disabled: true` for a disabled user's key,
+ * which loopback does not exempt (see resolveClientAuth).
  */
 export function resolveConnectAuth(req, socket, proxyConfig) {
   const hasKeys = !!(proxyConfig?.apiKey || (Array.isArray(proxyConfig?.clientKeys) && proxyConfig.clientKeys.length));
   if (!hasKeys) return { ok: true, client: null };
   const m = /^\s*(basic|bearer)\s+(.+?)\s*$/i.exec(req?.headers?.['proxy-authorization'] || '');
+  /** @type {{ ok: boolean, client: string|null, role?: string, disabled?: boolean }} */
   let auth = { ok: false, client: null };
   if (m) {
     let presented = m[2];
@@ -523,7 +539,7 @@ export function resolveConnectAuth(req, socket, proxyConfig) {
       const pass = i >= 0 ? dec.slice(i + 1) : '';
       // Try both slots: the documented remote form carries the key in either.
       auth = resolveClientAuth(proxyConfig, pass || user);
-      if (!auth.ok && pass && user) auth = resolveClientAuth(proxyConfig, user);
+      if (!auth.ok && !auth.disabled && pass && user) auth = resolveClientAuth(proxyConfig, user);
     } else {
       auth = resolveClientAuth(proxyConfig, presented);
     }
@@ -532,7 +548,7 @@ export function resolveConnectAuth(req, socket, proxyConfig) {
   // still names it (matching the HTTP gate, where a local caller with a client
   // key is attributed like any other). Same exemption as the other two gates,
   // so a forwarded request or `trustLoopback: false` closes it here too.
-  if (!auth.ok && loopbackExempt(req?.headers, socket?.remoteAddress, proxyConfig)) return { ok: true, client: null };
+  if (!auth.ok && !auth.disabled && loopbackExempt(req?.headers, socket?.remoteAddress, proxyConfig)) return { ok: true, client: null };
   return auth;
 }
 

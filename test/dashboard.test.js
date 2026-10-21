@@ -1062,6 +1062,19 @@ for (const status of [401, 403]) {
   });
 }
 
+test('a disabled key brings the key prompt up with the reason, which clears once a key works', async () => {
+  const page = bootPage({ storedKey: 'tc-bob' });
+  await page.answer(403, { type: 'error', error: { type: 'permission_error', message: 'This key has been disabled. Ask an admin to enable it again.' } });
+  assert.equal(page.byId('keybox').style.display, 'block');
+  assert.equal(page.store.size, 0, 'the stored key is dropped');
+  assert.match(page.byId('keyboxNote').textContent, /disabled/);
+
+  page.byId('key').value = 'tc-other';
+  page.byId('go').fire('click');
+  await page.answer(200, { accounts: [] });
+  assert.equal(page.byId('keyboxNote').textContent, '');
+});
+
 test('a first poll that fails shows its error instead of a blank page', async () => {
   const page = bootPage();
   await page.answer(500);
@@ -1416,6 +1429,17 @@ test('userOutcome never repeats a revealed or rotated key', () => {
   assert.equal(userOutcome('key', { ok: false }).text, 'showing the key failed');
 });
 
+test('userRequest sends a disable with its flag, and userOutcome says which way it went', () => {
+  const off = userRequest('disable', { name: ' bob ', role: 'admin', disabled: true }, 'tc-k');
+  assert.equal(off.url, '/teamclaude/users/disable');
+  assert.deepEqual(JSON.parse(off.init.body), { name: 'bob', disabled: true }, 'no role rides along');
+  assert.deepEqual(JSON.parse(userRequest('disable', { name: 'bob', disabled: false }, 'tc-k').init.body), { name: 'bob', disabled: false });
+  assert.deepEqual(userOutcome('disable', { ok: true, name: 'bob', disabled: true }), { kind: 'ok', text: 'disabled user bob' });
+  assert.deepEqual(userOutcome('disable', { ok: true, name: 'bob', disabled: false }), { kind: 'ok', text: 'enabled user bob' });
+  assert.deepEqual(userOutcome('disable', { ok: false, error: 'There is no user named "bob".' }),
+    { kind: 'error', text: 'disabling or enabling the user failed: There is no user named "bob".' });
+});
+
 test('viewerCan offers rotating to any named key, and to no one without a name', () => {
   for (const role of ['operator', 'tenant', 'readonly']) assert.equal(viewerCan({ client: 'bob', role }, 'rotate'), true, role);
   assert.equal(viewerCan({ client: null, role: 'operator' }, 'rotate'), false, 'the shared key has no key of its own');
@@ -1558,6 +1582,33 @@ test("Show key reveals a user's keys on request, and Hide takes them off the pag
   page.clickTitled('Hide key of bob');
   assert.equal(page.valued('tc-bob'), 0);
   assert.equal(page.titled('Show key of bob'), 1);
+});
+
+test('Disable sends at once, and a disabled user is shown off with Enable in its place', async () => {
+  const page = bootPage({ storedKey: 'tc-alice' });
+  await page.answer(200, USERS_STATUS({ client: 'alice', role: 'operator' }));
+  assert.equal(page.titled('Disable alice'), 0, 'your own key is not offered');
+  assert.equal(page.titled('Disable bob'), 1);
+  page.clickTitled('Disable bob');
+  const req = page.requests.at(-1);
+  assert.equal(req.url, '/teamclaude/users/disable');
+  assert.equal(req.init.headers['x-api-key'], 'tc-alice');
+  assert.deepEqual(JSON.parse(req.init.body), { name: 'bob', disabled: true });
+  await page.answer(200, { ok: true, name: 'bob', disabled: true });
+  assert.match(page.byId('note').textContent, /disabled user bob/);
+
+  const status = USERS_STATUS({ client: 'alice', role: 'operator' });
+  status.users[1] = { name: 'bob', role: 'tenant', disabled: true };
+  await page.answer(200, status);
+  assert.equal(page.titled('Enable bob'), 1);
+  assert.equal(page.titled('Disable bob'), 0);
+  assert.equal(page.classed('us-row off').length, 1, 'only the disabled row is dimmed');
+  assert.deepEqual(page.classed('us-off'), ['disabled']);
+
+  page.clickTitled('Enable bob');
+  assert.deepEqual(JSON.parse(page.requests.at(-1).init.body), { name: 'bob', disabled: false });
+  await page.answer(400, { ok: false, error: 'There is no user named "bob".' });
+  assert.match(page.byId('note').textContent, /disabling or enabling the user failed/);
 });
 
 test('a refused Show key says why and shows nothing', async () => {

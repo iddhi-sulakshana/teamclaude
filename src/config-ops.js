@@ -402,8 +402,8 @@ export function setAccountDisabled(config, query, disabled, spec = {}) {
 // ── users (proxy.clientKeys) ─────────────────────────────────────────────────
 //
 // What the dashboard's Users card changes. A user is every clientKeys entry
-// that carries one name: the auth gate books them all to that name, so remove
-// and role act on all of them rather than refusing a name listed twice. The
+// that carries one name: the auth gate books them all to that name, so remove,
+// role and disable act on all of them rather than refusing a name listed twice. The
 // role is written the way the server reads it (clientKeyRole): absent for a
 // tenant, "admin" or "readonly" otherwise.
 
@@ -524,6 +524,31 @@ export function setClientKeyRole(config, query, role, spec = {}) {
     else entry.role = next;
   }
   return { name, role: next };
+}
+
+/**
+ * Disable or enable a user on every entry with the name. A disabled user keeps
+ * their keys, role and usage, and every gate refuses the keys until they are
+ * enabled again; enabling deletes the flag rather than writing false, as
+ * setAccountDisabled does.
+ * @param {Config} config
+ * @param {unknown} query
+ * @param {unknown} disabled
+ * @param {{ actor?: string|null }} [spec] the user making the change, who may
+ *   not disable the key they are signed in with
+ * @returns {{ name: string, disabled: boolean }}
+ */
+export function setClientKeyDisabled(config, query, disabled, spec = {}) {
+  const name = userName(query);
+  if (typeof disabled !== 'boolean') throw new ConfigOpError('disabled must be true or false');
+  const entries = clientKeyList(config).filter(e => namedAs(e, name));
+  if (!entries.length) throw new ConfigOpError(`There is no user named "${name}".`);
+  if (spec.actor === name && disabled) throw new ConfigOpError('You cannot disable the key you are signed in with.');
+  for (const entry of entries) {
+    if (disabled) entry.disabled = true;
+    else delete entry.disabled;
+  }
+  return { name, disabled };
 }
 
 /**

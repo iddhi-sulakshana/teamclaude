@@ -316,13 +316,19 @@ export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost
  * Which identity a presented key authenticates as, checked against the shared
  * `proxy.apiKey` and every `proxy.clientKeys` entry ({ name, key, role? }).
  *
- * Returns { ok, client, role? }: ok=false → reject; `client` is the matching entry's
+ * Returns { ok, client, role?, disabled? }: ok=false → reject; `client` is the matching entry's
  * name (per-client usage is booked against it), or null for the shared key —
  * the shared key predates client identities and stays unattributed rather than
  * inventing one. `role` is present only when the matching entry names one (see
  * clientKeyRole), so every other answer keeps the shape it has always had.
  * With no keys configured at all the gate is open (unchanged
  * behavior), also unattributed.
+ *
+ * A key whose entry says `disabled` is refused with `disabled: true`, which
+ * every gate honours even where loopback would admit a caller with no key: a
+ * disabled user on the proxy's own machine must not get in as the operator.
+ * Disabled entries still count as configured keys, so a proxy with no shared
+ * key whose users are all disabled stays shut rather than falling open.
  *
  * Client keys are checked first so a clientKeys entry that duplicates the
  * shared key still yields its name. Every candidate uses the constant-time
@@ -393,6 +399,7 @@ export function resolveClientAuth(proxyConfig, presented) {
   if (!shared && clientKeys.length === 0) return { ok: true, client: null };
   for (const entry of clientKeys) {
     if (safeKeyEqual(presented, entry.key)) {
+      if (entry.disabled) return { ok: false, client: null, disabled: true };
       const role = clientKeyRole(entry);
       return role ? { ok: true, client: entry.name.trim(), role } : { ok: true, client: entry.name.trim() };
     }
@@ -415,6 +422,7 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/users/add', 'a client key cannot change users'],
   ['/teamclaude/users/remove', 'a client key cannot change users'],
   ['/teamclaude/users/role', 'a client key cannot change users'],
+  ['/teamclaude/users/disable', 'a client key cannot change users'],
   // A write in no file, but it answers other users' credentials.
   ['/teamclaude/users/key', "a client key cannot see users' keys"],
   // Every answer spends the fleet's quota on the operator's behalf.
@@ -433,15 +441,34 @@ const USER_OPS = new Map([
   ['/teamclaude/users/add', { hook: 'addUser', said: r => `Added user "${r.name}" (${r.role})` }],
   ['/teamclaude/users/remove', { hook: 'removeUser', said: r => `Removed user "${r.name}"` }],
   ['/teamclaude/users/role', { hook: 'setUserRole', said: r => `Set role of user "${r.name}" to ${r.role}` }],
+  ['/teamclaude/users/disable', { hook: 'setUserDisabled', said: r => `${r.disabled ? 'Disabled' : 'Enabled'} user "${r.name}"` }],
 ]);
+
+// What a disabled key is told, wherever it is refused with a body to carry it.
+const DISABLED_KEY_MESSAGE = 'This key has been disabled. Ask an admin to enable it again.';
+
+/**
+ * Whether a user is disabled: every clientKeys entry with the name says so. A
+ * name with one key still on is not, since that key still works; a name no
+ * longer listed is not either, as there is nothing left to disable.
+ * @param {any} proxyConfig
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function userDisabled(proxyConfig, name) {
+  const entries = (Array.isArray(proxyConfig?.clientKeys) ? proxyConfig.clientKeys : [])
+    .filter(/** @param {any} e */ e => typeof e?.name === 'string' && e.name.trim() === name);
+  return entries.length > 0 && entries.every(/** @param {any} e */ e => !!e.disabled);
+}
 
 /**
  * The configured users as the dashboard's Users card lists them: one row per
  * name, with the role the gate gives it, and never a key. A name listed more
  * than once shows the lowest role any of its entries has, which is what the
- * admin-model gate (isAdminCaller) already does for such a name.
+ * admin-model gate (isAdminCaller) already does for such a name. `disabled`
+ * is present only on a disabled user (userDisabled).
  * @param {any} proxyConfig
- * @returns {{ name: string, role: 'tenant'|'admin'|'readonly' }[]}
+ * @returns {{ name: string, role: 'tenant'|'admin'|'readonly', disabled?: true }[]}
  */
 function configuredUsers(proxyConfig) {
   const rank = { readonly: 0, tenant: 1, admin: 2 };
@@ -453,7 +480,7 @@ function configuredUsers(proxyConfig) {
     const seen = byName.get(name);
     if (!seen || rank[role] < rank[seen]) byName.set(name, role);
   }
-  return [...byName].map(([name, role]) => ({ name, role }));
+  return [...byName].map(([name, role]) => (userDisabled(proxyConfig, name) ? { name, role, disabled: true } : { name, role }));
 }
 
 /**
@@ -544,6 +571,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       const clientKey = req.headers['x-api-key'];
       const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
       const auth = resolveClientAuth(config.proxy, clientKey);
+      // A disabled key is refused before the loopback exemption: naming a
+      // disabled key is not the same as naming none. A 403 in Anthropic's
+      // error shape, so Claude Code shows the reason instead of asking for a
+      // new key.
+      if (auth.disabled) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'permission_error', message: DISABLED_KEY_MESSAGE },
+        }));
+        return;
+      }
       if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -912,8 +951,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
-      // Users (proxy.clientKeys): add, remove, and change a role, from the
-      // dashboard's Users card. Operator only, like the account controls: a
+      // Users (proxy.clientKeys): add, remove, change a role, and disable or
+      // enable, from the dashboard's Users card. Operator only, like the account controls: a
       // tenant key is refused by CLIENT_KEY_REFUSED_PATHS and a readonly one by
       // the prefix rule before either reaches here. The caller's own name goes
       // to the hook as `actor`, so an admin key cannot remove or demote itself.
@@ -947,7 +986,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
             ? await hooks.addUser({ name: body.name, role: body.role })
             : url === '/teamclaude/users/remove'
               ? await hooks.removeUser(body.name, { actor })
-              : await hooks.setUserRole(body.name, body.role, { actor });
+              : url === '/teamclaude/users/disable'
+                ? await hooks.setUserDisabled(body.name, body.disabled, { actor })
+                : await hooks.setUserRole(body.name, body.role, { actor });
         } catch (err) {
           const known = err instanceof ConfigOpError;
           const message = /** @type {Error} */ (err).message;
@@ -1319,6 +1360,12 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // but it is a way to reach the upstream on this host's address and
       // bandwidth. A deployment on a public hostname hands that to anyone.
       const auth = resolveUpgradeAuth(req, socket, config.proxy, boundHost());
+      if (auth.disabled) {
+        console.log(`[TeamClaude] WebSocket upgrade refused (a disabled key) from ${safeLine(/** @type {import('node:net').Socket} */ (socket)?.remoteAddress || 'unknown')} for ${safeLine(req.url)}`);
+        try { socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+        socket.destroy();
+        return;
+      }
       if (!auth.ok) {
         // Logged as well as answered: a WebSocket client discards the status
         // line, so the 401 alone leaves an operator with a channel that is
@@ -1640,6 +1687,16 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Request path must not contain dot-segments' } }));
         recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
+        return;
+      }
+
+      // Inside a MITM tunnel the key was checked once, at CONNECT, and a
+      // tunnel outlives that by as long as the client keeps it busy. So a user
+      // disabled since is refused here, per request, with the reason the base
+      // gate gives (config.proxy is read live, as the gate reads it).
+      if (forcedClient && userDisabled(/** @type {any} */ (config)?.proxy, forcedClient)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: DISABLED_KEY_MESSAGE } }));
         return;
       }
 
@@ -2244,7 +2301,7 @@ function relayStream(req, res, upstream, sx, stripOverage = false) {
  */
 export function resolveUpgradeAuth(req, socket, proxyConfig, boundHost = null) {
   const auth = resolveClientAuth(proxyConfig, req?.headers?.['x-api-key']);
-  if (auth.ok) return auth;
+  if (auth.ok || auth.disabled) return auth;
   // Loopback is exempt from the key requirement, exactly as the HTTP and
   // CONNECT gates are — with the request path's two conditions on top, for
   // the same actor: a web page in the operator's browser. A page can open a
@@ -2306,7 +2363,7 @@ export function upgradeTarget(upstream, url) {
   return target;
 }
 
-export function relayUpgrade(req, socket, head, upstream, sx, { client = null, clientUsage = null, log = console.log, stripOverage = false } = {}) {
+export function relayUpgrade(req, socket, head, upstream, sx, { client = /** @type {string|null} */ (null), clientUsage = null, log = console.log, stripOverage = false } = {}) {
   const target = upgradeTarget(upstream, req.url);
   if (!target) {
     log(`[TeamClaude] WebSocket upgrade refused: request target ${JSON.stringify(safeLine(req.url, 128))} is not a path on the upstream`);
