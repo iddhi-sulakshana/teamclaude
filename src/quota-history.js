@@ -69,21 +69,20 @@ export function valueAt(row, bucket, at = row.t) {
 }
 
 /**
- * How much a bucket rose from one sample to the next. A reset in between (the
- * instant moved on, or the reading fell) means the later reading was all spent
- * since; a bucket first seen in the later sample has nothing to rise from.
+ * Whether a bucket's reading in `row` belongs to a later window than the one in
+ * `prev`. The reset instant moving on says so. A fall alone does not: the
+ * response headers and the usage endpoint take turns updating the reading and
+ * round differently, so it can step back a point inside one window and return.
+ * Only with no reset to go by is a fall taken for a refill.
  * @param {Sample} prev
  * @param {Sample} row
  * @param {string} bucket
  */
-function rise(prev, row, bucket) {
-  const before = valueAt(prev, bucket);
-  const after = valueAt(row, bucket);
-  if (before == null || after == null) return 0;
+function newWindow(prev, row, bucket) {
   const r0 = prev[bucket + 'Reset'];
   const r1 = row[bucket + 'Reset'];
-  if ((Number.isFinite(r0) && Number.isFinite(r1) && r1 - r0 > RESET_JUMP_MS) || after < before) return after;
-  return after - before;
+  if (Number.isFinite(r0) && Number.isFinite(r1)) return r1 - r0 > RESET_JUMP_MS;
+  return /** @type {number} */ (valueAt(row, bucket)) < /** @type {number} */ (valueAt(prev, bucket));
 }
 
 /**
@@ -188,9 +187,11 @@ export class QuotaHistory {
 
   /**
    * Pro-weeks spent on one bucket over the `spanMs` before `now`: each
-   * account's rises between consecutive samples inside the span, times its
-   * weight. An account `weightOf` gives no weight (unknown tier, disabled) is
-   * left out.
+   * account's rises inside the span, times its weight. A rise is measured from
+   * the highest reading so far in the window, so a dip and its return are not
+   * spent twice; a new window's first reading was all spent since its reset;
+   * a bucket first seen mid-span has nothing to rise from. An account
+   * `weightOf` gives no weight (unknown tier, disabled) is left out.
    * @param {string} bucket
    * @param {number} now
    * @param {number} spanMs
@@ -204,9 +205,23 @@ export class QuotaHistory {
       if (!weight) continue;
       /** @type {Sample|null} */
       let prev = null;
+      let peak = 0;
       for (const row of list) {
         if (row.t < from || row.t > now) continue;
-        if (prev) total += weight * rise(prev, row, bucket);
+        const after = valueAt(row, bucket);
+        if (after != null) {
+          if (!prev || valueAt(prev, bucket) == null) peak = after;
+          else if (newWindow(prev, row, bucket)) {
+            total += weight * after;
+            peak = after;
+          } else if (after > peak) {
+            total += weight * (after - peak);
+            peak = after;
+          }
+          // A 0 is a window that is over or one untouched: the next rise
+          // counts from there.
+          if (after === 0) peak = 0;
+        }
         prev = row;
       }
     }

@@ -72,6 +72,39 @@ test('burned counts a reset as spend from zero, and ignores jitter in the reset'
   near(j.burned('unified7d', NOW, 2 * HOUR, weights({ 'u-b': 1 })), 0.02);
 });
 
+test('burned takes a reading that dips inside one window as rounding, not a reset', () => {
+  // The response headers and the usage endpoint take turns updating the
+  // reading and round differently, so it can step back a point and return
+  // with the reset unchanged (seen live: 0.39 0.38 0.39 0.40 0.41 0.40 0.41).
+  const h = new QuotaHistory();
+  const a = claude('a', {});
+  const reset = NOW + 50 * HOUR;
+  [0.39, 0.38, 0.39, 0.40, 0.41, 0.40, 0.41].forEach((u, i, all) => {
+    Object.assign(a.quota, { unified7d: u, unified7dReset: i % 2 ? reset - 144 : reset });
+    h.sample([a], NOW - (all.length - 1 - i) * HOUR);
+  });
+  near(h.burned('unified7d', NOW, 10 * HOUR, weights({ 'u-a': 5 })), 0.10);
+
+  // With no reset on either reading there is nothing else to go by, and a fall
+  // still reads as a new window.
+  const j = new QuotaHistory();
+  const b = claude('b', { unified7d: 0.60 });
+  j.sample([b], NOW - HOUR);
+  b.quota.unified7d = 0.02;
+  j.sample([b], NOW);
+  near(j.burned('unified7d', NOW, 2 * HOUR, weights({ 'u-b': 1 })), 0.02);
+
+  // A window that is over reads 0, and what the next one spends counts from
+  // there even when its first reading carries no reset.
+  const k = new QuotaHistory();
+  const c = claude('c', { unified7d: 0.90, unified7dReset: NOW - 90 * 60_000 });
+  k.sample([c], NOW - 2 * HOUR);
+  k.sample([c], NOW - HOUR);
+  Object.assign(c.quota, { unified7d: 0.05, unified7dReset: null });
+  k.sample([c], NOW);
+  near(k.burned('unified7d', NOW, 3 * HOUR, weights({ 'u-c': 1 })), 0.05);
+});
+
 test('coverage grades the history', () => {
   const h = new QuotaHistory();
   assert.deepEqual(h.coverage(NOW), { spanMs: 0, confidence: 'low' });
