@@ -298,6 +298,10 @@ export function atomicConfigUpdate(updater) {
   return withConfigLock(path, async () => {
     const config = await loadConfig() || createDefaultConfig();
     await updater(config);
+    // A row the updater added (a login, an import) is written with its id: a
+    // row without one would be given a different id by every later load, and a
+    // running server pairs its refreshed tokens to the row by that id.
+    if (Array.isArray(config.accounts)) ensureAccountIds(config.accounts);
     await writeJsonAtomic(path, config);
     return config;
   });
