@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { QuotaHistory, isForecastAccount, accountKey, valueAt, HISTORY_RETAIN_MS } from '../src/quota-history.js';
+import { QuotaHistory, isForecastAccount, accountKey, valueAt, HISTORY_RETAIN_MS, HISTORY_FINE_MS } from '../src/quota-history.js';
 
 const HOUR = 3600_000;
 const NOW = Date.UTC(2026, 9, 10, 12, 0, 0);
@@ -40,6 +40,28 @@ test('sample keeps forecast accounts, drops removed ones and ages out old sample
   assert.deepEqual([...h.samples.keys()], ['u-a'], 'b left the fleet');
   h.sample([a], NOW + HISTORY_RETAIN_MS + 2 * HOUR);
   assert.equal(h.samples.get('u-a').length, 1, 'the first two samples aged out');
+});
+
+test('history is kept four weeks, every sample for two days and one an hour before that', () => {
+  assert.equal(HISTORY_RETAIN_MS, 28 * 24 * HOUR);
+  assert.equal(HISTORY_FINE_MS, 48 * HOUR);
+  const h = new QuotaHistory();
+  const a = claude('a', { unified7d: 0.10, unified7dReset: NOW + 60 * 24 * HOUR });
+  // Every 15 minutes from 12:00 to 13:45.
+  for (let k = 0; k < 8; k++) {
+    a.quota.unified7d = 0.10 + k / 100;
+    h.sample([a], NOW + k * HOUR / 4);
+  }
+  const later = NOW + HISTORY_FINE_MS + 90 * 60_000;
+  a.quota.unified7d = 0.20;
+  h.sample([a], later);
+  // Up to 13:30 is past the two days: the first sample of each clock hour stays.
+  assert.deepEqual(h.samples.get('u-a').map(row => row.t), [NOW, NOW + HOUR, NOW + 105 * 60_000, later]);
+  near(h.burned('unified7d', later, later - NOW, weights({ 'u-a': 1 })), 0.10, 1e-9);
+
+  const last = NOW + HISTORY_RETAIN_MS + 30 * 60_000;
+  h.sample([a], last);
+  assert.deepEqual(h.samples.get('u-a').map(row => row.t), [NOW + HOUR, later, last], '12:00 aged out; 13:45 thinned into 13:00');
 });
 
 test('burned sums each account\'s rises inside the span, weighted', () => {
@@ -146,12 +168,14 @@ test('history round-trips through the state file and skips bad rows', () => {
   const h = new QuotaHistory();
   h.sample([claude('a', { unified7d: 0.1 })], NOW - HOUR);
   const saved = JSON.parse(JSON.stringify(h.exportState()));
-  saved['u-a'].push('junk', { t: 'soon' }, { t: NOW + HOUR, unified7d: 1 }, { t: NOW - 3 * 24 * HOUR, unified7d: 1 }, { t: NOW - HOUR / 2, unified7d: 0.2, extra: 'dropped' });
+  saved['u-a'].push('junk', { t: 'soon' }, { t: NOW + HOUR, unified7d: 1 }, { t: NOW - HISTORY_RETAIN_MS - HOUR, unified7d: 1 },
+    { t: NOW - 3 * 24 * HOUR, unified7d: 0.05 }, { t: NOW - HOUR / 2, unified7d: 0.2, extra: 'dropped' });
   saved['u-b'] = 'not-a-list';
   const back = new QuotaHistory();
   back.restore(saved, NOW);
   back.restore(null, NOW);
   assert.deepEqual(back.samples.get('u-a'), [
+    { t: NOW - 3 * 24 * HOUR, unified7d: 0.05 },
     { t: NOW - HOUR, unified7d: 0.1 },
     { t: NOW - HOUR / 2, unified7d: 0.2 },
   ]);

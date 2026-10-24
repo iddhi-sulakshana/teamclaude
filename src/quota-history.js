@@ -3,10 +3,12 @@
 // An account's quota is a snapshot: the utilization and reset instant the last
 // response reported. Nothing in it says how fast the fleet is spending, so this
 // samples every Claude subscription's buckets on a timer (every 15 minutes, from
-// index.js) and keeps two days of them. From that come the fleet's burn rate
-// over the last day, the curve the dashboard draws behind the forecast, and an
-// account's recent session slope. It is saved in the state file with the rest
-// of the quota, so a restart does not cost a day of history.
+// index.js) and keeps four weeks of them: every sample for two days, then the
+// first of each clock hour, which is enough to read a week's rhythm back from.
+// From that come the fleet's burn rate over the last day, the curve the
+// dashboard draws behind the forecast, and an account's recent session slope.
+// It is saved in the state file with the rest of the quota, so a restart does
+// not cost a day of history.
 //
 // The routing learner (BurnRateLearner, adaptive-distribution.js) answers a
 // different question — how fast ONE account is burning over the last few
@@ -15,7 +17,13 @@
 
 import { providerOf } from './provider.js';
 
-export const HISTORY_RETAIN_MS = 48 * 3600_000;
+export const HISTORY_RETAIN_MS = 28 * 24 * 3600_000;
+/**
+ * How long every sample is kept. Older ones are thinned to the first of each
+ * clock hour: a rise between two of them is the sum of the rises between the
+ * samples dropped, so the spend read back is the same, at a quarter the size.
+ */
+export const HISTORY_FINE_MS = 48 * 3600_000;
 /** The span the fleet's burn rate is measured over once that much history exists. */
 export const RATE_SPAN_MS = 24 * 3600_000;
 const HOUR_MS = 3600_000;
@@ -160,8 +168,16 @@ export class QuotaHistory {
   /** @param {number} now */
   _prune(now) {
     const cutoff = now - this.retainMs;
+    const fine = now - HISTORY_FINE_MS;
     for (const [key, list] of this.samples) {
-      const keep = list.filter(row => row.t > cutoff);
+      /** @type {Sample[]} */
+      const keep = [];
+      for (const row of list) {
+        if (row.t <= cutoff) continue;
+        const prev = keep[keep.length - 1];
+        if (row.t <= fine && prev && Math.floor(prev.t / HOUR_MS) === Math.floor(row.t / HOUR_MS)) continue;
+        keep.push(row);
+      }
       if (keep.length) this.samples.set(key, keep);
       else this.samples.delete(key);
     }
