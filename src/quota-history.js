@@ -4,7 +4,7 @@
 // response reported. Nothing in it says how fast the fleet is spending, so this
 // samples every Claude subscription's buckets on a timer (every 15 minutes, from
 // index.js) and keeps four weeks of them: every sample for two days, then the
-// first of each clock hour, which is enough to read a week's rhythm back from.
+// last of each clock hour, which is enough to read a week's rhythm back from.
 // From that come the fleet's burn rate over the last day, the curve the
 // dashboard draws behind the forecast, and an account's recent session slope.
 // It is saved in the state file with the rest of the quota, so a restart does
@@ -19,9 +19,11 @@ import { providerOf } from './provider.js';
 
 export const HISTORY_RETAIN_MS = 28 * 24 * 3600_000;
 /**
- * How long every sample is kept. Older ones are thinned to the first of each
- * clock hour: a rise between two of them is the sum of the rises between the
- * samples dropped, so the spend read back is the same, at a quarter the size.
+ * How long every sample is kept. Older ones are thinned to the last of each
+ * clock hour and the last of each window: a rise between two kept samples is
+ * the sum of the rises between the ones dropped, and a window's last reading
+ * holds all that was spent in it, so the spend read back is the same, at about
+ * a quarter the size.
  */
 export const HISTORY_FINE_MS = 48 * 3600_000;
 /** The span the fleet's burn rate is measured over once that much history exists. */
@@ -91,6 +93,17 @@ function newWindow(prev, row, bucket) {
   const r1 = row[bucket + 'Reset'];
   if (Number.isFinite(r0) && Number.isFinite(r1)) return r1 - r0 > RESET_JUMP_MS;
   return /** @type {number} */ (valueAt(row, bucket)) < /** @type {number} */ (valueAt(prev, bucket));
+}
+
+/**
+ * Whether `row` is the last reading of a window in some bucket: `next` belongs
+ * to a later one. Thinning keeps such a row: the next sample kept counts from
+ * zero, so what this one saw since the last kept reading would be lost.
+ * @param {Sample} row
+ * @param {Sample} next
+ */
+function endsWindow(row, next) {
+  return HISTORY_BUCKETS.some(bucket => valueAt(row, bucket) != null && valueAt(next, bucket) != null && newWindow(row, next, bucket));
 }
 
 /**
@@ -172,12 +185,12 @@ export class QuotaHistory {
     for (const [key, list] of this.samples) {
       /** @type {Sample[]} */
       const keep = [];
-      for (const row of list) {
-        if (row.t <= cutoff) continue;
-        const prev = keep[keep.length - 1];
-        if (row.t <= fine && prev && Math.floor(prev.t / HOUR_MS) === Math.floor(row.t / HOUR_MS)) continue;
+      list.forEach((row, i) => {
+        if (row.t <= cutoff) return;
+        const next = list[i + 1];
+        if (row.t <= fine && next && Math.floor(next.t / HOUR_MS) === Math.floor(row.t / HOUR_MS) && !endsWindow(row, next)) return;
         keep.push(row);
-      }
+      });
       if (keep.length) this.samples.set(key, keep);
       else this.samples.delete(key);
     }

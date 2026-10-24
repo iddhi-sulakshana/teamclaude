@@ -55,13 +55,35 @@ test('history is kept four weeks, every sample for two days and one an hour befo
   const later = NOW + HISTORY_FINE_MS + 90 * 60_000;
   a.quota.unified7d = 0.20;
   h.sample([a], later);
-  // Up to 13:30 is past the two days: the first sample of each clock hour stays.
-  assert.deepEqual(h.samples.get('u-a').map(row => row.t), [NOW, NOW + HOUR, NOW + 105 * 60_000, later]);
-  near(h.burned('unified7d', later, later - NOW, weights({ 'u-a': 1 })), 0.10, 1e-9);
+  // Up to 13:30 is past the two days: the last sample of each clock hour stays.
+  // 13:30 goes too, since 13:45 is still kept in full.
+  const at = (/** @type {number} */ min) => NOW + min * 60_000;
+  assert.deepEqual(h.samples.get('u-a').map(row => row.t), [at(45), at(105), later]);
+  near(h.burned('unified7d', later, later - at(45), weights({ 'u-a': 1 })), 0.07, 1e-9);
 
-  const last = NOW + HISTORY_RETAIN_MS + 30 * 60_000;
+  const last = NOW + HISTORY_RETAIN_MS + 50 * 60_000;
   h.sample([a], last);
-  assert.deepEqual(h.samples.get('u-a').map(row => row.t), [NOW + HOUR, later, last], '12:00 aged out; 13:45 thinned into 13:00');
+  assert.deepEqual(h.samples.get('u-a').map(row => row.t), [at(105), later, last], '12:45 aged out');
+});
+
+test('thinning keeps the last reading of a window, so the spend before a reset is not lost', () => {
+  const h = new QuotaHistory();
+  const reset = NOW + 80 * 60_000; // 13:20, off the hour
+  const a = claude('a', {});
+  // 12:00 to 14:45 every 15 minutes: 0.50 rising two points a sample to 0.60
+  // at 13:15, then a new window from 0.02 at 13:30 up to 0.12.
+  const values = [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12];
+  values.forEach((u, k) => {
+    const t = NOW + k * HOUR / 4;
+    Object.assign(a.quota, { unified7d: u, unified7dReset: t < reset ? reset : reset + 168 * HOUR });
+    h.sample([a], t);
+  });
+  const from = NOW + 45 * 60_000;
+  const full = h.burned('unified7d', NOW + 3 * HOUR, NOW + 3 * HOUR - from, weights({ 'u-a': 1 }));
+  near(full, 0.16, 1e-9);
+  h.sample([a], NOW + HISTORY_FINE_MS + 3 * HOUR);
+  assert.ok(h.samples.get('u-a').some(row => row.t === NOW + 75 * 60_000), '13:15, the window\'s last reading, is kept');
+  near(h.burned('unified7d', NOW + 3 * HOUR, NOW + 3 * HOUR - from, weights({ 'u-a': 1 })), full, 1e-9);
 });
 
 test('burned sums each account\'s rises inside the span, weighted', () => {
