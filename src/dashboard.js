@@ -347,11 +347,13 @@ export function extraUsageText(account) {
 // cap keeps a meter filling toward it from being read as one filling toward
 // the limit. `ratio` is null with neither ceiling known (an empty meter behind
 // the bare amount), and unclamped: upstream can report a month past its limit.
-// `off` marks an account that billed this month and cannot now. Shown for
-// exactly the accounts extraUsageText has words for.
+// `off` marks an account that billed this month and cannot now. `ceiling` is
+// that binding ceiling in minor units (null with neither known), for the
+// fleet row that adds them up. Shown for exactly the accounts extraUsageText
+// has words for.
 /**
  * @param {Record<string, any>|null|undefined} account
- * @returns {{ ratio: number|null, used: string, rest: string, title: string, off: boolean }|null}
+ * @returns {{ ratio: number|null, used: string, rest: string, title: string, off: boolean, ceiling: number|null }|null}
  */
 export function extraUsageBar(account) {
   var title = extraUsageText(account);
@@ -369,7 +371,52 @@ export function extraUsageBar(account) {
   };
   var rest = (ceiling == null ? '' : ' of ' + money(ceiling) + (capBinds ? ' cap' : ''))
     + (spend.enabled ? '' : ' · off');
-  return { ratio: ratio, used: money(used), rest: rest, title: title, off: !spend.enabled };
+  return { ratio: ratio, used: money(used), rest: rest, title: title, off: !spend.enabled, ceiling: ceiling };
+}
+
+// The Proxy status card's two extra-usage rows, for the whole fleet: how many
+// accounts can bill past their plan right now (and how many are doing so),
+// and this month's extra spend added up across the accounts extraUsageBar
+// has a figure for, against the sum of their ceilings — each account's own
+// (its `maxSpend` cap when that binds, else upstream's monthly limit), so the
+// total reads "of" what rotation can actually run up. One unknown ceiling
+// drops the "of" rather than understating it. Currencies are added up apart,
+// never converted. Null when no account reports spend at all (a fleet with no
+// Anthropic OAuth account, or one not yet probed), so the rows can stay off
+// the card instead of saying "0 of 12" about a feature the fleet cannot use.
+/**
+ * @param {Array<Record<string, any>>|null|undefined} accounts
+ * @returns {{ total: number, enabled: number, billing: number, amount: string|null, lines: string[] }|null}
+ */
+export function fleetExtraUsage(accounts) {
+  var list = accounts || [];
+  var seen = 0, enabled = 0, billing = 0;
+  /** @type {string[]} */
+  var lines = [];
+  /** @type {Record<string, { currency: any, exponent: any, usedMinor: number, ceilingMinor: number, open: boolean }>} */
+  var sums = {};
+  /** @type {string[]} */
+  var order = [];
+  list.forEach(function (a) {
+    var spend = (a.quota || {}).spend;
+    if (!spend) return;
+    seen++;
+    if (spend.enabled) enabled++;
+    if (a.onExtraUsage === true) billing++;
+    var bar = extraUsageBar(a);
+    if (!bar) return;
+    lines.push(a.name + ': ' + bar.used + bar.rest.replace(/ · off$/, ''));
+    var key = spend.currency || '';
+    if (!sums[key]) { sums[key] = { currency: spend.currency, exponent: spend.exponent, usedMinor: 0, ceilingMinor: 0, open: false }; order.push(key); }
+    sums[key].usedMinor += spend.usedMinor || 0;
+    if (bar.ceiling == null) sums[key].open = true; else sums[key].ceilingMinor += bar.ceiling;
+  });
+  if (!seen) return null;
+  var amounts = order.map(function (key) {
+    var sum = sums[key];
+    return formatMoney({ currency: sum.currency, exponent: sum.exponent, usedMinor: sum.usedMinor, limitMinor: sum.open ? null : sum.ceilingMinor });
+  });
+  return { total: list.length, enabled: enabled, billing: billing, amount: amounts.length ? amounts.join(' + ') : null, lines: lines };
 }
 
 // A meter's colour band, on the thresholds the Accounts legend names: under
@@ -1501,7 +1548,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows, hallLayout,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
-  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, meterTone, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
+  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, fleetExtraUsage, meterTone, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
   forecastGeometry, forecastTicks, forecastHover, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -2348,6 +2395,8 @@ const PAGE = `<!doctype html>
         <div class="kv"><span class="k">Conversations</span><span class="v" id="statConv">—</span></div>
         <div class="kv"><span class="k">Uptime</span><span class="v" id="statUp">—</span></div>
         <div class="kv"><span class="k">Accounts active</span><span class="v kv-segs" id="statServing">—</span></div>
+        <div class="kv" id="statExtraWrap" style="display:none"><span class="k">Extra usage</span><span class="v kv-segs" id="statExtra">—</span></div>
+        <div class="kv" id="statSpendWrap" style="display:none"><span class="k">Extra spend</span><span class="v" id="statSpend">—</span></div>
         <div class="kv tail" id="thrWrap">
           <label class="k" for="thrVal">Auto-switch at</label>
           <div class="thr-row">
@@ -5014,6 +5063,31 @@ ${createHall3d.toString()}
         return a.name + ' (' + (UNAVAILABLE_TEXT[why] || why) + ')';
       }).join(', ')
       : 'Every account can take a request';
+    renderExtraUsageRows(accounts);
+  }
+
+  // Extra usage (paid overage) for the fleet, under Accounts active: the
+  // accounts that can bill past their plan, drawn the way the active count
+  // is, and what the month has cost across them. Both rows stay off a card
+  // whose fleet reports no spend at all; the spend row alone goes when no
+  // account can bill and none has, so the card does not show "$0.00" about
+  // nothing. The tooltips carry the per-account figures.
+  function renderExtraUsageRows(accounts) {
+    var fleet = fleetExtraUsage(accounts);
+    byId('statExtraWrap').style.display = fleet ? '' : 'none';
+    byId('statSpendWrap').style.display = fleet && fleet.amount ? '' : 'none';
+    if (!fleet) return;
+    var box = byId('statExtra');
+    box.textContent = '';
+    box.appendChild(segBar(fleet.enabled, fleet.total));
+    box.appendChild(el('span', '', fleet.enabled + ' of ' + fleet.total + (fleet.billing ? ' · ' + fleet.billing + ' billing' : '')));
+    var canBill = accounts.filter(function (a) { return a.quota && a.quota.spend && a.quota.spend.enabled; }).map(function (a) { return a.name; });
+    box.title = (canBill.length ? 'Can bill past plan limits: ' + canBill.join(', ') : 'No account can bill past its plan limits')
+      + (fleet.billing ? ' · serving on extra usage now: ' + accounts.filter(function (a) { return a.onExtraUsage === true; }).map(function (a) { return a.name; }).join(', ') : '');
+    if (!fleet.amount) return;
+    var spend = byId('statSpend');
+    spend.textContent = fleet.amount;
+    spend.title = 'This month: ' + fleet.lines.join(' · ');
   }
 
   function setLive(ok) {

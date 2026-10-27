@@ -6,7 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, inlineScripts, THREE_BASE, scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit,
-  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, meterTone, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
+  accountBadges, thresholdBadgeText, extraUsageText, extraUsageBar, fleetExtraUsage, meterTone, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
   sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows, hallLayout,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
@@ -774,6 +774,60 @@ test('extraUsageBar marks an account switched off since, and draws no ratio with
   assert.equal(noLimit.rest, '');
 });
 
+// The Proxy status card's fleet rows: how many accounts can bill past their
+// plan, and the month's extra spend added up across them.
+test('fleetExtraUsage is null for a fleet no account of which reports spend', () => {
+  assert.equal(fleetExtraUsage([]), null);
+  assert.equal(fleetExtraUsage(null), null);
+  assert.equal(fleetExtraUsage([{ name: 'a', quota: {} }, { name: 'b', quota: { spend: null } }]), null);
+});
+
+test('fleetExtraUsage counts the accounts that can bill and sums the month against their ceilings', () => {
+  const fleet = fleetExtraUsage([
+    { name: 'a', quota: { spend: billable(1435) } },
+    { name: 'b', maxSpend: 20, quota: { spend: billable(500) }, onExtraUsage: true },
+    // Cannot bill, has not: counted in the total, no amount of its own.
+    { name: 'c', quota: { spend: normalizeSpend({ extra_usage: { is_enabled: false }, spend: { used: { amount_minor: 0, currency: 'USD', exponent: 2 } } }) } },
+    // No spend record at all (an API-key account, say).
+    { name: 'd', quota: {} },
+  ]);
+  assert.equal(fleet.total, 4);
+  assert.equal(fleet.enabled, 2);
+  assert.equal(fleet.billing, 1);
+  // a against upstream's $10,000 limit, b against its own $20 cap.
+  assert.equal(fleet.amount, '$19.35 of $10,020.00');
+  assert.deepEqual(fleet.lines, ['a: $14.35 of $10,000.00', 'b: $5.00 of $20.00 cap']);
+});
+
+test('fleetExtraUsage keeps the month\'s spend on an account switched off since, and drops the ceiling when one is unknown', () => {
+  const noLimit = normalizeSpend({ extra_usage: { is_enabled: true }, spend: { used: { amount_minor: 4237, currency: 'USD', exponent: 2 } } });
+  const fleet = fleetExtraUsage([
+    { name: 'a', quota: { spend: billable(1435) } },
+    { name: 'b', quota: { spend: noLimit } },
+  ]);
+  assert.equal(fleet.enabled, 2);
+  assert.equal(fleet.amount, '$56.72');
+  assert.deepEqual(fleet.lines, ['a: $14.35 of $10,000.00', 'b: $42.37']);
+  const off = fleetExtraUsage([switchedOff({ disabled_reason: 'out_of_credits' })]);
+  assert.equal(off.enabled, 0);
+  assert.equal(off.amount, '€15.00 of €20.00');
+  // An account that can bill but has spent nothing still shows the ceiling.
+  assert.equal(fleetExtraUsage([{ name: 'a', quota: { spend: billable(0) } }]).amount, '$0.00 of $10,000.00');
+  // Nothing to add up: no account can bill and none has.
+  const idle = fleetExtraUsage([{ name: 'c', quota: { spend: normalizeSpend({ extra_usage: { is_enabled: false }, spend: { used: { amount_minor: 0, currency: 'USD', exponent: 2 } } }) } }]);
+  assert.equal(idle.enabled, 0);
+  assert.equal(idle.amount, null);
+  assert.deepEqual(idle.lines, []);
+});
+
+test('fleetExtraUsage adds up each currency on its own', () => {
+  const fleet = fleetExtraUsage([
+    { name: 'a', quota: { spend: billable(1435) } },
+    switchedOff({}),
+  ]);
+  assert.equal(fleet.amount, '$14.35 of $10,000.00 + €15.00 of €20.00');
+});
+
 test('the extra-usage helpers run inside the serialized bundle, money helpers included', () => {
   // They call formatMoney, resolveMaxSpendMinor and spendCapReached by name,
   // and those are imported from oauth.js and model.js: the page has them only
@@ -1150,6 +1204,35 @@ test('Proxy status counts the accounts a request could go to, and names the bloc
   assert.equal(page.labelled('1 of 3'), 1);
   assert.equal(page.byId('acctCount').textContent, '1 of 3 active', 'and the Accounts heading agrees');
   assert.equal(page.byId('statServing').title, 'Blocked: b (upstream 429 hold), c (disabled by operator)');
+});
+
+test('Proxy status shows the fleet\'s extra usage under Accounts active, and only for a fleet that reports spend', async () => {
+  const bare = bootPage();
+  await bare.answer(200, { accounts: [{ name: 'a' }, { name: 'b' }] });
+  assert.equal(bare.byId('statExtraWrap').style.display, 'none', 'no spend record anywhere: no rows');
+  assert.equal(bare.byId('statSpendWrap').style.display, 'none');
+  const page = bootPage();
+  await page.answer(200, { accounts: [
+    { name: 'a', quota: { spend: billable(1435) } },
+    { name: 'b', maxSpend: 20, quota: { spend: billable(500) }, onExtraUsage: true },
+    { name: 'c', quota: {} },
+  ] });
+  assert.equal(page.byId('statExtraWrap').style.display, '');
+  assert.equal(page.byId('statSpendWrap').style.display, '');
+  assert.equal(page.labelled('2 of 3 · 1 billing'), 1);
+  assert.equal(page.byId('statExtra').title, 'Can bill past plan limits: a, b · serving on extra usage now: b');
+  assert.equal(page.byId('statSpend').textContent, '$19.35 of $10,020.00');
+  assert.equal(page.byId('statSpend').title, 'This month: a: $14.35 of $10,000.00 · b: $5.00 of $20.00 cap');
+  // Spend reported, but no account can bill and none has: the count stays,
+  // the amount has nothing to say.
+  const idle = bootPage();
+  await idle.answer(200, { accounts: [
+    { name: 'a', quota: { spend: normalizeSpend({ extra_usage: { is_enabled: false }, spend: { used: { amount_minor: 0, currency: 'USD', exponent: 2 } } }) } },
+  ] });
+  assert.equal(idle.byId('statExtraWrap').style.display, '');
+  assert.equal(idle.labelled('0 of 1'), 1);
+  assert.equal(idle.byId('statExtra').title, 'No account can bill past its plan limits');
+  assert.equal(idle.byId('statSpendWrap').style.display, 'none');
 });
 
 test('the overview shows every client\'s traffic and switches measure without polling', async () => {
