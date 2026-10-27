@@ -42,8 +42,8 @@ import { SxManager } from './sx.js';
 import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, PKG_NAME } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText } from './safe-text.js';
-import { ClientUsageTracker, UsageDimensionTracker, USAGE_SLOT_MS } from './client-usage.js';
-import { QuotaHistory } from './quota-history.js';
+import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
+import { QuotaHistory, HISTORY_SAMPLE_MS } from './quota-history.js';
 import { ClientQuotaTracker } from './quota-attribution.js';
 import { buildForecast } from './forecast-payload.js';
 import { ForecastExplainer } from './forecast-explain.js';
@@ -921,10 +921,10 @@ async function serverCommand() {
   quotaSaveInterval = setInterval(persistQuotaState, 60_000);
   quotaSaveInterval.unref?.();
 
-  // A quota reading per account every 15 minutes for the forecast, and one now
+  // A quota reading per account every minute for the forecast, and one now
   // so a fresh start has a first point to measure from.
   quotaHistory.sample(accountManager.accounts, Date.now());
-  historyInterval = setInterval(() => quotaHistory.sample(accountManager.accounts, Date.now()), USAGE_SLOT_MS);
+  historyInterval = setInterval(() => quotaHistory.sample(accountManager.accounts, Date.now()), HISTORY_SAMPLE_MS);
   historyInterval.unref?.();
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).

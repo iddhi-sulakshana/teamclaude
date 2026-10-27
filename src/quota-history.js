@@ -2,7 +2,7 @@
 //
 // An account's quota is a snapshot: the utilization and reset instant the last
 // response reported. Nothing in it says how fast the fleet is spending, so this
-// samples every Claude subscription's buckets on a timer (every 15 minutes, from
+// samples every Claude subscription's buckets on a timer (every minute, from
 // index.js) and keeps four weeks of them: every sample for two days, then the
 // last of each clock hour, which is enough to read a week's rhythm back from.
 // From that come the fleet's burn rate over the last day, the curve the
@@ -19,11 +19,20 @@ import { providerOf } from './provider.js';
 
 export const HISTORY_RETAIN_MS = 28 * 24 * 3600_000;
 /**
+ * How often index.js takes a reading. A minute, so a change in pace shows in
+ * the forecast about as soon as the dashboard asks for it again (it refetches
+ * once a minute) rather than up to a quarter of an hour later. Readings only
+ * move when a response or a probe brings a new figure, so most samples repeat
+ * the last one; they cost the state file size for two days and nothing after
+ * the hourly thinning.
+ */
+export const HISTORY_SAMPLE_MS = 60_000;
+/**
  * How long every sample is kept. Older ones are thinned to the last of each
  * clock hour and the last of each window: a rise between two kept samples is
  * the sum of the rises between the ones dropped, and a window's last reading
- * holds all that was spent in it, so the spend read back is the same, at about
- * a quarter the size.
+ * holds all that was spent in it, so the spend read back is the same, at a
+ * small fraction of the size.
  */
 export const HISTORY_FINE_MS = 48 * 3600_000;
 /** The span the fleet's burn rate is measured over once that much history exists. */

@@ -279,7 +279,7 @@ The chart on the right of the overview answers "at this rate, when do we run out
 How it is worked out:
 
 - **Unit.** Accounts are weighed by plan — Pro 1, Max 5x 5, Max 20x 20 — so 10% of a Max 20x account counts twice as much as 10% of a Max 5x one.
-- **Burn rate.** The server samples every account's quota every 15 minutes and keeps four weeks in the state file: every sample for two days, one an hour before that. The rate is how far the weighted meters rose over the last 24 hours. With 6–24 hours of samples it uses what it has (medium confidence); with less, each account's average since its last reset (low confidence, and the chart says so).
+- **Burn rate.** The server samples every account's quota every minute and keeps four weeks in the state file: every sample for two days, one an hour before that. The rate is how far the weighted meters rose over the last 24 hours. With 6–24 hours of samples it uses what it has (medium confidence); with less, each account's average since its last reset (low confidence, and the chart says so).
 - **Pace** is the burn rate against the fleet's weekly capacity: 1.0× spends exactly a week's capacity per week.
 - **Projection.** The fleet is run forward in 15-minute steps, draining accounts the way the router does — soonest weekly reset first by default, least remaining first under `distributeSessions: "adaptive"`, spread by plan size under `distributeSessions: true`, best `priority` first in every mode — and refilling each at its reset. What an account had left below its threshold at its reset is counted as unused.
 - **Verdict.** *Overusing* when the pool runs dry before a refill or pace is above 1.0×; *underusing* when more than 30% of a week's capacity would reset unused; *on pace* otherwise.
