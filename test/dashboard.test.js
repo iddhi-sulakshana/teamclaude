@@ -295,6 +295,49 @@ test('blocked and disabled accounts sort after the serving ones, each group in f
   assert.deepEqual(accountDisplayOrder(null), []);
 });
 
+test('accounts at their weekly limit sort by when the weekly window resets, soonest first', () => {
+  const H = 3600e3;
+  const accounts = [
+    // Session reset soonest of all, weekly reset furthest: the 5h clock must not decide.
+    { name: 'late', unavailable: 'quota', quota: { unified5h: 0.2, unified5hReset: 1 * H, unified7d: 1, unified7dReset: 90 * H } },
+    { name: 'session-only', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: 2 * H, unified7d: 0.5, unified7dReset: 5 * H } },
+    { name: 'soon', unavailable: 'quota', quota: { unified5h: 0.4, unified5hReset: 4 * H, unified7d: 1, unified7dReset: 10 * H } },
+    // Past the 0.98 default, so blocked on the weekly limit even short of 100%.
+    { name: 'mid', unavailable: 'quota', quota: { unified5h: 0, unified5hReset: 3 * H, unified7d: 0.99, unified7dReset: 40 * H } },
+    { name: 'unknown', unavailable: 'quota', quota: { unified7d: 1 } },
+  ];
+  assert.deepEqual(accountDisplayOrder(accounts).map(i => accounts[i].name), ['soon', 'mid', 'late', 'unknown', 'session-only']);
+});
+
+test('the weekly limit is read off the fleet threshold and the account\'s own override', () => {
+  const H = 3600e3;
+  const accounts = [
+    { name: 'a', unavailable: 'quota', quota: { unified7d: 0.9, unified7dReset: 50 * H } },
+    { name: 'b', unavailable: 'quota', quota: { unified7d: 1, unified7dReset: 20 * H } },
+    // Its own 0.95 keeps it under the limit at 0.92 whatever the fleet says.
+    { name: 'c', unavailable: 'quota', switchThreshold: { unified7d: 0.95 }, quota: { unified7d: 0.92, unified7dReset: 1 * H } },
+  ];
+  const order = (...args) => accountDisplayOrder(accounts, ...args).map(i => accounts[i].name);
+  // Default 0.98: only b has hit; a and c follow by utilization.
+  assert.deepEqual(order(), ['b', 'c', 'a']);
+  // A fleet 7d threshold of 0.85 puts a past its limit too, and its later reset puts it after b.
+  assert.deepEqual(order(0.98, { default: 0.98, unified7d: 0.85 }), ['b', 'a', 'c']);
+  assert.deepEqual(order(0.85, null), ['b', 'a', 'c']);
+});
+
+test('accountDisplayOrder runs inside the serialized bundle, threshold helpers included', () => {
+  const script = inlineScripts(renderDashboardHtml()).at(-1);
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const isolated = new Function(`${bundle}; return accountDisplayOrder;`)();
+  const accounts = [
+    { name: 'a', unavailable: 'quota', quota: { unified7d: 0.9, unified7dReset: 50 } },
+    { name: 'b', unavailable: 'quota', quota: { unified7d: 1, unified7dReset: 20 } },
+    { name: 'c', unavailable: 'quota', switchThreshold: 0.8, quota: { unified7d: 0.85, unified7dReset: 10 } },
+  ];
+  assert.deepEqual(isolated(accounts, 0.98, { unified7d: 0.85 }), accountDisplayOrder(accounts, 0.98, { unified7d: 0.85 }));
+  assert.deepEqual(isolated(accounts, 0.98, { unified7d: 0.85 }), [2, 1, 0]);
+});
+
 test('the hallway walks past the open doors to the knocked one, then the shut ones', () => {
   const rows = hallwayRows({
     currentAccount: 'd',

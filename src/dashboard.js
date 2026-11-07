@@ -21,7 +21,7 @@ import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
 import { USAGE_WINDOWS, USAGE_MONTH } from './client-usage.js';
 import { formatMoney } from './oauth.js';
-import { resolveMaxSpendMinor, spendCapReached } from './model.js';
+import { resolveMaxSpendMinor, spendCapReached, resolveSwitchThreshold, resolveFleetThreshold } from './model.js';
 import { DM_SANS_WOFF2, DM_MONO_WOFF2 } from './dashboard-fonts.js';
 import { createHall3d } from './dashboard-hall3d.js';
 import { readFileSync } from 'node:fs';
@@ -1000,21 +1000,48 @@ export function sortRows(rows, key, dir) {
 
 // The order the account grid draws in, as indices into `accounts`: the ones
 // serving first, then the blocked ones (disabled, or out of rotation for any
-// other reason), each group sorted by weekly limit utilization (highest first).
-// Indices rather than the accounts themselves so a card keeps the avatar colour
-// its place in the fleet gives it, the same one its settings dialog shows.
-export function accountDisplayOrder(accounts) {
-  var serving = [], blocked = [];
-  (accounts || []).forEach(function (a, i) { (a.disabled || a.unavailable ? blocked : serving).push(i); });
-  var sortByWeeklyHit = function (indices) {
+// other reason). Within each group, the accounts at their weekly limit lead,
+// soonest weekly reset first, since that is when each comes back; the 5-hour
+// clock says nothing about an account whose week is spent. The rest follow by
+// weekly limit utilization (highest first). The limit is the switch threshold
+// the router gates on, the fleet's (`status.switchThreshold` /
+// `status.switchThresholds`) under the account's own override. Indices rather
+// than the accounts themselves so a card keeps the avatar colour its place in
+// the fleet gives it, the same one its settings dialog shows.
+/**
+ * @param {Record<string, any>[]|null|undefined} accounts
+ * @param {number|null|undefined} [fleetThreshold]
+ * @param {Object<string, number>|null|undefined} [fleetThresholds]
+ * @returns {number[]}
+ */
+export function accountDisplayOrder(accounts, fleetThreshold, fleetThresholds) {
+  var list = accounts || [];
+  /** @type {number[]} */ var serving = [];
+  /** @type {number[]} */ var blocked = [];
+  list.forEach(function (a, i) { (a.disabled || a.unavailable ? blocked : serving).push(i); });
+  var fleetWeekly = resolveFleetThreshold(fleetThreshold, fleetThresholds, 'unified7d');
+  /** @param {Record<string, any>} a */
+  var weekly = function (a) {
+    var q = a.quota || {};
+    var u = q.unified7d || 0;
+    var reset = q.unified7dReset;
+    return {
+      u: u,
+      spent: u >= resolveSwitchThreshold(a.switchThreshold, 'unified7d', fleetWeekly),
+      // An unknown reset waits behind every known one.
+      reset: typeof reset === 'number' && isFinite(reset) ? reset : Infinity,
+    };
+  };
+  /** @param {number[]} indices */
+  var sortGroup = function (indices) {
     return indices.sort(function (i, j) {
-      var a = accounts[i] || {}, b = accounts[j] || {};
-      var aUtilization = (a.quota || {}).unified7d || 0;
-      var bUtilization = (b.quota || {}).unified7d || 0;
-      return bUtilization - aUtilization;
+      var a = weekly(list[i] || {}), b = weekly(list[j] || {});
+      if (a.spent !== b.spent) return a.spent ? -1 : 1;
+      if (a.spent && a.reset !== b.reset) return a.reset < b.reset ? -1 : 1;
+      return b.u - a.u;
     });
   };
-  return sortByWeeklyHit(serving).concat(sortByWeeklyHit(blocked));
+  return sortGroup(serving).concat(sortGroup(blocked));
 }
 
 // The Hallway view's corridors: one per provider (a mixed fleet has a current
@@ -1548,7 +1575,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, accountTokenSplit, usageTokenSplit, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, accountDisplayOrder, hallwayRows, hallLayout,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   clientRanking, userMix, viewerCan, loginStartRequest, loginFinishRequest, loginOutcome, userRequest, userOutcome, rotateKeyRequest,
-  formatMoney, resolveMaxSpendMinor, spendCapReached, extraUsageText, extraUsageBar, fleetExtraUsage, meterTone, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
+  formatMoney, resolveMaxSpendMinor, spendCapReached, resolveSwitchThreshold, resolveFleetThreshold, extraUsageText, extraUsageBar, fleetExtraUsage, meterTone, seriesLines, userLineNames, userSlots, smoothPath, heatGrid, seriesTicks, dayTicks,
   forecastGeometry, forecastTicks, forecastHover, verdictChip, forecastTag, forecastCaption, forecastEmptyText, cardForecastLines, forecastPopup, explainRequest, explainOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -5117,7 +5144,7 @@ ${createHall3d.toString()}
     } else {
       var acc = byId('accounts');
       acc.textContent = '';
-      accountDisplayOrder(accounts).forEach(function (i, pos) { acc.appendChild(renderAccount(accounts[i], i, pos, s)); });
+      accountDisplayOrder(accounts, s.switchThreshold, s.switchThresholds).forEach(function (i, pos) { acc.appendChild(renderAccount(accounts[i], i, pos, s)); });
     }
     renderProblems(s);
     renderForecast();
