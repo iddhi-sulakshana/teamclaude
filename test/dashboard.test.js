@@ -295,21 +295,36 @@ test('blocked and disabled accounts sort after the serving ones, each group in f
   assert.deepEqual(accountDisplayOrder(null), []);
 });
 
-test('accounts at their weekly limit sort by when the weekly window resets, soonest first', () => {
-  const H = 3600e3;
+test('blocked accounts sort by when they come back, whichever limit holds them', () => {
+  const M = 60e3, H = 60 * M;
+  // The dashboard as it stood: srinath's session frees in 2 minutes, before
+  // any spent week does, so it leads; the 5h clock of a weekly-spent account
+  // (buddhima's) says nothing about when it comes back.
   const accounts = [
-    // Session reset soonest of all, weekly reset furthest: the 5h clock must not decide.
-    { name: 'late', unavailable: 'quota', quota: { unified5h: 0.2, unified5hReset: 1 * H, unified7d: 1, unified7dReset: 90 * H } },
-    { name: 'session-only', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: 2 * H, unified7d: 0.5, unified7dReset: 5 * H } },
-    { name: 'soon', unavailable: 'quota', quota: { unified5h: 0.4, unified5hReset: 4 * H, unified7d: 1, unified7dReset: 10 * H } },
-    // Past the 0.98 default, so blocked on the weekly limit even short of 100%.
-    { name: 'mid', unavailable: 'quota', quota: { unified5h: 0, unified5hReset: 3 * H, unified7d: 0.99, unified7dReset: 40 * H } },
-    { name: 'unknown', unavailable: 'quota', quota: { unified7d: 1 } },
+    { name: 'leo', quota: { unified5h: 0.22, unified5hReset: 32 * M, unified7d: 0.09, unified7dReset: 127 * H } },
+    { name: 'kaveesha', unavailable: 'quota', quota: { unified5h: 0, unified7d: 1, unified7dReset: 5.5 * H } },
+    { name: 'ekanayaka', unavailable: 'quota', quota: { unified5h: 0, unified7d: 1, unified7dReset: 58 * H } },
+    { name: 'buddhima', unavailable: 'quota', quota: { unified5h: 0, unified5hReset: 4.2 * H, unified7d: 1, unified7dReset: 86 * H } },
+    { name: 'iddhi', unavailable: 'quota', quota: { unified5h: 0, unified7d: 1, unified7dReset: 103 * H } },
+    { name: 'srinath', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: 2 * M, unified7d: 0.5, unified7dReset: 125 * H } },
+    { name: 'shehan', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: 2.2 * H, unified7d: 0.17, unified7dReset: 152 * H } },
   ];
-  assert.deepEqual(accountDisplayOrder(accounts).map(i => accounts[i].name), ['soon', 'mid', 'late', 'unknown', 'session-only']);
+  assert.deepEqual(accountDisplayOrder(accounts).map(i => accounts[i].name),
+    ['leo', 'srinath', 'shehan', 'kaveesha', 'ekanayaka', 'buddhima', 'iddhi']);
 });
 
-test('short of the weekly limit, accounts at their 5h limit sort by when the 5h window resets', () => {
+test('an account held by both limits comes back when the later one resets', () => {
+  const H = 3600e3;
+  const accounts = [
+    { name: 'both', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: 3 * H, unified7d: 1, unified7dReset: 1 * H } },
+    { name: 'session', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: 2 * H, unified7d: 0.4 } },
+    // Past the 0.98 default, so blocked on the weekly limit even short of 100%.
+    { name: 'week', unavailable: 'quota', quota: { unified5h: 0.2, unified5hReset: 0.5 * H, unified7d: 0.99, unified7dReset: 2.5 * H } },
+  ];
+  assert.deepEqual(accountDisplayOrder(accounts).map(i => accounts[i].name), ['session', 'week', 'both']);
+});
+
+test('accounts with no known comeback follow, the rest by weekly utilization', () => {
   const H = 3600e3;
   const accounts = [
     { name: 'idle-high', unavailable: 'throttled', quota: { unified5h: 0.3, unified5hReset: 1 * H, unified7d: 0.7 } },
@@ -320,13 +335,14 @@ test('short of the weekly limit, accounts at their 5h limit sort by when the 5h 
     { name: 'session-unknown', unavailable: 'quota', quota: { unified5h: 1, unified7d: 0.3 } },
   ];
   const order = (...args) => accountDisplayOrder(accounts, ...args).map(i => accounts[i].name);
-  // Weekly-spent first; then the 5h-spent by 5h reset; then the rest by weekly utilization.
-  assert.deepEqual(order(), ['week', 'session-soon', 'session-late', 'session-unknown', 'idle-high', 'idle-low']);
-  // A fleet 5h threshold of 0.25 puts idle-high past its 5h limit, and its 1h reset leads that tier.
-  assert.deepEqual(order(0.98, { unified5h: 0.25 }), ['week', 'idle-high', 'session-soon', 'session-late', 'session-unknown', 'idle-low']);
+  // At a limit with a known reset, soonest first; at a limit with no reset;
+  // then the accounts at neither limit, by weekly utilization.
+  assert.deepEqual(order(), ['session-soon', 'session-late', 'week', 'session-unknown', 'idle-high', 'idle-low']);
+  // A fleet 5h threshold of 0.25 puts idle-high past its 5h limit, back in an hour.
+  assert.deepEqual(order(0.98, { unified5h: 0.25 }), ['idle-high', 'session-soon', 'session-late', 'week', 'session-unknown', 'idle-low']);
   // The account's own 5h override counts the same way.
   accounts[4].switchThreshold = { unified5h: 0.05 };
-  assert.deepEqual(order(), ['week', 'idle-low', 'session-soon', 'session-late', 'session-unknown', 'idle-high']);
+  assert.deepEqual(order(), ['idle-low', 'session-soon', 'session-late', 'week', 'session-unknown', 'idle-high']);
 });
 
 test('the weekly limit is read off the fleet threshold and the account\'s own override', () => {

@@ -1000,14 +1000,14 @@ export function sortRows(rows, key, dir) {
 
 // The order the account grid draws in, as indices into `accounts`: the ones
 // serving first, then the blocked ones (disabled, or out of rotation for any
-// other reason). Within each group, the accounts at their weekly limit lead,
-// soonest weekly reset first, since that is when each comes back; the 5-hour
-// clock says nothing about an account whose week is spent. Short of that, the
-// accounts at their 5-hour limit follow, soonest 5-hour reset first. The rest
-// follow by weekly limit utilization (highest first). A limit is the switch
-// threshold the router gates on for that bucket, the fleet's
-// (`status.switchThreshold` / `status.switchThresholds`) under the account's
-// own override. Indices rather
+// other reason). Within each group, the accounts at a limit lead, ordered by
+// when each comes back, soonest first: the weekly reset for an account whose
+// week is spent (its 5-hour clock frees nothing), the 5-hour reset for one
+// whose session is, the later of the two when both are. One with no reset on
+// record waits behind them. The accounts at neither limit follow by weekly
+// limit utilization (highest first). A limit is the switch threshold the
+// router gates on for that bucket, the fleet's (`status.switchThreshold` /
+// `status.switchThresholds`) under the account's own override. Indices rather
 // than the accounts themselves so a card keeps the avatar colour its place in
 // the fleet gives it, the same one its settings dialog shows.
 /**
@@ -1026,26 +1026,28 @@ export function accountDisplayOrder(accounts, fleetThreshold, fleetThresholds) {
   // An unknown reset waits behind every known one.
   /** @param {unknown} t */
   var clock = function (t) { return typeof t === 'number' && isFinite(t) ? t : Infinity; };
-  // tier 0: weekly limit hit, keyed by the weekly reset; tier 1: 5-hour limit
-  // hit, keyed by the 5-hour reset; tier 2: neither, keyed by nothing.
+  // `back` is when the account frees: the later reset of the limits it is at,
+  // or null when it is at neither.
   /** @param {Record<string, any>} a */
   var place = function (a) {
     var q = a.quota || {};
     var u = q.unified7d || 0;
+    /** @type {number|null} */
+    var back = null;
     if (u >= resolveSwitchThreshold(a.switchThreshold, 'unified7d', fleetWeekly)) {
-      return { tier: 0, reset: clock(q.unified7dReset), u: u };
+      back = clock(q.unified7dReset);
     }
     if ((q.unified5h || 0) >= resolveSwitchThreshold(a.switchThreshold, 'unified5h', fleetSession)) {
-      return { tier: 1, reset: clock(q.unified5hReset), u: u };
+      back = Math.max(back == null ? -Infinity : back, clock(q.unified5hReset));
     }
-    return { tier: 2, reset: Infinity, u: u };
+    return { back: back, u: u };
   };
   /** @param {number[]} indices */
   var sortGroup = function (indices) {
     return indices.sort(function (i, j) {
       var a = place(list[i] || {}), b = place(list[j] || {});
-      if (a.tier !== b.tier) return a.tier - b.tier;
-      if (a.reset !== b.reset) return a.reset < b.reset ? -1 : 1;
+      if ((a.back == null) !== (b.back == null)) return a.back == null ? 1 : -1;
+      if (a.back != null && b.back != null && a.back !== b.back) return a.back < b.back ? -1 : 1;
       return b.u - a.u;
     });
   };
