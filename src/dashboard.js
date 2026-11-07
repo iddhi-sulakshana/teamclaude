@@ -1002,10 +1002,12 @@ export function sortRows(rows, key, dir) {
 // serving first, then the blocked ones (disabled, or out of rotation for any
 // other reason). Within each group, the accounts at their weekly limit lead,
 // soonest weekly reset first, since that is when each comes back; the 5-hour
-// clock says nothing about an account whose week is spent. The rest follow by
-// weekly limit utilization (highest first). The limit is the switch threshold
-// the router gates on, the fleet's (`status.switchThreshold` /
-// `status.switchThresholds`) under the account's own override. Indices rather
+// clock says nothing about an account whose week is spent. Short of that, the
+// accounts at their 5-hour limit follow, soonest 5-hour reset first. The rest
+// follow by weekly limit utilization (highest first). A limit is the switch
+// threshold the router gates on for that bucket, the fleet's
+// (`status.switchThreshold` / `status.switchThresholds`) under the account's
+// own override. Indices rather
 // than the accounts themselves so a card keeps the avatar colour its place in
 // the fleet gives it, the same one its settings dialog shows.
 /**
@@ -1020,24 +1022,30 @@ export function accountDisplayOrder(accounts, fleetThreshold, fleetThresholds) {
   /** @type {number[]} */ var blocked = [];
   list.forEach(function (a, i) { (a.disabled || a.unavailable ? blocked : serving).push(i); });
   var fleetWeekly = resolveFleetThreshold(fleetThreshold, fleetThresholds, 'unified7d');
+  var fleetSession = resolveFleetThreshold(fleetThreshold, fleetThresholds, 'unified5h');
+  // An unknown reset waits behind every known one.
+  /** @param {unknown} t */
+  var clock = function (t) { return typeof t === 'number' && isFinite(t) ? t : Infinity; };
+  // tier 0: weekly limit hit, keyed by the weekly reset; tier 1: 5-hour limit
+  // hit, keyed by the 5-hour reset; tier 2: neither, keyed by nothing.
   /** @param {Record<string, any>} a */
-  var weekly = function (a) {
+  var place = function (a) {
     var q = a.quota || {};
     var u = q.unified7d || 0;
-    var reset = q.unified7dReset;
-    return {
-      u: u,
-      spent: u >= resolveSwitchThreshold(a.switchThreshold, 'unified7d', fleetWeekly),
-      // An unknown reset waits behind every known one.
-      reset: typeof reset === 'number' && isFinite(reset) ? reset : Infinity,
-    };
+    if (u >= resolveSwitchThreshold(a.switchThreshold, 'unified7d', fleetWeekly)) {
+      return { tier: 0, reset: clock(q.unified7dReset), u: u };
+    }
+    if ((q.unified5h || 0) >= resolveSwitchThreshold(a.switchThreshold, 'unified5h', fleetSession)) {
+      return { tier: 1, reset: clock(q.unified5hReset), u: u };
+    }
+    return { tier: 2, reset: Infinity, u: u };
   };
   /** @param {number[]} indices */
   var sortGroup = function (indices) {
     return indices.sort(function (i, j) {
-      var a = weekly(list[i] || {}), b = weekly(list[j] || {});
-      if (a.spent !== b.spent) return a.spent ? -1 : 1;
-      if (a.spent && a.reset !== b.reset) return a.reset < b.reset ? -1 : 1;
+      var a = place(list[i] || {}), b = place(list[j] || {});
+      if (a.tier !== b.tier) return a.tier - b.tier;
+      if (a.reset !== b.reset) return a.reset < b.reset ? -1 : 1;
       return b.u - a.u;
     });
   };

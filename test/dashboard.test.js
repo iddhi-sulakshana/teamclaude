@@ -309,6 +309,26 @@ test('accounts at their weekly limit sort by when the weekly window resets, soon
   assert.deepEqual(accountDisplayOrder(accounts).map(i => accounts[i].name), ['soon', 'mid', 'late', 'unknown', 'session-only']);
 });
 
+test('short of the weekly limit, accounts at their 5h limit sort by when the 5h window resets', () => {
+  const H = 3600e3;
+  const accounts = [
+    { name: 'idle-high', unavailable: 'throttled', quota: { unified5h: 0.3, unified5hReset: 1 * H, unified7d: 0.7 } },
+    { name: 'session-late', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: 4 * H, unified7d: 0.9, unified7dReset: 20 * H } },
+    { name: 'week', unavailable: 'quota', quota: { unified5h: 0.1, unified5hReset: 0.5 * H, unified7d: 1, unified7dReset: 30 * H } },
+    { name: 'session-soon', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: 2 * H, unified7d: 0.2, unified7dReset: 10 * H } },
+    { name: 'idle-low', unavailable: 'throttled', quota: { unified5h: 0.1, unified5hReset: 0.2 * H, unified7d: 0.1 } },
+    { name: 'session-unknown', unavailable: 'quota', quota: { unified5h: 1, unified7d: 0.3 } },
+  ];
+  const order = (...args) => accountDisplayOrder(accounts, ...args).map(i => accounts[i].name);
+  // Weekly-spent first; then the 5h-spent by 5h reset; then the rest by weekly utilization.
+  assert.deepEqual(order(), ['week', 'session-soon', 'session-late', 'session-unknown', 'idle-high', 'idle-low']);
+  // A fleet 5h threshold of 0.25 puts idle-high past its 5h limit, and its 1h reset leads that tier.
+  assert.deepEqual(order(0.98, { unified5h: 0.25 }), ['week', 'idle-high', 'session-soon', 'session-late', 'session-unknown', 'idle-low']);
+  // The account's own 5h override counts the same way.
+  accounts[4].switchThreshold = { unified5h: 0.05 };
+  assert.deepEqual(order(), ['week', 'idle-low', 'session-soon', 'session-late', 'session-unknown', 'idle-high']);
+});
+
 test('the weekly limit is read off the fleet threshold and the account\'s own override', () => {
   const H = 3600e3;
   const accounts = [
