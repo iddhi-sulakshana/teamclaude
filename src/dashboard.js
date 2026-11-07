@@ -1004,12 +1004,14 @@ export function sortRows(rows, key, dir) {
 // when each comes back, soonest first: the weekly reset for an account whose
 // week is spent (its 5-hour clock frees nothing), the 5-hour reset for one
 // whose session is, the later of the two when both are. One with no reset on
-// record waits behind them. The accounts at neither limit follow by weekly
-// limit utilization (highest first). A limit is the switch threshold the
-// router gates on for that bucket, the fleet's (`status.switchThreshold` /
-// `status.switchThresholds`) under the account's own override. Indices rather
-// than the accounts themselves so a card keeps the avatar colour its place in
-// the fleet gives it, the same one its settings dialog shows.
+// record waits behind them. The accounts at neither limit follow by when
+// their 5-hour window resets, soonest first, those with no window open last
+// (weekly utilization, highest first, breaks a tie). A limit is the switch
+// threshold the router gates on for that bucket, the fleet's
+// (`status.switchThreshold` / `status.switchThresholds`) under the account's
+// own override. Indices rather than the accounts themselves so a card keeps
+// the avatar colour its place in the fleet gives it, the same one its
+// settings dialog shows.
 /**
  * @param {Record<string, any>[]|null|undefined} accounts
  * @param {number|null|undefined} [fleetThreshold]
@@ -1040,7 +1042,7 @@ export function accountDisplayOrder(accounts, fleetThreshold, fleetThresholds) {
     if ((q.unified5h || 0) >= resolveSwitchThreshold(a.switchThreshold, 'unified5h', fleetSession)) {
       back = Math.max(back == null ? -Infinity : back, clock(q.unified5hReset));
     }
-    return { back: back, u: u };
+    return { back: back, session: clock(q.unified5hReset), u: u };
   };
   /** @param {number[]} indices */
   var sortGroup = function (indices) {
@@ -1048,6 +1050,7 @@ export function accountDisplayOrder(accounts, fleetThreshold, fleetThresholds) {
       var a = place(list[i] || {}), b = place(list[j] || {});
       if ((a.back == null) !== (b.back == null)) return a.back == null ? 1 : -1;
       if (a.back != null && b.back != null && a.back !== b.back) return a.back < b.back ? -1 : 1;
+      if (a.back == null && a.session !== b.session) return a.session < b.session ? -1 : 1;
       return b.u - a.u;
     });
   };

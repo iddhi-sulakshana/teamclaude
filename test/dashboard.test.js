@@ -324,7 +324,23 @@ test('an account held by both limits comes back when the later one resets', () =
   assert.deepEqual(accountDisplayOrder(accounts).map(i => accounts[i].name), ['session', 'week', 'both']);
 });
 
-test('accounts with no known comeback follow, the rest by weekly utilization', () => {
+test('serving accounts sort by when their 5h window resets, soonest first', () => {
+  const M = 60e3, H = 60 * M;
+  // The serving cards as they stood: leo's session resets first, srinath has
+  // no session window open, and weekly utilization decides nothing.
+  const accounts = [
+    { name: 'pramod', quota: { unified5h: 0.14, unified5hReset: 4.2 * H, unified7d: 0.86, unified7dReset: 110 * H } },
+    { name: 'srinath', quota: { unified5h: null, unified7d: 0.5, unified7dReset: 125 * H } },
+    { name: 'ruchira', quota: { unified5h: 0.09, unified5hReset: 4.4 * H, unified7d: 0.22, unified7dReset: 55 * H } },
+    { name: 'ravindu', quota: { unified5h: 0, unified5hReset: 4.1 * H, unified7d: 0.21, unified7dReset: 98 * H } },
+    { name: 'leo', quota: { unified5h: 0.22, unified5hReset: 24 * M, unified7d: 0.09, unified7dReset: 127 * H } },
+    { name: 'chamodh', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: 1.1 * H, unified7d: 0.34, unified7dReset: 134 * H } },
+  ];
+  assert.deepEqual(accountDisplayOrder(accounts).map(i => accounts[i].name),
+    ['leo', 'ravindu', 'pramod', 'ruchira', 'srinath', 'chamodh']);
+});
+
+test('accounts with no known comeback follow, the rest by 5h reset', () => {
   const H = 3600e3;
   const accounts = [
     { name: 'idle-high', unavailable: 'throttled', quota: { unified5h: 0.3, unified5hReset: 1 * H, unified7d: 0.7 } },
@@ -336,8 +352,8 @@ test('accounts with no known comeback follow, the rest by weekly utilization', (
   ];
   const order = (...args) => accountDisplayOrder(accounts, ...args).map(i => accounts[i].name);
   // At a limit with a known reset, soonest first; at a limit with no reset;
-  // then the accounts at neither limit, by weekly utilization.
-  assert.deepEqual(order(), ['session-soon', 'session-late', 'week', 'session-unknown', 'idle-high', 'idle-low']);
+  // then the accounts at neither limit, by 5h reset.
+  assert.deepEqual(order(), ['session-soon', 'session-late', 'week', 'session-unknown', 'idle-low', 'idle-high']);
   // A fleet 5h threshold of 0.25 puts idle-high past its 5h limit, back in an hour.
   assert.deepEqual(order(0.98, { unified5h: 0.25 }), ['idle-high', 'session-soon', 'session-late', 'week', 'session-unknown', 'idle-low']);
   // The account's own 5h override counts the same way.
