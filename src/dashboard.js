@@ -1000,18 +1000,16 @@ export function sortRows(rows, key, dir) {
 
 // The order the account grid draws in, as indices into `accounts`: the ones
 // serving first, then the blocked ones (disabled, or out of rotation for any
-// other reason). Within each group, the accounts at a limit lead, ordered by
-// when each comes back, soonest first: the weekly reset for an account whose
-// week is spent (its 5-hour clock frees nothing), the 5-hour reset for one
-// whose session is, the later of the two when both are. One with no reset on
-// record waits behind them. The accounts at neither limit follow by when
-// their 5-hour window resets, soonest first, those with no window open last
-// (weekly utilization, highest first, breaks a tie). A limit is the switch
-// threshold the router gates on for that bucket, the fleet's
-// (`status.switchThreshold` / `status.switchThresholds`) under the account's
-// own override. Indices rather than the accounts themselves so a card keeps
-// the avatar colour its place in the fleet gives it, the same one its
-// settings dialog shows.
+// other reason). Serving accounts go by when their weekly window resets,
+// soonest first, the order rotation spends them in. A blocked account goes by
+// when it comes back: its weekly reset when it is at its weekly limit (its
+// 5-hour clock frees nothing then), its 5-hour reset otherwise. A missing
+// reset waits behind every known one, and weekly utilization (highest first)
+// breaks a tie. The weekly limit is the switch threshold the router gates on,
+// the fleet's (`status.switchThreshold` / `status.switchThresholds`) under the
+// account's own override. Indices rather than the accounts themselves so a
+// card keeps the avatar colour its place in the fleet gives it, the same one
+// its settings dialog shows.
 /**
  * @param {Record<string, any>[]|null|undefined} accounts
  * @param {number|null|undefined} [fleetThreshold]
@@ -1024,37 +1022,28 @@ export function accountDisplayOrder(accounts, fleetThreshold, fleetThresholds) {
   /** @type {number[]} */ var blocked = [];
   list.forEach(function (a, i) { (a.disabled || a.unavailable ? blocked : serving).push(i); });
   var fleetWeekly = resolveFleetThreshold(fleetThreshold, fleetThresholds, 'unified7d');
-  var fleetSession = resolveFleetThreshold(fleetThreshold, fleetThresholds, 'unified5h');
-  // An unknown reset waits behind every known one.
   /** @param {unknown} t */
   var clock = function (t) { return typeof t === 'number' && isFinite(t) ? t : Infinity; };
-  // `back` is when the account frees: the later reset of the limits it is at,
-  // or null when it is at neither.
-  /** @param {Record<string, any>} a */
-  var place = function (a) {
-    var q = a.quota || {};
-    var u = q.unified7d || 0;
-    /** @type {number|null} */
-    var back = null;
-    if (u >= resolveSwitchThreshold(a.switchThreshold, 'unified7d', fleetWeekly)) {
-      back = clock(q.unified7dReset);
-    }
-    if ((q.unified5h || 0) >= resolveSwitchThreshold(a.switchThreshold, 'unified5h', fleetSession)) {
-      back = Math.max(back == null ? -Infinity : back, clock(q.unified5hReset));
-    }
-    return { back: back, session: clock(q.unified5hReset), u: u };
+  /** @param {Record<string, any>} q */
+  var weeklyReset = function (q) { return clock(q.unified7dReset); };
+  /** @param {Record<string, any>} q @param {Record<string, any>} a */
+  var comesBack = function (q, a) {
+    var spent = (q.unified7d || 0) >= resolveSwitchThreshold(a.switchThreshold, 'unified7d', fleetWeekly);
+    return spent ? clock(q.unified7dReset) : clock(q.unified5hReset);
   };
-  /** @param {number[]} indices */
-  var sortGroup = function (indices) {
+  /** @param {number} i */
+  var used = function (i) { return ((list[i] || {}).quota || {}).unified7d || 0; };
+  /** @param {number[]} indices @param {(q: Record<string, any>, a: Record<string, any>) => number} keyOf */
+  var sortGroup = function (indices, keyOf) {
+    /** @type {Record<number, number>} */
+    var keys = {};
+    indices.forEach(function (i) { var a = list[i] || {}; keys[i] = keyOf(a.quota || {}, a); });
     return indices.sort(function (i, j) {
-      var a = place(list[i] || {}), b = place(list[j] || {});
-      if ((a.back == null) !== (b.back == null)) return a.back == null ? 1 : -1;
-      if (a.back != null && b.back != null && a.back !== b.back) return a.back < b.back ? -1 : 1;
-      if (a.back == null && a.session !== b.session) return a.session < b.session ? -1 : 1;
-      return b.u - a.u;
+      if (keys[i] !== keys[j]) return keys[i] < keys[j] ? -1 : 1;
+      return used(j) - used(i);
     });
   };
-  return sortGroup(serving).concat(sortGroup(blocked));
+  return sortGroup(serving, weeklyReset).concat(sortGroup(blocked, comesBack));
 }
 
 // The Hallway view's corridors: one per provider (a mixed fleet has a current
