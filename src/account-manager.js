@@ -4967,6 +4967,9 @@ export class AccountManager {
         // rather than only seeing this account's already-resolved default.
         switchThreshold: a.switchThreshold ?? null,
         allowExtraUsage: a.allowExtraUsage === true,
+        // Plan size against a Pro account (Pro 1, Max 5x 5, Max 20x 20; null when
+        // unknown): the weight the forecast uses, here so a card can name the plan.
+        planWeight: quotaTier(a).weight,
         // True while this account is the extra-usage fallback — serving past
         // its quota and billing for it. The one state `unavailable` alone
         // cannot tell apart from an account that is simply out.

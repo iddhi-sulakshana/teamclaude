@@ -131,6 +131,30 @@ test('accountBadges leaves out what every account in a Claude OAuth fleet would 
   assert.deepEqual(accountBadges({ name: 'a', disabled: true, status: 'active' }, 'b').map(b => b.text), ['prio 0', 'disabled']);
 });
 
+test('accountBadges marks a Max plan with a gold chip after current, and nothing for smaller plans', () => {
+  const five = accountBadges({ name: 'a', type: 'oauth', status: 'active', planWeight: 5 }, 'a');
+  assert.deepEqual(five.slice(0, 3), [
+    { cls: 'current', text: 'current' },
+    { cls: 'plan max', text: 'Max 5x' },
+    { cls: 'meta priority', text: 'prio 0' },
+  ]);
+  assert.deepEqual(accountBadges({ name: 'a', type: 'oauth', planWeight: 20 }, 'b')[0], { cls: 'plan max', text: 'Max 20x' });
+  // A standard seat, and a payload from a server that predates the field, say nothing.
+  for (const planWeight of [1, null, undefined]) {
+    assert.equal(accountBadges({ name: 'a', type: 'oauth', planWeight }, 'b').some(b => /plan/.test(b.cls)), false);
+  }
+});
+
+test('the status payload carries each account\'s plan weight', () => {
+  const live = { accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000, type: 'oauth' };
+  const am = new AccountManager([
+    { ...live, name: 'max', rateLimitTier: 'default_claude_max_5x', seatTier: 'team_tier_1' },
+    { ...live, name: 'std', rateLimitTier: 'default_raven', seatTier: 'team_standard' },
+    { ...live, name: 'unknown' },
+  ], 0.98);
+  assert.deepEqual(am.getStatus().accounts.map(a => a.planWeight), [5, 1, null]);
+});
+
 // ── per-account switch threshold (#409) ───────────────────────
 
 test('thresholdBadgeText is silent with no override, or one that matches the fleet', () => {

@@ -269,6 +269,8 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // leads, as the card's accent border already says.
   var badges = [];
   if (isCurrent) badges.push({ cls: 'current', text: 'current' });
+  // A Max plan, in gold: it carries 5 or 20 times a standard seat's quota.
+  if (a.planWeight >= 5) badges.push({ cls: 'plan max', text: a.planWeight >= 20 ? 'Max 20x' : 'Max 5x' });
   badges.push({ cls: 'meta priority', text: 'prio ' + (a.priority || 0) });
   if (status !== 'active') badges.push({ cls: status, text: status });
   if (a.provider && a.provider !== 'anthropic') badges.push({ cls: 'provider ' + a.provider, text: providerLabel(a.provider) });
@@ -2037,6 +2039,7 @@ const PAGE = `<!doctype html>
   .acct-name { font-size: 15px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chips { display: flex; flex-wrap: wrap; gap: 5px; }
   .chip { height: 22px; padding: 0 9px; border-radius: 999px; background: var(--raised); color: var(--text-2); font-size: 11px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .chip.plan.max { background: var(--amber-soft); color: var(--amber); font-weight: 500; }
   .blocked { font-size: 12px; color: var(--coral-text); background: var(--coral-soft); border-radius: 999px; padding: 7px 12px; display: flex; align-items: center; gap: 8px; align-self: flex-start; }
   .blocked::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--coral); flex: none; }
   .meters { display: flex; flex-direction: column; gap: 14px; }
@@ -2982,6 +2985,7 @@ ${createHall3d.toString()}
   function chipDot(cls) {
     var c = ' ' + cls + ' ';
     if (c.indexOf(' current ') !== -1) return 'lime';
+    if (c.indexOf(' plan ') !== -1) return 'amber';
     if (/ (disabled|error|exhausted|billing) /.test(c)) return 'coral';
     if (/ (throttled|extra-usage|entitlement|upstream-rejected|quota) /.test(c)) return 'amber';
     if (c.indexOf(' provider ') !== -1 || c.indexOf(' known ') !== -1) return 'lilac';
