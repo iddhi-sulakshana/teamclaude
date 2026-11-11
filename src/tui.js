@@ -333,14 +333,17 @@ export function resetCreditTag(quota, now = Date.now()) {
 /**
  * Short row tag for the extra-usage fallback (`accounts[].allowExtraUsage`):
  * `xu!` while the account is serving past its quota and billing for it, `xu`
- * while it is merely allowed to, '' otherwise. Same shape and colours as the
- * money tag beside it, for the same width-budget reason.
+ * while it is merely allowed to, `xuA` while it is allowed to for admins only
+ * (`"admin"`), '' otherwise. Same shape and colours as the money tag beside
+ * it, for the same width-budget reason.
  * @param {boolean} allowed
  * @param {boolean} serving
+ * @param {boolean} [adminOnly]
  */
-export function extraUsageTag(allowed, serving) {
+export function extraUsageTag(allowed, serving, adminOnly = false) {
   if (serving) return 'xu!';
-  return allowed ? 'xu' : '';
+  if (allowed) return 'xu';
+  return adminOnly ? 'xuA' : '';
 }
 
 export function blockedFamilies(quota, threshold) {
@@ -2243,7 +2246,7 @@ export class TUI {
       // after it on the same row, so a row's reserve is the two together.
       const spendW = members.reduce((w, a) => {
         const tag = spendTag(a.quota, a.maxSpend);
-        const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a));
+        const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a), a.allowExtraUsage === 'admin');
         return Math.max(w, (tag ? 2 + vw(tag) : 0) + (xu ? 2 + vw(xu) : 0));
       }, 0);
       // Same rule again for the switch-threshold tag (#409) — silent on the
@@ -2639,7 +2642,7 @@ export class TUI {
     if (money) line += `  ${(/\d/.test(money.split('/')[0]) ? red : yellow)(money)}`;
     // Extra-usage fallback: allowed reads yellow like a bare `$`; serving on
     // it is billing now, so red like a billed amount.
-    const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a));
+    const xu = extraUsageTag(a.allowExtraUsage === true, this._onExtraUsage(a), a.allowExtraUsage === 'admin');
     if (xu) line += `  ${(xu === 'xu!' ? red : yellow)(xu)}`;
     // Free reset credits sit beside the money tag: both report what this
     // account holds in reserve rather than what it is currently spending.

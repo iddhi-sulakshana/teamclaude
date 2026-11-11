@@ -236,8 +236,10 @@ export function accountSwitchThreshold(acct) {
 }
 
 /**
- * Whether a config entry opts its account into the extra-usage fallback: a
- * literal `true`, on an account the fallback can actually bill — an Anthropic
+ * A config entry's opt-in to the extra-usage fallback, as the fallback reads
+ * it: `true` (anyone's traffic may bill it), `'admin'` (only an admin caller's
+ * may — a seat the operator holds back, see _pickFallback), or false. Either
+ * value only as a literal, on an account the fallback can actually bill — an Anthropic
  * OAuth login, drawn by the same line ensureTokenFresh draws before it touches
  * a credential. "Extra usage" is a feature of Anthropic's subscription plans:
  * an API key has no plan limit to serve past, a third-party backend
@@ -248,9 +250,12 @@ export function accountSwitchThreshold(acct) {
  * Shared with sync-accounts.js so a reload reads the flag as startup did.
  *
  * @param {Record<string, any>} acct
+ * @returns {true|'admin'|false}
  */
 export function accountAllowsExtraUsage(acct) {
-  return acct.allowExtraUsage === true && acct.type === 'oauth' && !acct.upstream && providerOf(acct) === DEFAULT_PROVIDER;
+  const v = acct.allowExtraUsage;
+  if (v !== true && v !== 'admin') return false;
+  return acct.type === 'oauth' && !acct.upstream && providerOf(acct) === DEFAULT_PROVIDER ? v : false;
 }
 
 /**
@@ -297,7 +302,7 @@ function makeAccount(acct, index, listener = null) {
   // Once, at construction, not on every reload: the flag names money the
   // operator meant to spend, so silently doing nothing would be the one wrong
   // answer.
-  if (acct.allowExtraUsage === true && !accountAllowsExtraUsage(acct)) {
+  if ((acct.allowExtraUsage === true || acct.allowExtraUsage === 'admin') && !accountAllowsExtraUsage(acct)) {
     console.warn(`[TeamClaude] Account "${safeLine(acct.name, 64)}": allowExtraUsage is ignored — only an Anthropic OAuth account can serve on extra usage`);
   }
   return {
@@ -345,7 +350,8 @@ function makeAccount(acct, index, listener = null) {
     // upstream, and the operator allows the proxy to lean on it once every
     // account is past its quota. Strictly `true`, so a stray truthy value in a
     // hand-edited config cannot start billing, and Anthropic OAuth logins only
-    // (see accountAllowsExtraUsage). See _pickFallback.
+    // (see accountAllowsExtraUsage). `'admin'` holds the overage back for admin
+    // callers. See _pickFallback.
     allowExtraUsage: accountAllowsExtraUsage(acct),
     // This account's own egress proxy, parsed (accounts[].routing). Every
     // socket opened for the account tunnels through it — request forwarding,
@@ -625,6 +631,10 @@ export class AccountManager {
     // Bookkeeping for logs, status and the ramp trigger only; no routing
     // decision reads it. See _selectFallback.
     this._extraUsage = new Map();
+    // Whether the selection in progress is an admin caller's, which is what
+    // lets it reach a seat held back with `allowExtraUsage: "admin"`. Scoped to
+    // one synchronous walk, like `_selectingProvider` (see getActiveAccount).
+    this._selectingAdmin = false;
     // Minimum time a 429 hold is respected verbatim before a throttled account
     // becomes probe-eligible (see _isProbeable). Long enough to honor a genuine
     // retry-after, short enough that a stale hold cannot pin the fleet.
@@ -1052,8 +1062,13 @@ export class AccountManager {
    * session fans out across many (see conversation.js). It is spelled
    * `sessionId` because it is one for every request that names no conversation,
    * and because the affinity it drives is the same affinity it always was.
+   *
+   * `admin` says the caller is an admin (the server's isAdminCaller), which
+   * is what lets the fallback reach a seat held back with
+   * `allowExtraUsage: "admin"`. False unless said, so a caller that never
+   * says cannot spend one.
    */
-  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER, decision = null) {
+  getActiveAccount(exclude = null, model = null, advisorModel = null, sessionId = null, provider = DEFAULT_PROVIDER, decision = null, admin = false) {
     // Selection reads this.currentIndex as "where the fleet is". With more than
     // one provider that is a single slot for several fleets, so a request whose
     // provider does not own it borrows the slot for the walk and hands it back.
@@ -1087,6 +1102,7 @@ export class AccountManager {
     // field the caller reads afterwards — the failover hop runs after an
     // upstream round trip, by which time another request has selected.
     this._selectionDecision = decision;
+    this._selectingAdmin = admin === true;
     try {
       const excluded = this._excludeOtherProviders(exclude, provider);
       // Settled once, here, rather than in the walks: session distribution and
@@ -1101,6 +1117,7 @@ export class AccountManager {
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
+      this._selectingAdmin = false;
       walked = this.currentIndex;
       // Hand the slot back before anything can observe it moved. Only the
       // provider that owns currentIndex gets to change it.
@@ -1140,10 +1157,16 @@ export class AccountManager {
     // ending it there re-announced and re-ramped the same account on the next
     // request. And none of this runs for a fleet with no opt-in and no episode
     // to end, so such a fleet pays nothing per request for the feature.
+    //
+    // Nor is a null that only means "this caller is not an admin" when the
+    // episode is on a seat held for admins: the seat still serves them, and
+    // ending it there re-announced and re-ramped it on every admin request
+    // that followed a teammate's.
     if (this._extraUsage.size || this.accounts.some(a => a.allowExtraUsage)) {
       const scope = this._cursorKey(model, null, provider);
       const excluded = /** @type {Set<number>|null} */ (exclude);
-      if (this._extraUsage.has(scope) && ((!account && !excluded?.size) || (account && this._isAvailable(account, model)))) {
+      const episode = this._extraUsage.get(scope);
+      if (episode && ((!account && !excluded?.size && (admin === true || !episode.adminOnly)) || (account && this._isAvailable(account, model)))) {
         this._endFallback(scope, account ? `Quota headroom is back on "${safeLine(account.name, 64)}"` : null);
       }
       this._sweepFallback();
@@ -1233,16 +1256,18 @@ export class AccountManager {
    * onto the account a selection already rests on records nothing.
    *
    * @param {string} scope
-   * @param {{ account: Record<string, any>, paid: boolean }} pick
+   * @param {{ account: Record<string, any>, paid: boolean, adminOnly?: boolean }} pick
    * @param {string|null} model
    * @param {boolean} hopOnly
    */
-  _noteFallback(scope, { account, paid }, model, hopOnly) {
+  _noteFallback(scope, { account, paid, adminOnly = false }, model, hopOnly) {
     const prev = this._extraUsage.get(scope);
     const moved = !prev || prev.account !== account || prev.paid !== paid;
     if (!moved && (hopOnly || !prev.hopOnly)) return false;
     this._extraUsage.set(scope, {
-      account, paid, hopOnly, model, provider: providerOf(account),
+      // `adminOnly`: billing a seat held for admins, so a caller who is not
+      // one cannot end the episode by finding nothing (see getActiveAccount).
+      account, paid, adminOnly, hopOnly, model, provider: providerOf(account),
       // The month's spend when billing began, kept across a hop that a later
       // selection confirms: a rise since then marks the account as billing
       // even while its utilization reads under 100%.
@@ -1253,13 +1278,14 @@ export class AccountManager {
     if (!moved) return true;
     const name = safeLine(account.name, 64);
     const where = this._scopeLabel(model);
+    const held = adminOnly ? ', held for admins' : '';
     if (hopOnly) {
       console.log(paid
-        ? `[TeamClaude] Failover hop onto "${name}" on extra usage (paid overage)${where}`
+        ? `[TeamClaude] Failover hop onto "${name}" on extra usage (paid overage${held})${where}`
         : `[TeamClaude] Failover hop onto "${name}" — past its switch threshold, but with free quota left${where}`);
     } else {
       console.log(paid
-        ? `[TeamClaude] No account has quota left${where} — routing to "${name}" on extra usage (paid overage)`
+        ? `[TeamClaude] No account has quota left${where} — routing ${adminOnly ? 'admins ' : ''}to "${name}" on extra usage (paid overage${held})`
         : `[TeamClaude] No account is under its switch threshold${where} — routing to "${name}" on the free quota it has left`);
     }
     return true;
@@ -1314,9 +1340,10 @@ export class AccountManager {
    * siblings with every request (#286).
    *
    * Same candidate set as a real selection: the request's own exclusions, the
-   * provider partition, the expiry band. Returns the account or null.
+   * provider partition, the expiry band. Returns the account or null. `admin`
+   * is getActiveAccount's: only an admin's hop reaches a seat held for admins.
    */
-  pickAlternate(exclude, model = null, advisorModel = null, provider = DEFAULT_PROVIDER) {
+  pickAlternate(exclude, model = null, advisorModel = null, provider = DEFAULT_PROVIDER, admin = false) {
     const excluded = this._excludeOtherProviders(exclude, provider);
     // The fallback as a last resort, through the same pure picker the
     // selection walk uses: a 429/5xx hop off a probed, spent account would
@@ -1335,7 +1362,7 @@ export class AccountManager {
       ? this._advisorReach(excluded, model, advisorModel) : null;
     const normal = this._pickBestAvailable(excluded, model, reach && reach.eligible < reach.of ? null : advisorModel);
     if (normal) return normal;
-    const pick = this._pickFallback(excluded, model, provider);
+    const pick = this._pickFallback(excluded, model, provider, admin === true);
     if (!pick) return null;
     // A paid hop must not bill silently, yet it is still a detour: no cursor,
     // no ramp. So it only records the scope's episode — bookkeeping that feeds
@@ -2351,6 +2378,10 @@ export class AccountManager {
       // might refresh, so the exhausted-fleet probe does not get to override it.
       // Checked here rather than in _isProbeable because a cap is model-scoped.
       if (this.capExceeded(account, model)) continue;
+      // A probe is a live request: on a seat held for admins whose overage is
+      // on upstream, a spent one bills. A caller who is not an admin probes
+      // elsewhere, or not at all.
+      if (this.heldFromCaller(account, model, this._selectingAdmin)) continue;
       // Same for routing/ownership: a probe for a routed or owned model must not
       // land on an ineligible account (it would just reject the unknown model id).
       if (model && !this._routeAllows(account, model)) continue;
@@ -2394,7 +2425,7 @@ export class AccountManager {
    */
   _selectFallback(exclude = null, model = null) {
     const provider = this._selectingProvider ?? DEFAULT_PROVIDER;
-    const pick = this._pickFallback(exclude, model, provider);
+    const pick = this._pickFallback(exclude, model, provider, this._selectingAdmin);
     if (!pick) return null;
     if (!this._currentBarredOnlyFor(model, null, exclude)) this._setCurrent(pick.account);
     if (this._noteFallback(this._cursorKey(model, null, provider), pick, model, false)) this._beginRamp(pick.account);
@@ -2448,18 +2479,29 @@ export class AccountManager {
    * utilized — the most free quota left, or the least deep into overage and
    * the likeliest to be the first back under its limit.
    *
+   * A third tier sits under the paid one: seats opted in with
+   * `allowExtraUsage: "admin"`, which the operator holds back for admins. Only
+   * an `admin` caller reaches it, and only once no account opted in for
+   * everyone can bill — so a held seat's overage is the last money the fleet
+   * spends, and only on an admin's behalf. Its free quota is not held back:
+   * a held seat past its threshold but under 100% serves anyone in the free
+   * tier, like any other account.
+   *
    * @param {Set<number>|null} [exclude]
-   * @returns {{ account: Record<string, any>, paid: boolean } | null}
+   * @param {boolean} [admin]
+   * @returns {{ account: Record<string, any>, paid: boolean, adminOnly: boolean } | null}
    */
-  _pickFallback(exclude = null, model = null, provider = DEFAULT_PROVIDER) {
+  _pickFallback(exclude = null, model = null, provider = DEFAULT_PROVIDER, admin = false) {
     if (!this.accounts.some(a => a.allowExtraUsage)) return null;
     const partition = this._excludeOtherProviders(null, provider);
     if (this.accounts.some(a => !partition?.has(a.index) && this._isAvailable(a, model))) return null;
 
     /** @type {Record<string, any>|null} */ let free = null;
     /** @type {Record<string, any>|null} */ let paid = null;
+    /** @type {Record<string, any>|null} */ let held = null;
     /** @type {[number, number]|null} */ let freeRank = null;
     /** @type {[number, number]|null} */ let paidRank = null;
+    /** @type {[number, number]|null} */ let heldRank = null;
     const better = (/** @type {number} */ p, /** @type {number} */ u, /** @type {[number, number]|null} */ rank) =>
       !rank || p < rank[0] || (p === rank[0] && u < rank[1]);
     for (const account of this.accounts) {
@@ -2478,12 +2520,36 @@ export class AccountManager {
         continue;
       }
       if (!account.allowExtraUsage) continue;
+      if (account.allowExtraUsage === 'admin' && !admin) continue;
       const spend = /** @type {{ enabled?: boolean } | null} */ (account.quota.spend);
       if (spend?.enabled === false) continue;
-      if (better(priority, usage, paidRank)) { paid = account; paidRank = [priority, usage]; }
+      if (account.allowExtraUsage === 'admin') {
+        if (better(priority, usage, heldRank)) { held = account; heldRank = [priority, usage]; }
+      } else if (better(priority, usage, paidRank)) { paid = account; paidRank = [priority, usage]; }
     }
-    if (free) return { account: free, paid: false };
-    return paid ? { account: paid, paid: true } : null;
+    if (free) return { account: free, paid: false, adminOnly: false };
+    if (paid) return { account: paid, paid: true, adminOnly: false };
+    return held ? { account: held, paid: true, adminOnly: true } : null;
+  }
+
+  /**
+   * Whether `account` is a seat held for admins (`allowExtraUsage: "admin"`)
+   * that this caller may not spend: the caller is not an admin and serving
+   * would bill — the account is at 100% of a bucket governing `model`, or
+   * upstream has said `rejected`. Under 100% the seat's quota is free and
+   * anyone's. For the paths that bypass the fallback: the revalidation probe
+   * and an explicit account pin, either of which would otherwise send a live
+   * request to a seat whose overage is on upstream.
+   * @param {Record<string, any>|null|undefined} account
+   * @param {*} [model]
+   * @param {boolean} [admin]
+   */
+  heldFromCaller(account, model = null, admin = false) {
+    if (!account || account.allowExtraUsage !== 'admin' || admin === true) return false;
+    // A window that has already reset must not hold the seat back on a value
+    // that no longer applies (the same reason capExceeded clears first).
+    this._clearExpiredQuotas(account);
+    return this._maxUtilization(account, model) >= 1 || account.quota.unifiedStatus === 'rejected';
   }
 
   _isAvailable(account, model = null, advisorModel = null) {
@@ -4967,6 +5033,10 @@ export class AccountManager {
         // rather than only seeing this account's already-resolved default.
         switchThreshold: a.switchThreshold ?? null,
         allowExtraUsage: a.allowExtraUsage === true,
+        // `allowExtraUsage: "admin"`: the overage is held for admins. Its own
+        // field, so `allowExtraUsage` keeps meaning "anyone's traffic may bill
+        // this" to every consumer that already reads it as a boolean.
+        extraUsageAdminOnly: a.allowExtraUsage === 'admin',
         // Plan size against a Pro account (Pro 1, Max 5x 5, Max 20x 20; null when
         // unknown): the weight the forecast uses, here so a card can name the plan.
         planWeight: quotaTier(a).weight,

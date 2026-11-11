@@ -421,7 +421,8 @@ function renderAccountHeader(account, currentAccount, paint, now, followSessions
   // The opt-in is shown even while unused, so an operator can tell before the
   // fleet runs dry which accounts would start billing; serving on it is said
   // in red on the Blocked line (see unavailableLine).
-  const xu = account.allowExtraUsage === true ? ', extra usage allowed' : '';
+  const xu = account.allowExtraUsage === true ? ', extra usage allowed'
+    : account.extraUsageAdminOnly === true ? ', extra usage for admins' : '';
   return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0}${xu})`)} ${status}${org}${sess}`;
 }
 

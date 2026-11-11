@@ -301,6 +301,7 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // so a missing field on an older server's payload shows nothing.
   if (a.onExtraUsage === true) badges.push({ cls: 'extra-usage billing', text: 'on extra usage \u2014 billing' });
   else if (a.allowExtraUsage === true) badges.push({ cls: 'extra-usage', text: 'extra usage allowed' });
+  else if (a.extraUsageAdminOnly === true) badges.push({ cls: 'extra-usage', text: 'extra usage for admins' });
   // The account's own egress proxy, as the status payload carries it: already
   // password-masked (describeRouting), and absent for an account on the fleet
   // path, which is the default and earns no badge.

@@ -223,6 +223,22 @@ and the status payload carries `allowExtraUsage` and `onExtraUsage` per account;
 
 Edits apply live on config reload — turning it off stops the spending immediately.
 
+### Seats held for admins
+
+Some seats have extra usage turned on at Anthropic that the team as a whole should not spend. Opt such a seat in with `"admin"` instead of `true`:
+
+```json
+{ "name": "lead@example.com", "allowExtraUsage": "admin", "maxSpend": 50 }
+```
+
+- **Its plan quota is shared as usual.** The seat rotates like any account, and once nothing is under its threshold its free quota past the threshold serves anyone in the free tier. Only the overage is held back.
+- **Its overage is the last money spent, and only for admins.** The fallback bills accounts set to `true` first. Only when none of them can bill any more (at their `maxUsage` or `maxSpend` cap, or with overage off upstream) does it bill a held seat, and only for an admin caller. Admins are the same callers as for [`proxy.adminOnlyModels`](configuration.md#fields): the shared `proxy.apiKey`, key-exempt local callers, and `proxy.clientKeys` entries with `"role": "admin"`. Among several held seats: `priority`, then the least deep into overage.
+- **Everyone else gets what an empty fleet gives.** A caller who is not an admin is answered 429 (or held, with `holdSeconds`) as if the seat were not there. Their requests do not end the admin's episode either, so admin traffic stays on the seat without being re-announced or re-ramped.
+- **No side doors.** The exhausted-fleet revalidation probe and an explicit account pin (`TC_ACCT`, `/tc-acct/<name>`) both send a live request without going through the fallback. For a caller who is not an admin, both skip a held seat that would bill: one at 100% of a bucket governing the model, or carrying upstream's `rejected` verdict. Under 100% its quota is free, so the probe and pins work as before.
+- **The same hard gates bind.** `disabled`, `maxUsage`, `maxSpend`, a live 429 hold, an error state, routes, and overage switched off upstream all still apply, for admins too.
+
+`teamclaude status` says `extra usage for admins` in the account header, the TUI row carries a yellow `xuA` tag, and the dashboard shows an `extra usage for admins` badge. While the seat bills, all three switch to the same billing marks as any other account (`xu!`, `on extra usage — billing`). The status payload carries `extraUsageAdminOnly: true`, and `allowExtraUsage` stays `false` for such a seat, so a consumer that reads `allowExtraUsage` as "anyone's traffic may bill this" stays right.
+
 ## Third-party backend quota
 
 A [third-party backend account](accounts.md#third-party-backend-accounts) has no Anthropic quota, so its bars read `unknown`. Where the provider publishes a figure of its own, the probe reads it on the same schedule and status shows it:

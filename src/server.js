@@ -1957,7 +1957,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
 
       // stripOverage is sampled once here, at dispatch: retries and holds of
       // this request keep it, and a reload applies to subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      // `admin` likewise: whether this caller may spend a seat whose extra
+      // usage is held for admins (accounts[].allowExtraUsage "admin").
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, client, admin: isAdminCaller(req, forcedClient, proxyConfig), delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -3251,9 +3253,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   const account = hopTo != null
     ? accountManager.accounts[hopTo]
     : ctx.pinnedIndex != null
-      ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model) ? pinned : null)
+      // A pin skips the fallback, so it skips the fallback's admin gate too:
+      // checked here, or a tenant could aim TC_ACCT at a seat held for admins
+      // and bill its overage.
+      ? (pinned && !pinnedWrongProvider && !accountManager.capExceeded(pinned, ctx.model)
+        && !accountManager.heldFromCaller(pinned, ctx.model, ctx.admin) ? pinned : null)
       : accountManager.getActiveAccount(
-        ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection,
+        ctx.tried, ctx.model, ctx.advisorModel, ctx.pinKey, ctx.provider, selection, ctx.admin,
       );
   // Accounts a rollover deliberately routed this request away from. Request-
   // scoped: the decision belongs to the request, not to one attempt of it.
@@ -3775,7 +3781,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // must leave the fleet cursor where it is (#286).
         const alt = accountManager.pickAlternate(
           new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
-          ctx.model, ctx.advisorModel, ctx.provider,
+          ctx.model, ctx.advisorModel, ctx.provider, ctx.admin,
         );
         if (alt && !accountManager.isPaused(alt.index)) {
           ctx.rateLimitHopped = true;
@@ -3932,7 +3938,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
-        ctx.model, ctx.advisorModel, ctx.provider,
+        ctx.model, ctx.advisorModel, ctx.provider, ctx.admin,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
         await upstreamRes.body?.cancel();
@@ -4042,7 +4048,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         && !ctx.streamFailureHopped && retryCount < maxRetries) {
       const alt = accountManager.pickAlternate(
         new Set([...ctx.tried, ...(ctx.rolledOff || []), account.index]),
-        ctx.model, ctx.advisorModel, ctx.provider,
+        ctx.model, ctx.advisorModel, ctx.provider, ctx.admin,
       );
       if (alt && !accountManager.isPaused(alt.index)) {
         const peeked = await peekStreamFailure(upstreamBody);

@@ -182,7 +182,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
-      if (diskAcct.allowExtraUsage === true) cfgAcct.allowExtraUsage = true; else delete cfgAcct.allowExtraUsage;
+      if (diskAcct.allowExtraUsage === true || diskAcct.allowExtraUsage === 'admin') cfgAcct.allowExtraUsage = diskAcct.allowExtraUsage; else delete cfgAcct.allowExtraUsage;
       // Both polarities are mirrored, unlike the flags above: `false` is the
       // side of this key that does something, so a stale mirror of either value
       // would win the save stencil's spread and undo the disk edit.

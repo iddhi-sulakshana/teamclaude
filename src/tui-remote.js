@@ -262,7 +262,10 @@ export class RemoteAccountManager {
       unavailable: a?.unavailable == null ? a?.unavailable : text(a.unavailable, 64),
       // Booleans that decide a red "billing" tag: anything but a literal true
       // from the other end reads as off, never as a claim that money moves.
-      allowExtraUsage: a?.allowExtraUsage === true,
+      // `'admin'` for a seat held for admins, the shape the local account
+      // carries, so the TUI reads one field in both modes.
+      allowExtraUsage: a?.allowExtraUsage === true ? true : a?.extraUsageAdminOnly === true ? 'admin' : false,
+      extraUsageAdminOnly: a?.extraUsageAdminOnly === true,
       onExtraUsage: a?.onExtraUsage === true,
       // Already password-masked by the server; still a payload string drawn
       // into the frame, so it gets the same scrub as everything else.
