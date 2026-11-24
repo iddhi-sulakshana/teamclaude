@@ -20,7 +20,7 @@ import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders, userDisabled } from './server.js';
+import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders, userDisabled, pausedSeat } from './server.js';
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
@@ -281,6 +281,13 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
           socket.destroy();
           return;
         }
+        // Likewise a user whose own seat has needed a re-login since (seatPauseFor).
+        if (client && pausedSeat(/** @type {any} */ (accountManager).accounts, /** @type {any} */ (config).proxy, client, log)) {
+          log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for user ${JSON.stringify(safeLine(client, 64))}, paused until their seat is signed in again`);
+          try { socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+          socket.destroy();
+          return;
+        }
         const target = upgradeUpstreamFor(req.headers.host, config, upstream);
         if (!target) {
           log(`[TeamClaude] MITM: refusing a WebSocket Upgrade for host ${JSON.stringify(safeLine(req.headers.host, 64))}, which this proxy does not intercept`);
@@ -345,6 +352,13 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="teamclaude"\r\nConnection: close\r\n\r\n');
       } catch { /* client already gone */ }
       clientSocket.destroy();
+      return;
+    }
+    // A user whose own seat needs a re-login is paused (seatPauseFor): no
+    // tunnel, as for a disabled key. The tunnel's own request listener checks
+    // again per request, so one opened before the seat failed is caught too.
+    if (auth.client && pausedSeat(/** @type {any} */ (accountManager).accounts, /** @type {any} */ (config).proxy, auth.client, log)) {
+      refuseRaw(clientSocket, '403 Forbidden');
       return;
     }
 

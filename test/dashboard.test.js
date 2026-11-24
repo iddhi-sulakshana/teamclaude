@@ -1807,6 +1807,23 @@ test('Disable sends at once, and a disabled user is shown off with Enable in its
   assert.match(page.byId('note').textContent, /disabling or enabling the user failed/);
 });
 
+test('a user paused by their seat is shown off, and the Disable button still controls only the hand ban', async () => {
+  const page = bootPage({ storedKey: 'tc-alice' });
+  const status = USERS_STATUS({ client: 'alice', role: 'operator' });
+  status.users[1] = { name: 'bob', role: 'tenant', seatRelogin: 'bob@747.live' };
+  await page.answer(200, status);
+  assert.deepEqual(page.classed('us-off'), ['off: seat needs re-login']);
+  assert.equal(page.classed('us-row off').length, 1, 'only the paused row is dimmed');
+  assert.equal(page.titled('Disable bob'), 1, 'the hand ban is still offered');
+
+  const banned = bootPage({ storedKey: 'tc-alice' });
+  const both = USERS_STATUS({ client: 'alice', role: 'operator' });
+  both.users[1] = { name: 'bob', role: 'tenant', disabled: true, seatRelogin: 'bob@747.live' };
+  await banned.answer(200, both);
+  assert.deepEqual(banned.classed('us-off'), ['disabled', 'off: seat needs re-login']);
+  assert.equal(banned.titled('Enable bob'), 1);
+});
+
 test('a refused Show key says why and shows nothing', async () => {
   const page = bootPage();
   await page.answer(200, USERS_STATUS({ client: null, role: 'operator' }));

@@ -462,15 +462,88 @@ export function userDisabled(proxyConfig, name) {
 }
 
 /**
+ * The seat that pauses a user, if any: one they own (accounts[].owner) that
+ * needs a re-login (status 'error'), so they cannot go on spending everyone
+ * else's while their own is broken. Worked out from the live status on every
+ * call, never stored: the pause lifts the moment the seat works again, and it
+ * neither reads nor writes clientKeys[].disabled, so a ban an admin set by hand
+ * is untouched. An admin is never paused — by name, as isAdminCaller decides
+ * it: every entry for the name says "admin".
+ * @param {any[]} accounts the running accounts (accountManager.accounts)
+ * @param {any} proxyConfig
+ * @param {string} name a clientKeys name
+ * @returns {string|null} the seat's name, or null when nothing pauses the user
+ */
+export function seatPauseFor(accounts, proxyConfig, name) {
+  const seat = (Array.isArray(accounts) ? accounts : []).find(a => a?.owner === name && a.status === 'error');
+  if (!seat) return null;
+  const entries = (Array.isArray(proxyConfig?.clientKeys) ? proxyConfig.clientKeys : [])
+    .filter(/** @param {any} e */ e => typeof e?.name === 'string' && e.name.trim() === name);
+  if (entries.length > 0 && entries.every(/** @param {any} e */ e => clientKeyRole(e) === 'admin')) return null;
+  return seat.name;
+}
+
+/**
+ * What a paused user is told, wherever the refusal has a body to carry it.
+ * @param {string} seat
+ * @returns {string}
+ */
+export function seatPausedMessage(seat) {
+  return `Your Claude seat (${seat}) needs a re-login, so your key is paused. Ask an admin for a sign-in link; your key turns back on by itself once you've signed in.`;
+}
+
+// Who the gates last found paused, by name, so the log says so once when a
+// user is paused and once when they are back, not on every refused request.
+/** @type {Map<string, string>} */
+const pausedUsers = new Map();
+// User lists already checked for owners that name nobody: once per loaded list
+// (a reload hands over a new clientKeys array), as usableClientKeys does.
+const checkedSeatOwners = new WeakSet();
+
+/**
+ * seatPauseFor, for the key gates: the same answer, plus the log lines an
+ * operator needs — a user paused, a user back on, and (once per loaded user
+ * list) an owner that names no user and so pauses no one.
+ * @param {any[]} accounts
+ * @param {any} proxyConfig
+ * @param {string} name
+ * @param {(line: string) => void} [log]
+ * @returns {string|null}
+ */
+export function pausedSeat(accounts, proxyConfig, name, log = console.log) {
+  const keys = proxyConfig?.clientKeys;
+  if (Array.isArray(keys) && !checkedSeatOwners.has(keys)) {
+    checkedSeatOwners.add(keys);
+    const names = new Set(keys.map(/** @param {any} e */ e => (typeof e?.name === 'string' ? e.name.trim() : '')));
+    for (const a of Array.isArray(accounts) ? accounts : []) {
+      if (a?.owner && !names.has(a.owner)) {
+        log(`[TeamClaude] accounts: "${safeLine(a.name, 64)}" has owner "${safeLine(a.owner, 64)}", but there is no user by that name — it pauses no one`);
+      }
+    }
+  }
+  const seat = seatPauseFor(accounts, proxyConfig, name);
+  if (seat && pausedUsers.get(name) !== seat) {
+    pausedUsers.set(name, seat);
+    log(`[TeamClaude] User "${safeLine(name, 64)}" paused: their seat "${safeLine(seat, 64)}" needs a re-login`);
+  } else if (!seat && pausedUsers.has(name)) {
+    pausedUsers.delete(name);
+    log(`[TeamClaude] User "${safeLine(name, 64)}" back on: their seat works again`);
+  }
+  return seat;
+}
+
+/**
  * The configured users as the dashboard's Users card lists them: one row per
  * name, with the role the gate gives it, and never a key. A name listed more
  * than once shows the lowest role any of its entries has, which is what the
  * admin-model gate (isAdminCaller) already does for such a name. `disabled`
- * is present only on a disabled user (userDisabled).
+ * is present only on a disabled user (userDisabled), and `seatRelogin`, the
+ * seat's name, only on a user paused by their own seat (seatPauseFor).
  * @param {any} proxyConfig
- * @returns {{ name: string, role: 'tenant'|'admin'|'readonly', disabled?: true }[]}
+ * @param {any[]} [accounts] the running accounts
+ * @returns {{ name: string, role: 'tenant'|'admin'|'readonly', disabled?: true, seatRelogin?: string }[]}
  */
-function configuredUsers(proxyConfig) {
+function configuredUsers(proxyConfig, accounts = []) {
   const rank = { readonly: 0, tenant: 1, admin: 2 };
   /** @type {Map<string, 'tenant'|'admin'|'readonly'>} */
   const byName = new Map();
@@ -480,7 +553,13 @@ function configuredUsers(proxyConfig) {
     const seen = byName.get(name);
     if (!seen || rank[role] < rank[seen]) byName.set(name, role);
   }
-  return [...byName].map(([name, role]) => (userDisabled(proxyConfig, name) ? { name, role, disabled: true } : { name, role }));
+  return [...byName].map(([name, role]) => {
+    /** @type {{ name: string, role: 'tenant'|'admin'|'readonly', disabled?: true, seatRelogin?: string }} */
+    const user = userDisabled(proxyConfig, name) ? { name, role, disabled: true } : { name, role };
+    const seat = seatPauseFor(accounts, proxyConfig, name);
+    if (seat) user.seatRelogin = seat;
+    return user;
+  });
 }
 
 /**
@@ -588,6 +667,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.end(JSON.stringify({
           type: 'error',
           error: { type: 'authentication_error', message: 'Invalid proxy API key' },
+        }));
+        return;
+      }
+      // A user whose own seat needs a re-login is paused until it works again
+      // (seatPauseFor). After the two refusals above, so a hand ban keeps its
+      // own message, and only a named key: loopback without one has no seat.
+      const pausedBy = auth.ok && auth.client ? pausedSeat(accountManager.accounts, config.proxy, auth.client) : null;
+      if (pausedBy) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'permission_error', message: seatPausedMessage(pausedBy) },
         }));
         return;
       }
@@ -710,7 +801,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const viewer = { client: req.tcClient || null, role: who };
         // Who holds a key is the operator's to see: a tenant is not shown the
         // other tenants, only the usage the status already books to them.
-        const users = who === 'operator' ? { users: configuredUsers(config.proxy) } : {};
+        const users = who === 'operator' ? { users: configuredUsers(config.proxy, accountManager.accounts) } : {};
         res.end(JSON.stringify({ ...extra, ...status, ...users, viewer, upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
@@ -1376,6 +1467,15 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         socket.destroy();
         return;
       }
+      // A user paused by their own seat (seatPauseFor) is refused here as on
+      // the request path; a WebSocket client discards the status line, so the
+      // log says why.
+      if (auth.client && pausedSeat(accountManager.accounts, config.proxy, auth.client)) {
+        console.log(`[TeamClaude] WebSocket upgrade refused (user ${JSON.stringify(safeLine(auth.client, 64))} is paused until their seat is signed in again) for ${safeLine(req.url)}`);
+        try { socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); } catch { /* already gone */ }
+        socket.destroy();
+        return;
+      }
       // The identity the gate resolved rides along, as it does on the request
       // path (req.tcClient): a handshake authenticated with a client key is
       // attributed to that client, or it is a channel the operator cannot see
@@ -1697,6 +1797,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       if (forcedClient && userDisabled(/** @type {any} */ (config)?.proxy, forcedClient)) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: DISABLED_KEY_MESSAGE } }));
+        return;
+      }
+      // And a user whose own seat has needed a re-login since: paused per
+      // request for the same reason, and back on the request after it works.
+      const tunnelPausedBy = forcedClient ? pausedSeat(/** @type {any} */ (accountManager).accounts, /** @type {any} */ (config)?.proxy, forcedClient) : null;
+      if (tunnelPausedBy) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: seatPausedMessage(tunnelPausedBy) } }));
         return;
       }
 

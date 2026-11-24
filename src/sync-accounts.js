@@ -3,7 +3,7 @@ import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
-import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
+import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting, accountOwner } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
 
 /**
@@ -128,6 +128,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // (an API key, a third-party backend, a Codex login) stays opted out on
     // reload as it was at startup; the warning was makeAccount's to give.
     mgr.allowExtraUsage = accountAllowsExtraUsage(diskAcct);
+    // Whose seat this is: read per request by the key gates (seatPauseFor), so
+    // an edit on disk decides who is paused from the next request on.
+    mgr.owner = accountOwner(diskAcct);
     // Same for a per-account routing proxy: it is read per request off this
     // object (server.js forwardRequest, ensureTokenFresh, the prober), so a
     // disk edit or a `teamclaude routing` change takes effect on the very next
@@ -183,6 +186,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;
       if (diskAcct.disabled) cfgAcct.disabled = true; else delete cfgAcct.disabled;
       if (diskAcct.allowExtraUsage === true || diskAcct.allowExtraUsage === 'admin') cfgAcct.allowExtraUsage = diskAcct.allowExtraUsage; else delete cfgAcct.allowExtraUsage;
+      if (accountOwner(diskAcct)) cfgAcct.owner = diskAcct.owner; else delete cfgAcct.owner;
       // Both polarities are mirrored, unlike the flags above: `false` is the
       // side of this key that does something, so a stale mirror of either value
       // would win the save stencil's spread and undo the disk edit.

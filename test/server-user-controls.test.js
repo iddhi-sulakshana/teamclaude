@@ -203,6 +203,32 @@ test('status lists the users by name and role for an operator only, never their 
   });
 });
 
+test('status marks a user whose seat needs a re-login, for an operator only', async () => {
+  const config = freshConfig();
+  config.proxy.clientKeys.push({ name: 'dave', key: 'tc-dave' });
+  const { hooks } = liveHooks(config);
+  const am = new AccountManager([
+    { name: 'acct@example.com', type: 'apikey', apiKey: 'k1' },
+    { name: 'bob@example.com', type: 'oauth', accessToken: 'T', refreshToken: 'r', expiresAt: Date.now() + 3600_000, owner: 'bob' },
+  ], 0.98);
+  am.accounts[1].status = 'error';
+  const proxy = createProxyServer(am, config, hooks);
+  const port = await listen(proxy);
+  try {
+    const op = await (await statusAs(port, PROXY_KEY)).json();
+    assert.deepEqual(op.users, [
+      { name: 'alice', role: 'admin' },
+      { name: 'bob', role: 'tenant', seatRelogin: 'bob@example.com' },
+      { name: 'carol', role: 'readonly' },
+      { name: 'dave', role: 'tenant' },
+    ]);
+    const tenant = await (await statusAs(port, 'tc-dave')).json();
+    assert.equal('users' in tenant, false, 'a tenant is not shown who else is paused');
+  } finally {
+    proxy.close();
+  }
+});
+
 test('bad input is a 400 that reaches no hook; a refused op is a 400 with its reason', async () => {
   const config = freshConfig();
   const { hooks, calls } = liveHooks(config);

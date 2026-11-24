@@ -3643,11 +3643,18 @@ ${createHall3d.toString()}
       return;
     }
     users.forEach(function (u) {
-      var row = el('div', u.disabled ? 'us-row off' : 'us-row');
+      var row = el('div', u.disabled || u.seatRelogin ? 'us-row off' : 'us-row');
       var nm = el('span', 'cl-name', u.name);
       nm.title = u.name;
       if (u.name === me) nm.appendChild(el('span', 'you', 'you'));
       if (u.disabled) nm.appendChild(el('span', 'us-off', 'disabled'));
+      // Paused by their own seat: derived on the server, lifted by the re-login,
+      // so the Disable button beside it still controls only the hand ban.
+      if (u.seatRelogin) {
+        var paused = el('span', 'us-off', 'off: seat needs re-login');
+        paused.title = u.seatRelogin + ' needs a re-login';
+        nm.appendChild(paused);
+      }
       row.appendChild(nm);
       var seg = el('span', 'seg on-bg');
       seg.setAttribute('role', 'group');

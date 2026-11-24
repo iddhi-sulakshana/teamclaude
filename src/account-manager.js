@@ -259,6 +259,18 @@ export function accountAllowsExtraUsage(acct) {
 }
 
 /**
+ * The user whose own seat this account is (accounts[].owner): a
+ * proxy.clientKeys name, trimmed, or null when unset or not a usable string.
+ * While the seat needs a re-login that user is paused (seatPauseFor in
+ * server.js). Shared with sync-accounts.js so a reload reads it as startup did.
+ * @param {Record<string, any>} acct
+ * @returns {string|null}
+ */
+export function accountOwner(acct) {
+  return typeof acct?.owner === 'string' && acct.owner.trim() ? acct.owner.trim() : null;
+}
+
+/**
  * One account's own egress proxy (accounts[].routing), parsed and validated.
  * The URL carries scheme (http/socks4/socks4a/socks5/socks5h), optional
  * user:pass auth, host and port — see account-routing.js. An unusable value is
@@ -353,6 +365,8 @@ function makeAccount(acct, index, listener = null) {
     // (see accountAllowsExtraUsage). `'admin'` holds the overage back for admin
     // callers. See _pickFallback.
     allowExtraUsage: accountAllowsExtraUsage(acct),
+    // The user whose own seat this is (accounts[].owner); see accountOwner.
+    owner: accountOwner(acct),
     // This account's own egress proxy, parsed (accounts[].routing). Every
     // socket opened for the account tunnels through it — request forwarding,
     // token refresh, profile, usage and quota probes — and it outranks both sx
